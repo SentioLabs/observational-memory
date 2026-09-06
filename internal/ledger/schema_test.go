@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -842,5 +844,151 @@ func TestSchemaPreflightCloseWaitsForTransaction(t *testing.T) {
 	check(t, err)
 	if value != "finish before close" {
 		t.Fatal("concurrent Close lost committed transaction")
+	}
+}
+
+type initializationEntropyBarrier struct {
+	reader  io.Reader
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (b *initializationEntropyBarrier) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return b.reader.Read(p)
+}
+
+func TestSchemaPreflightInitializingAliasCancellationKeepsWriterLocked(t *testing.T) {
+	if os.Getenv("OM_TEST_INITIALIZING_ALIAS") != "1" {
+		// Keep the entropy override isolated from unrelated tests and restore it
+		// only after the initializing goroutine has finished.
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSchemaPreflightInitializingAliasCancellationKeepsWriterLocked$")
+		cmd.Env = append(os.Environ(), "OM_TEST_INITIALIZING_ALIAS=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("initialization alias fixture: %v\n%s", err, out)
+		}
+		return
+	}
+	for _, cancelCreator := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel-creator-%t", cancelCreator), func(t *testing.T) {
+			store, err := filepath.EvalSymlinks(t.TempDir())
+			check(t, err)
+			aliasStore, err := filepath.EvalSymlinks(t.TempDir())
+			check(t, err)
+			name, err := identity("session-", "initializing-alias")
+			check(t, err)
+			dir := filepath.Join(store, name)
+			check(t, os.Mkdir(dir, 0700))
+			aliasDir := filepath.Join(aliasStore, name)
+			check(t, os.Symlink(dir, aliasDir))
+			path := filepath.Join(dir, "memory.sqlite3")
+			aliasPath := filepath.Join(aliasDir, "memory.sqlite3")
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+			originalReader := rand.Reader
+			rand.Reader = &initializationEntropyBarrier{reader: originalReader, entered: entered, release: release}
+			creatorCtx, cancelCreation := context.WithCancel(context.Background())
+			defer cancelCreation()
+			type openResult struct {
+				ledger *Ledger
+				err    error
+			}
+			created := make(chan openResult, 1)
+			go func() { l, err := Open(creatorCtx, store, "initializing-alias"); created <- openResult{l, err} }()
+			joined := false
+			t.Cleanup(func() {
+				unblock()
+				if !joined {
+					result := <-created
+					if result.ledger != nil {
+						_ = result.ledger.Close()
+					}
+				}
+				rand.Reader = originalReader
+			})
+			select {
+			case <-entered:
+			case result := <-created:
+				joined = true
+				if result.ledger != nil {
+					_ = result.ledger.Close()
+				}
+				t.Fatalf("creator did not reach transaction barrier: %v", result.err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("creator did not enter initialization transaction")
+			}
+			aliasCtx, cancelAlias := context.WithCancel(context.Background())
+			defer cancelAlias()
+			aliasResult := make(chan openResult, 1)
+			go func() { l, err := Open(aliasCtx, aliasStore, "initializing-alias"); aliasResult <- openResult{l, err} }()
+			info, err := os.Stat(path)
+			check(t, err)
+			var pinned *os.File
+			deadline := time.Now().Add(time.Second)
+			for pinned == nil {
+				preflightReaders.Lock()
+				for _, candidate := range preflightReaders.files {
+					if candidate.info != nil && os.SameFile(info, candidate.info) {
+						pinned = candidate.file
+					}
+				}
+				preflightReaders.Unlock()
+				if time.Now().After(deadline) {
+					t.Fatal("alias did not read unpublished database")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			cancelAlias()
+			alias := <-aliasResult
+			if alias.ledger != nil {
+				alias.ledger.Close()
+			}
+			if !errors.Is(alias.err, context.Canceled) {
+				t.Fatalf("alias cancellation: %v", alias.err)
+			}
+			// Cancellation must not release the still-initializing creator's
+			// process-wide SQLite lock through the alias's raw descriptor.
+			runSchemaCrash(t, path, "contender")
+			if cancelCreator {
+				cancelCreation()
+			}
+			unblock()
+			result := <-created
+			joined = true
+			if cancelCreator {
+				if result.ledger != nil {
+					result.ledger.Close()
+					t.Fatal("canceled creator published database")
+				}
+				if !errors.Is(result.err, context.Canceled) {
+					t.Fatalf("creator cancellation: %v", result.err)
+				}
+				if _, err = os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("failed initialization left owned database", err)
+				}
+			} else {
+				check(t, result.err)
+				_, err = result.ledger.CaptureV2(CaptureInput{Kind: "user", Text: "Committed after alias canceled", Key: "committed"})
+				check(t, err)
+				check(t, result.ledger.Close())
+			}
+			if _, err = pinned.Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Fatal("finished initializer left pinned descriptor", err)
+			}
+			preflightReaders.Lock()
+			retained := preflightReaders.paths[path] != nil || preflightReaders.paths[aliasPath] != nil
+			preflightReaders.Unlock()
+			if retained {
+				t.Fatal("finished initializer retained lease")
+			}
+			if _, err = os.Stat(filepath.Join(dir, ".initializing")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("finished initializer retained marker", err)
+			}
+		})
 	}
 }

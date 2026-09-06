@@ -590,6 +590,19 @@ func createLedger(ctx context.Context, store, path, session string) (result *Led
 			_ = os.Remove(path)
 		}
 	}()
+	// The lease was acquired before this inode existed. Register it before any
+	// SQLite handle can lock it, so a canceled alias cannot close its raw reader
+	// and release the creator's process-wide locks during initialization.
+	info, statErr := file.Stat()
+	if statErr != nil {
+		_ = file.Close()
+		return nil, statErr
+	}
+	preflightReaders.Lock()
+	if state := preflightReaders.paths[path]; state != nil {
+		rememberPreflightInode(state, info)
+	}
+	preflightReaders.Unlock()
 	if err = file.Close(); err != nil {
 		return nil, err
 	}
