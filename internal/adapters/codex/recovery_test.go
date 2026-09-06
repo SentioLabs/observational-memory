@@ -45,8 +45,8 @@ func TestOrdinaryRunScriptEvidenceIsCaptured(t *testing.T) {
 	e["tool_input"] = map[string]any{"command": "sh scripts/run.sh test"}
 	e["tool_response"] = "Authentication tests failed."
 	invoke(t, store, e)
-	pending, err := open(t, store).Pending()
-	if err != nil || len(pending.Sources) != 1 || !strings.Contains(pending.Sources[0].Text, "tests failed") {
+	pending, err := open(t, store).ReadPending("")
+	if err != nil || len(pending.Page.Items) != 1 || !strings.Contains(pending.Page.Items[0].Text, "tests failed") {
 		t.Fatal("ordinary test evidence was excluded", err)
 	}
 }
@@ -103,8 +103,8 @@ func TestPausePrefixExcludesItsOwnPromptAndFollowingTools(t *testing.T) {
 	e["prompt"] = "Remember this permitted decision."
 	e["turn_id"] = "turn-2"
 	invoke(t, store, e)
-	pending, err := l.Pending()
-	if err != nil || len(pending.Sources) != 1 || pending.Sources[0].Text != e["prompt"] {
+	pending, err := l.ReadPending("")
+	if err != nil || len(pending.Page.Items) != 1 || pending.Page.Items[0].Text != e["prompt"] {
 		t.Fatal("resume did not retain only permitted evidence", err)
 	}
 }

@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
+
+	"github.com/sentiolabs/observational-memory/internal/ledger"
 )
 
 func run(t *testing.T, args []string, input string) (string, error) {
@@ -115,5 +118,71 @@ func TestV2MutationContract(t *testing.T) {
 	}
 	if _, err = run(t, append(base, "apply"), `{"expected_through":0,"expected_revision":0,"acknowledge":[]}`); err == nil {
 		t.Fatal("accepted stale writer")
+	}
+}
+
+func TestReadEnvelopeCLIReconstruction(t *testing.T) {
+	base := []string{"--store", t.TempDir(), "--session", "bounded"}
+	text := strings.Repeat("界🙂\x00\n\"\\", 4000)
+	payload, err := json.Marshal(map[string]any{"kind": "tool", "text": text, "key": "large"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, append(base, "capture"), string(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var captured ledger.CaptureReceipt
+	if err = json.Unmarshal([]byte(out), &captured); err != nil {
+		t.Fatal(err)
+	}
+	reconstructed := ""
+	token := ""
+	seen := map[string]bool{}
+	for {
+		args := append(append([]string{}, base...), "recall", captured.SourceID)
+		if token != "" {
+			args = append(args, "--cursor", token)
+		}
+		out, err = run(t, args, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(out) > ledger.ReadEnvelopeBytes || !utf8.ValidString(out) || !json.Valid([]byte(out)) || !strings.HasSuffix(out, "\n") {
+			t.Fatal("invalid complete stdout")
+		}
+		var page ledger.RecallPage
+		if err = json.Unmarshal([]byte(out), &page); err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range page.Page.Items {
+			if item.Evidence == nil || item.Evidence.StartByte != int64(len(reconstructed)) {
+				t.Fatal("lost evidence span")
+			}
+			reconstructed += item.Evidence.Text
+		}
+		if page.Page.NextCursor == "" {
+			break
+		}
+		if seen[page.Page.NextCursor] {
+			t.Fatal("nonadvancing cursor")
+		}
+		token = page.Page.NextCursor
+		seen[token] = true
+	}
+	if reconstructed != text {
+		t.Fatal("stdout source reconstruction changed")
+	}
+	for _, args := range [][]string{{"prime", "--cursor", token}, {"view", "--cursor", token}, {"view", "--all", "--cursor", token}, {"pending", "--cursor", "bad"}} {
+		out, err = run(t, append(append([]string{}, base...), args...), "")
+		if err == nil || out != "" {
+			t.Fatal("invalid cursor wrote partial output", args, err)
+		}
+	}
+	cmd := New()
+	var writer bytes.Buffer
+	cmd.SetOut(&writer)
+	if err = output(cmd, map[string]string{"oversize": strings.Repeat("\x00", 12000)}); err == nil || writer.Len() != 0 {
+		t.Fatal("oversized response partially written")
 	}
 }

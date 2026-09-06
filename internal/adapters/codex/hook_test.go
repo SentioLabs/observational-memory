@@ -2,7 +2,6 @@ package codex
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
@@ -57,11 +56,11 @@ func TestLifecycleAndContinuationExclusion(t *testing.T) {
 		t.Fatal("recursive Stop loop")
 	}
 	l := open(t, store)
-	pending, err := l.Pending()
+	pending, err := l.ReadPending("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending.Sources) != 2 || pending.Sources[0].Text != prompt["prompt"] {
+	if len(pending.Page.Items) != 2 || pending.Page.Items[0].Text != prompt["prompt"] {
 		t.Fatal("continuation entered source evidence")
 	}
 	cp := capturedCheckpoint(t, l)
@@ -102,11 +101,11 @@ func TestExcludedEventsAndPause(t *testing.T) {
 	tool["tool_input"] = map[string]any{"command": "'/example with spaces/om' --session hooks status"}
 	invoke(t, store, tool)
 	invoke(t, store, event("Unsupported"))
-	pending, err := l.Pending()
+	pending, err := l.ReadPending("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending.Sources) != 0 {
+	if len(pending.Page.Items) != 0 {
 		t.Fatal("captured excluded evidence")
 	}
 }
@@ -132,26 +131,20 @@ func capturedCheckpoint(t *testing.T, l *ledger.Ledger) ledger.CheckpointV2 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", l.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	rows, err := db.Query("SELECT id FROM evidence_units WHERE review_state='pending' ORDER BY seq")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
 	cp := ledger.CheckpointV2{ExpectedThrough: status.Through, ExpectedRevision: status.Revision, Acknowledge: []string{}}
-	for rows.Next() {
-		var id string
-		if err = rows.Scan(&id); err != nil {
+	token := ""
+	for {
+		page, err := l.ReadPending(token)
+		if err != nil {
 			t.Fatal(err)
 		}
-		cp.Acknowledge = append(cp.Acknowledge, id)
-	}
-	if err = rows.Err(); err != nil {
-		t.Fatal(err)
+		for _, unit := range page.Page.Items {
+			cp.Acknowledge = append(cp.Acknowledge, unit.ID)
+		}
+		if page.Page.NextCursor == "" {
+			break
+		}
+		token = page.Page.NextCursor
 	}
 	return cp
 }

@@ -29,8 +29,7 @@ func New() *cobra.Command {
 	root.PersistentFlags().StringVar(&opts.store, "store", os.Getenv("OBSERVATIONAL_MEMORY_STORE"), "Writable memory store")
 	root.PersistentFlags().StringVar(&opts.session, "session", "", "Exact session identity")
 	root.AddCommand(&cobra.Command{Use: "version", Short: "Show the runtime version", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		_, err := fmt.Fprintln(cmd.OutOrStdout(), "om "+Version)
-		return err
+		return output(cmd, "om "+Version)
 	}})
 	root.AddCommand(&cobra.Command{Use: "capabilities", Short: "Show the CLI contract and supported clients", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
 		return output(cmd, map[string]any{"version": Version, "protocol_version": ProtocolVersion, "ledger_schema": ledger.LedgerSchemaV2, "clients": []string{"codex"}})
@@ -80,7 +79,10 @@ func New() *cobra.Command {
 			return output(cmd, value)
 		}}
 	}
-	root.AddCommand(core("pending", "Read the next source chunk", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) { return l.Pending() }))
+	var pendingCursor string
+	pending := core("pending", "Read a bounded pending evidence page", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) { return l.ReadPending(pendingCursor) })
+	pending.Flags().StringVar(&pendingCursor, "cursor", "", "Opaque continuation token")
+	root.AddCommand(pending)
 	root.AddCommand(core("status", "Inspect session memory", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) { return l.Status() }))
 	root.AddCommand(core("prime", "Load prepared memory and checkpoint status", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) { return l.Prime() }))
 	root.AddCommand(core("capture", "Capture source JSON from stdin", cobra.NoArgs, func(cmd *cobra.Command, l *ledger.Ledger, _ []string) (any, error) {
@@ -113,15 +115,25 @@ func New() *cobra.Command {
 		}
 		return l.ApplyV2(checkpoint)
 	}))
-	root.AddCommand(core("recall ID", "Recall memory and supporting evidence", cobra.ExactArgs(1), func(_ *cobra.Command, l *ledger.Ledger, args []string) (any, error) { return l.Recall(args[0]) }))
+	var recallCursor string
+	recall := core("recall ID", "Recall a bounded memory and evidence page", cobra.ExactArgs(1), func(_ *cobra.Command, l *ledger.Ledger, args []string) (any, error) {
+		return l.ReadRecall(args[0], recallCursor)
+	})
+	recall.Flags().StringVar(&recallCursor, "cursor", "", "Opaque continuation token")
+	root.AddCommand(recall)
 	var all bool
-	view := core("view", "Show prepared memory", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) {
+	var viewCursor string
+	view := core("view", "Show prepared memory", cobra.NoArgs, func(cmd *cobra.Command, l *ledger.Ledger, _ []string) (any, error) {
 		if all {
-			return l.Entries(true)
+			return l.ReadEntries(viewCursor)
+		}
+		if cmd.Flags().Changed("cursor") {
+			return nil, fmt.Errorf("--cursor requires view --all")
 		}
 		return l.View()
 	})
 	view.Flags().BoolVar(&all, "all", false, "Include retired entries as JSON")
+	view.Flags().StringVar(&viewCursor, "cursor", "", "Opaque continuation token for --all")
 	root.AddCommand(view)
 	for _, name := range []string{"pause", "resume"} {
 		root.AddCommand(core(name, name+" automatic memory", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) {
@@ -182,23 +194,10 @@ func runHook(ctx context.Context, reader io.Reader, store string) (map[string]an
 	return codex.Handle(ctx, event, store, exe)
 }
 func output(cmd *cobra.Command, value any) error {
-	switch value.(type) {
-	case ledger.CaptureReceipt, ledger.ReceiptV2:
-		data, err := ledger.EncodeResponse(value)
-		if err != nil {
-			return err
-		}
-		_, err = cmd.OutOrStdout().Write(data)
-		return err
-	}
-	if text, ok := value.(string); ok {
-		_, err := fmt.Fprintln(cmd.OutOrStdout(), text)
-		return err
-	}
-	data, err := ledger.JSON(value)
+	body, err := ledger.EncodeResponse(value)
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(cmd.OutOrStdout(), string(data))
+	_, err = cmd.OutOrStdout().Write(body)
 	return err
 }

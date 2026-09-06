@@ -54,10 +54,9 @@ func TestRetirementRedactsKnownCredentials(t *testing.T) {
 	_, _, replacement := observe(t, l, "Use the replacement credential.")
 	_, err := l.ApplyV2(checkpointNow(t, l, CheckpointV2{Retire: []Retirement{{ID: old, Reason: "  Revoked sk-FAKESECRETFAKESECRETFAKESECRET  ", ReplacementIDs: []string{replacement}}}}))
 	check(t, err)
-	recall, err := l.Recall(old)
-	check(t, err)
-	if recall.Entry.Retirement.Reason != "Revoked [REDACTED CREDENTIAL]" {
-		t.Fatalf("retirement not redacted: %q", recall.Entry.Retirement.Reason)
+	recall := drainRecall(t, l, old)
+	if recall.fields[old+"/retirement.reason"] != "Revoked [REDACTED CREDENTIAL]" {
+		t.Fatalf("retirement not redacted: %q", recall.fields[old+"/retirement.reason"])
 	}
 }
 
@@ -104,22 +103,22 @@ func TestImportPreservesNewSessionPromptAndIsolation(t *testing.T) {
 	if status.PendingSources != 2 || status.Active.Observations != 1 || !status.Paused || status.LastCheckpointAt == "" || status.ImportedFrom == nil || status.ImportedFrom.Session != "source" {
 		t.Fatalf("wrong imported state: %+v", status)
 	}
-	pending, err := target.Pending()
+	pending, err := target.ReadPending("")
 	check(t, err)
-	if pending.Sources[1].ID != promptID || pending.Sources[1].Seq <= pending.Sources[0].Seq {
+	if pending.Page.Items[1].SourceID != promptID || pending.Page.Items[1].Seq <= pending.Page.Items[0].Seq {
 		t.Fatal("destination prompt was lost or not left pending")
 	}
-	incomingUnits := readTestUnits(t, target, pending.Sources[0].ID)
+	incomingUnits := readTestUnits(t, target, pending.Page.Items[0].SourceID)
 	localUnits := readTestUnits(t, target, promptID)
 	if localUnits[0].Seq <= incomingUnits[len(incomingUnits)-1].Seq || localUnits[0].ReviewState != ReviewPending {
 		t.Fatal("destination evidence units were not appended as pending")
 	}
 	sourceStatus, err := source.Status()
 	check(t, err)
-	if status.UnitCount != sourceStatus.UnitCount+int64(len(localUnits)) || status.StoredSourceBytes != sourceStatus.StoredSourceBytes+int64(len(pending.Sources[1].Text)) {
+	if status.UnitCount != sourceStatus.UnitCount+int64(len(localUnits)) || status.StoredSourceBytes != sourceStatus.StoredSourceBytes+int64(len(pending.Page.Items[1].Text)) {
 		t.Fatal("handoff lost v2 source/unit rows")
 	}
-	_, err = target.Recall(observation)
+	_, err = target.ReadRecall(observation, "")
 	check(t, err)
 	if state, _ := target.State("prompt_id"); state != promptID {
 		t.Fatal("destination prompt identity lost")

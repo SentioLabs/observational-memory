@@ -118,14 +118,12 @@ func TestRetirementAndRecallSurviveReopen(t *testing.T) {
 	if strings.Contains(view, "Use Rust.") {
 		t.Fatal("retired memory injected")
 	}
-	old, err := l.Recall(oid)
-	check(t, err)
-	if old.Entry.Active || old.Sources[0].ID != sid {
+	old := drainRecall(t, l, oid)
+	if old.headers[oid].Active || old.sources[sid] != "Use Rust." {
 		t.Fatal("retirement erased evidence")
 	}
-	r, err := l.Recall(reflected.Reflections[0])
-	check(t, err)
-	if len(r.Observations) != 1 || len(r.Sources) != 1 {
+	r := drainRecall(t, l, reflected.Reflections[0])
+	if len(r.headers) != 2 || len(r.sources) != 1 {
 		t.Fatal("reflection provenance lost")
 	}
 }
@@ -161,7 +159,7 @@ func TestForkAndConcurrentSessions(t *testing.T) {
 	_, _, oid := observe(t, l, "Shared evidence.")
 	check(t, l.SetState("stop_turn", "already-stopped"))
 	other := openTest(t, store, "other")
-	if _, err := other.Recall(oid); err == nil {
+	if _, err := other.ReadRecall(oid, ""); err == nil {
 		t.Fatal("session leak")
 	}
 	if _, err := l.Fork("other"); err == nil {
@@ -170,7 +168,7 @@ func TestForkAndConcurrentSessions(t *testing.T) {
 	_, err := l.Fork("child")
 	check(t, err)
 	child := openTest(t, store, "child")
-	_, err = child.Recall(oid)
+	_, err = child.ReadRecall(oid, "")
 	check(t, err)
 	state, err := child.State("stop_turn")
 	check(t, err)
@@ -178,9 +176,15 @@ func TestForkAndConcurrentSessions(t *testing.T) {
 		t.Fatal("fork copied transient state")
 	}
 	observe(t, child, "Child-only decision.")
-	entries, err := l.Entries(true)
+	entries, err := l.ReadEntries("")
 	check(t, err)
-	if len(entries) != 1 {
+	headers := 0
+	for _, item := range entries.Page.Items {
+		if item.Header != nil {
+			headers++
+		}
+	}
+	if headers != 1 {
 		t.Fatal("fork shares writes")
 	}
 	traversal := openTest(t, store, "../../escape")
@@ -204,9 +208,9 @@ func TestForkAndConcurrentSessions(t *testing.T) {
 	for err := range errs {
 		check(t, err)
 	}
-	pending, err := l.Pending()
+	pending, err := l.ReadPending("")
 	check(t, err)
-	if len(pending.Sources) != 8 {
+	if len(pending.Page.Items) != 8 {
 		t.Fatal("concurrent evidence lost")
 	}
 }
@@ -218,23 +222,18 @@ func TestUnicodeBoundsViewAndRedaction(t *testing.T) {
 	}
 	count := 0
 	for {
-		pending, err := l.Pending()
+		pending, err := l.ReadPending("")
 		check(t, err)
-		if len(pending.Sources) == 0 {
+		if len(pending.Page.Items) == 0 {
 			break
 		}
-		for _, s := range pending.Sources {
-			if s.Truncated || s.Text != strings.Repeat("🙂", 30000) {
-				t.Fatal("source was not retained completely")
-			}
-			count++
+		id := pending.Page.Items[0].SourceID
+		if drainRecall(t, l, id).sources[id] != strings.Repeat("🙂", 30000) {
+			t.Fatal("source was not retained completely")
 		}
-		deferrals := []SourceDeferral{}
-		for _, s := range pending.Sources {
-			deferrals = append(deferrals, SourceDeferral{SourceID: s.ID, Reason: "Routine retained log"})
-		}
-		_, err = l.ApplyV2(checkpointNow(t, l, CheckpointV2{DeferSources: deferrals}))
+		_, err = l.ApplyV2(checkpointNow(t, l, CheckpointV2{DeferSources: []SourceDeferral{{SourceID: id, Reason: "Routine retained log"}}}))
 		check(t, err)
+		count++
 	}
 	if count != 5 {
 		t.Fatal("backlog did not drain")
@@ -266,14 +265,13 @@ func TestRecallOrdersEvidence(t *testing.T) {
 	}
 	receipt, err := l.ApplyV2(checkpointNow(t, l, CheckpointV2{Acknowledge: pendingIDs(t, l), Observations: []ObservationV2{{Text: "Combined.", EvidenceIDs: ids}}}))
 	check(t, err)
-	recall, err := l.Recall(receipt.Observations[0])
-	check(t, err)
-	for i, s := range recall.Sources {
-		if s.Seq != int64(i+1) {
-			t.Fatal("sources reordered")
+	recall := drainRecall(t, l, receipt.Observations[0])
+	for i, e := range recall.evidence {
+		if e.Seq != int64(i+1) {
+			t.Fatal("evidence reordered")
 		}
 	}
-	if recall.Observations != nil {
+	if len(recall.headers) != 1 {
 		t.Fatal("duplicated observation")
 	}
 }
