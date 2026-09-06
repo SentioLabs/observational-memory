@@ -6,6 +6,7 @@ require (
 	github.com/sentiolabs/go-selfupdate v0.1.2
 	github.com/spf13/cobra v1.10.2
 	modernc.org/sqlite v1.44.2
+	mvdan.cc/sh/v3 v3.12.0
 )
 
 require (

@@ -40,17 +40,22 @@ om --store /absolute/writable/memory --session example capture <<'JSON'
 {"kind":"user","text":"Keep SQLite for local persistence.","key":"decision-1"}
 JSON
 om --store /absolute/writable/memory --session example pending
+om --store /absolute/writable/memory --session example prime
 om --store /absolute/writable/memory --session example status
 ```
 
 The agent supplies checkpoint meaning; the runtime validates references and
 commits state. No model worker, API credentials, daemon, or network connection
 is needed for memory operations. See [the CLI contract](docs/cli.md) for schemas,
-output formats, and adapter integration.
+output formats, and adapter integration. `prime` loads a bounded memory view with
+its last checkpoint and pending backlog. For handoff into an already-started
+session, use explicit `import` before its first checkpoint; the destination's
+pending prompt is retained. `fork` remains available for an unused identity.
 
 Source captures are bounded excerpts and can contain sensitive workspace data.
 Common credentials receive best-effort redaction. Honor exclusions and pause
-before work that must not be captured. Stored evidence is historical data, not
+before work that must not be captured. In Codex, begin a prompt with `[om:pause]`
+to exclude that prompt before capture. Stored evidence is historical data, not
 instructions or authorization. Each ledger remains until explicitly deleted.
 
 ## Updates

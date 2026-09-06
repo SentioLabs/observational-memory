@@ -10,9 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"time"
 
-	"modernc.org/sqlite"
+	_ "modernc.org/sqlite"
 )
 
 const schema = `
@@ -188,90 +187,4 @@ func readEntry(row scanner) (Entry, error) {
 }
 func entry(ctx context.Context, q queryer, id string) (Entry, error) {
 	return readEntry(q.QueryRowContext(ctx, "SELECT seq,body,active,retirement FROM entries WHERE id=?", id))
-}
-func (l *Ledger) Fork(destination string) (Status, error) {
-	if _, err := cleanText(destination, 256); err != nil {
-		return Status{}, err
-	}
-	if destination == l.session {
-		return Status{}, fmt.Errorf("choose a different destination session")
-	}
-	name, err := identity("session-", destination)
-	if err != nil {
-		return Status{}, err
-	}
-	dir := filepath.Join(l.store, name)
-	if err = os.Mkdir(dir, 0700); err != nil {
-		return Status{}, fmt.Errorf("destination already exists or cannot be created: %w", err)
-	}
-	path := filepath.Join(dir, "memory.sqlite3")
-	conn, err := l.db.Conn(l.ctx)
-	if err != nil {
-		return Status{}, err
-	}
-	err = conn.Raw(func(raw any) error {
-		api, ok := raw.(interface {
-			NewBackup(string) (*sqlite.Backup, error)
-		})
-		if !ok {
-			return fmt.Errorf("SQLite backup API unavailable")
-		}
-		backup, err := api.NewBackup((&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String())
-		if err != nil {
-			return err
-		}
-		deadline := time.Now().Add(2 * time.Second)
-		for {
-			if err = l.ctx.Err(); err != nil {
-				break
-			}
-			more, stepErr := backup.Step(100)
-			if stepErr != nil {
-				err = stepErr
-				break
-			}
-			if !more {
-				break
-			}
-			if time.Now().After(deadline) {
-				err = fmt.Errorf("snapshot exceeded two-second budget")
-				break
-			}
-		}
-		return errors.Join(err, backup.Finish())
-	})
-	closeErr := conn.Close()
-	if err = errors.Join(err, closeErr); err != nil {
-		return Status{}, err
-	}
-	// The copied session marker must be rewritten before Open validates it.
-	copied, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String())
-	if err != nil {
-		return Status{}, err
-	}
-	_, err = copied.ExecContext(l.ctx, "UPDATE meta SET value=? WHERE key='session'", destination)
-	closeErr = copied.Close()
-	if err = errors.Join(err, closeErr); err != nil {
-		return Status{}, err
-	}
-	target, err := Open(l.ctx, l.store, destination)
-	if err != nil {
-		return Status{}, err
-	}
-	defer target.Close()
-	tx, err := target.db.BeginTx(l.ctx, nil)
-	if err != nil {
-		return Status{}, err
-	}
-	defer tx.Rollback()
-	if err = setMeta(l.ctx, tx, "forked_from", l.session); err != nil {
-		return Status{}, err
-	}
-	if _, err = tx.ExecContext(l.ctx, "DELETE FROM meta WHERE key NOT IN ('session','version','cursor','paused','forked_from')"); err != nil {
-		return Status{}, err
-	}
-	if err = tx.Commit(); err != nil {
-		return Status{}, err
-	}
-	return target.Status()
 }
