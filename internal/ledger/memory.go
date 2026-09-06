@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -430,8 +431,7 @@ func (l *Ledger) Status() (Status, error) {
 	if err = conn.QueryRowContext(l.ctx, `SELECT COUNT(*),COALESCE(SUM(length(CAST(json_extract(body,'$.text') AS BLOB))),0) FROM sources`).Scan(&status.SourceCount, &status.StoredSourceBytes); err != nil {
 		return status, err
 	}
-	if err = conn.QueryRowContext(l.ctx, `SELECT COUNT(DISTINCT s.id),COALESCE(SUM(length(CAST(substr(CAST(json_extract(s.body,'$.text') AS BLOB),u.start_byte+1,u.end_byte-u.start_byte) AS TEXT))),0)
- FROM evidence_units u JOIN sources s ON s.id=u.source_id WHERE u.review_state='pending'`).Scan(&status.PendingSources, &status.PendingChars); err != nil {
+	if status.PendingSources, status.PendingChars, err = pendingCharacterCounts(l.ctx, conn); err != nil {
 		return status, err
 	}
 	if err = conn.QueryRowContext(l.ctx, `SELECT COALESCE(SUM(json_extract(body,'$.kind')='observation'),0),COALESCE(SUM(json_extract(body,'$.kind')='reflection'),0) FROM entries WHERE active=1`).Scan(&status.Active.Observations, &status.Active.Reflections); err != nil {
@@ -451,4 +451,35 @@ func (l *Ledger) Status() (Status, error) {
 	status.EstimatedPendingTokens = (status.PendingChars + 3) / 4
 	_, err = conn.ExecContext(l.ctx, "COMMIT")
 	return status, err
+}
+
+// These legacy character counts are separate from v2 byte coverage. Aggregating
+// ranges in a subquery decodes each pending source once, then counts only its
+// pending ranges. Go's rune count includes embedded NUL (SQLite length does not).
+func pendingCharacterCounts(ctx context.Context, q queryer) (sources, chars int64, err error) {
+	rows, err := q.QueryContext(ctx, `SELECT json_extract(s.body,'$.text'),
+ (SELECT json_group_array(json_array(start_byte,end_byte)) FROM evidence_units WHERE source_id=s.id AND review_state='pending')
+ FROM sources s WHERE EXISTS(SELECT 1 FROM evidence_units WHERE source_id=s.id AND review_state='pending')`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var text, encodedRanges string
+		if err = rows.Scan(&text, &encodedRanges); err != nil {
+			return 0, 0, err
+		}
+		var ranges [][2]int64
+		if err = json.Unmarshal([]byte(encodedRanges), &ranges); err != nil {
+			return 0, 0, err
+		}
+		for _, span := range ranges {
+			if span[0] < 0 || span[1] <= span[0] || span[1] > int64(len(text)) {
+				return 0, 0, fmt.Errorf("invalid evidence range in pending source")
+			}
+			chars += int64(utf8.RuneCountInString(text[span[0]:span[1]]))
+		}
+		sources++
+	}
+	return sources, chars, rows.Err()
 }

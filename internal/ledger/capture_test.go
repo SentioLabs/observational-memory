@@ -204,3 +204,47 @@ func TestSourceRetentionImmutableOriginAndLocalAge(t *testing.T) {
 		t.Fatal("deferred evidence counted as pending")
 	}
 }
+
+func TestSourceRetentionStatusCountsPendingUnicodeAndNUL(t *testing.T) {
+	l := openTest(t, t.TempDir(), "pending-characters")
+	receipt, err := l.CaptureV2(CaptureInput{Kind: "tool", Text: strings.Repeat("\x00\x01界🙂", 4000)})
+	check(t, err)
+	units := readTestUnits(t, l, receipt.SourceID)
+	_, err = l.db.Exec(`UPDATE evidence_units SET review_state='reviewed' WHERE id=?`, units[0].ID)
+	check(t, err)
+	_, err = l.db.Exec(`UPDATE evidence_units SET review_state='deferred' WHERE id=?`, units[2].ID)
+	check(t, err)
+	var pendingChars, pendingBytes int64
+	for i, u := range units {
+		if i != 0 && i != 2 {
+			pendingChars += int64(utf8.RuneCountInString(u.Text))
+			pendingBytes += int64(len(u.Text))
+		}
+	}
+	status, err := l.Status()
+	check(t, err)
+	if status.PendingChars != pendingChars || status.Coverage.Pending.Bytes != pendingBytes || status.PendingSources != 1 {
+		t.Fatalf("incorrect pending Unicode counts: got chars=%d bytes=%d; want chars=%d bytes=%d", status.PendingChars, status.Coverage.Pending.Bytes, pendingChars, pendingBytes)
+	}
+}
+
+func BenchmarkStatusEscapedSource(b *testing.B) {
+	l, err := Open(context.Background(), b.TempDir(), "escaped")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer l.Close()
+	if _, err = l.CaptureV2(CaptureInput{Kind: "tool", Text: strings.Repeat("\x01", 500000)}); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for b.Loop() {
+		status, err := l.Status()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if status.PendingChars != 500000 {
+			b.Fatal("incorrect character count")
+		}
+	}
+}

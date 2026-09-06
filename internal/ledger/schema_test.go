@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -293,5 +294,180 @@ func TestSchemaPreflightWALRefusalDoesNotCreateSidecars(t *testing.T) {
 		if !bytes.Equal(expected, actual) {
 			t.Fatal("preflight modified WAL database")
 		}
+	}
+}
+
+func TestSchemaPreflightCrashWriter(t *testing.T) {
+	path := os.Getenv("OM_TEST_CRASH_PATH")
+	if path == "" {
+		return
+	}
+	if os.Getenv("OM_TEST_CRASH_KIND") == "marker" {
+		check(t, os.WriteFile(filepath.Join(filepath.Dir(path), ".initializing"), nil, 0600))
+		_, err := createLedger(context.Background(), filepath.Dir(filepath.Dir(path)), path, "crash")
+		check(t, err)
+		os.Exit(0) // Commit succeeded, but the process never removes its marker.
+	}
+	db, err := sql.Open("sqlite", path)
+	check(t, err)
+	_, err = db.Exec(`PRAGMA cache_size=5; BEGIN IMMEDIATE; UPDATE meta SET value='2' WHERE key='version'; UPDATE payload SET value=randomblob(4096)`)
+	check(t, err)
+	os.Exit(0) // Simulate a crash after dirty pages spill, without rollback/close.
+}
+
+func runSchemaCrash(t *testing.T, path, kind string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestSchemaPreflightCrashWriter$")
+	cmd.Env = append(os.Environ(), "OM_TEST_CRASH_PATH="+path, "OM_TEST_CRASH_KIND="+kind)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("crash fixture: %v\n%s", err, out)
+	}
+}
+
+func TestSchemaPreflightReopensCommittedAbandonedMarker(t *testing.T) {
+	store := t.TempDir()
+	name, err := identity("session-", "crash")
+	check(t, err)
+	dir := filepath.Join(store, name)
+	check(t, os.Mkdir(dir, 0700))
+	path := filepath.Join(dir, "memory.sqlite3")
+	runSchemaCrash(t, path, "marker")
+	l, err := Open(context.Background(), store, "crash")
+	check(t, err)
+	defer l.Close()
+	_, err = l.Capture("user", "after interrupted startup", "recovered")
+	check(t, err)
+	if _, err = os.Stat(filepath.Join(dir, ".initializing")); err != nil {
+		t.Fatal("opener removed another creator's marker")
+	}
+}
+
+func TestSchemaPreflightRefusesHotJournalWithoutRecovery(t *testing.T) {
+	store := t.TempDir()
+	name, err := identity("session-", "crash")
+	check(t, err)
+	dir := filepath.Join(store, name)
+	check(t, os.Mkdir(dir, 0755))
+	path := filepath.Join(dir, "memory.sqlite3")
+	db, err := sql.Open("sqlite", path)
+	check(t, err)
+	_, err = db.Exec(`CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO meta VALUES('version','1'),('session','crash'); CREATE TABLE payload(value BLOB); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<400) INSERT INTO payload SELECT zeroblob(4096) FROM n;`)
+	check(t, err)
+	check(t, db.Close())
+	runSchemaCrash(t, path, "journal")
+	probe, err := sql.Open("sqlite", fileURI(path)+"?mode=ro&immutable=1")
+	check(t, err)
+	version, err := meta(context.Background(), probe, "version")
+	check(t, err)
+	check(t, probe.Close())
+	if version != "2" {
+		t.Fatalf("fixture did not spill uncommitted metadata: %q", version)
+	}
+	before := map[string][]byte{}
+	for _, suffix := range []string{"", "-journal"} {
+		check(t, os.Chmod(path+suffix, 0644))
+		before[suffix], err = os.ReadFile(path + suffix)
+		check(t, err)
+	}
+	if len(before["-journal"]) < 512 || bytes.Equal(before["-journal"][:8], make([]byte, 8)) {
+		t.Fatal("fixture is not a hot journal")
+	}
+	if l, err := Open(context.Background(), store, "crash"); err == nil {
+		l.Close()
+		t.Fatal("accepted incompatible hot journal")
+	}
+	for suffix, want := range before {
+		got, err := os.ReadFile(path + suffix)
+		check(t, err)
+		info, err := os.Stat(path + suffix)
+		check(t, err)
+		if !bytes.Equal(got, want) || info.Mode().Perm() != 0644 {
+			t.Fatal("refusal recovered or changed original", suffix)
+		}
+	}
+	info, err := os.Stat(dir)
+	check(t, err)
+	if info.Mode().Perm() != 0755 {
+		t.Fatal("refusal changed directory mode")
+	}
+	entries, err := os.ReadDir(dir)
+	check(t, err)
+	if len(entries) != 2 {
+		t.Fatal("refusal changed sidecar inventory")
+	}
+}
+
+func TestSchemaPreflightTightensExistingEmptyDirectory(t *testing.T) {
+	store := t.TempDir()
+	name, err := identity("session-", "existing-dir")
+	check(t, err)
+	dir := filepath.Join(store, name)
+	check(t, os.Mkdir(dir, 0755))
+	l := openTest(t, store, "existing-dir")
+	info, err := os.Stat(dir)
+	check(t, err)
+	if info.Mode().Perm() != 0700 {
+		t.Fatal("successful new ledger left directory accessible")
+	}
+	info, err = os.Stat(l.Path)
+	check(t, err)
+	if info.Mode().Perm() != 0600 {
+		t.Fatal("database permissions")
+	}
+}
+
+func TestSchemaPreflightWALModeWithoutSidecars(t *testing.T) {
+	store := t.TempDir()
+	name, err := identity("session-", "wal-closed")
+	check(t, err)
+	dir := filepath.Join(store, name)
+	check(t, os.Mkdir(dir, 0755))
+	path := filepath.Join(dir, "memory.sqlite3")
+	db, err := sql.Open("sqlite", path)
+	check(t, err)
+	_, err = db.Exec(`PRAGMA journal_mode=WAL; CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO meta VALUES('version','1'),('session','wal-closed')`)
+	check(t, err)
+	check(t, db.Close())
+	check(t, os.Chmod(path, 0644))
+	before, err := os.ReadFile(path)
+	check(t, err)
+	entries, err := os.ReadDir(dir)
+	check(t, err)
+	if len(entries) != 1 {
+		t.Fatal("fixture did not checkpoint/remove WAL")
+	}
+	if l, err := Open(context.Background(), store, "wal-closed"); err == nil {
+		l.Close()
+		t.Fatal("accepted incompatible WAL mode")
+	}
+	after, err := os.ReadFile(path)
+	check(t, err)
+	entries, err = os.ReadDir(dir)
+	check(t, err)
+	if !bytes.Equal(before, after) || len(entries) != 1 {
+		t.Fatal("read-only refusal changed checkpointed WAL store")
+	}
+}
+
+func TestSchemaPreflightDuringActiveRollbackWriter(t *testing.T) {
+	store := t.TempDir()
+	l := openTest(t, store, "active-writer")
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	check(t, err)
+	defer tx.Rollback()
+	check(t, setMeta(context.Background(), tx, "inflight", "not committed"))
+	opened, err := Open(context.Background(), store, "active-writer")
+	check(t, err)
+	defer opened.Close()
+	value, err := opened.State("inflight")
+	check(t, err)
+	if value != "" {
+		t.Fatal("preflight/open exposed uncommitted state")
+	}
+	check(t, tx.Commit())
+	value, err = opened.State("inflight")
+	check(t, err)
+	if value != "not committed" {
+		t.Fatal("reader did not see later committed state")
 	}
 }

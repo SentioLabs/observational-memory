@@ -102,6 +102,12 @@ func Open(ctx context.Context, store, session string) (*Ledger, error) {
 			return nil, err
 		}
 		if _, err = os.Stat(marker); err == nil {
+			// A process can exit after committing but before removing its marker.
+			// A successful committed-state probe lets us proceed without deleting any
+			// state that could still belong to a live creator.
+			if preflightExisting(ctx, path, session) == nil {
+				return openExisting(ctx, absolute, path, dir, session)
+			}
 			if !time.Now().Before(deadline) {
 				return nil, fmt.Errorf("ledger initialization still in progress; retry opening session")
 			}
@@ -145,21 +151,24 @@ func Open(ctx context.Context, store, session string) (*Ledger, error) {
 			return nil, err
 		}
 		l, err := createLedger(ctx, absolute, path, session)
+		if err == nil {
+			if err = os.Chmod(dir, 0700); err != nil {
+				_ = l.Close()
+				l = nil
+			}
+		}
 		_ = os.Remove(marker)
 		return l, err
 	}
 }
 
-func database(ctx context.Context, path string, readOnly, immutable bool) (*sql.DB, error) {
+func database(ctx context.Context, path string, readOnly bool) (*sql.DB, error) {
 	uri := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
 	params := url.Values{"_pragma": {"busy_timeout(2000)", "foreign_keys(1)"}, "_txlock": {"immediate"}}
 	if readOnly {
 		params.Set("mode", "ro")
 	} else {
 		params.Set("mode", "rw")
-	}
-	if immutable {
-		params.Set("immutable", "1")
 	}
 	uri.RawQuery = params.Encode()
 	db, err := sql.Open("sqlite", uri.String())
@@ -192,49 +201,53 @@ func validateStore(ctx context.Context, q queryer, session string) error {
 	return nil
 }
 func preflightExisting(ctx context.Context, path, session string) error {
-	// Immutable mode probes the main database without touching a WAL's shared
-	// memory. Identity/version never change after a store is provisioned.
-	probe := func(path string, immutable bool) error {
-		db, err := database(ctx, path, true, immutable)
+	probe := func(path string) error {
+		db, err := database(ctx, path, true)
 		if err != nil {
 			return err
 		}
 		defer db.Close()
 		return validateStore(ctx, db, session)
 	}
-	err := probe(path, true)
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	info, statErr := os.Stat(path + "-wal")
-	if errors.Is(statErr, os.ErrNotExist) {
+	// A normal read-only rollback-mode connection honors locks and reads only
+	// committed pages. A hot journal fails with READONLY_ROLLBACK before recovery
+	// can modify either original file. Immutable mode would expose dirty pages.
+	file, err := os.Open(path)
+	if err != nil {
 		return err
 	}
-	if statErr != nil {
-		return statErr
+	header := make([]byte, 20)
+	_, readErr := io.ReadFull(file, header)
+	_ = file.Close()
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		return readErr
 	}
-	if info.Size() == 0 {
+	walMode := header[18] == 2 || header[19] == 2
+	if _, err = os.Stat(path + "-wal"); err == nil {
+		walMode = true
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	// A fresh WAL database can hold its schema only in the log. SQLite's normal
-	// read-only mode may CREATE -shm there, so probe private copies instead. The
-	// originals are only opened for reading; all recovery side effects are private.
-	dir, copyErr := os.MkdirTemp("", "om-preflight-*")
-	if copyErr != nil {
-		return copyErr
+	if !walMode {
+		return probe(path)
+	}
+	// Even a checkpointed WAL-mode database with no current log can create WAL
+	// shared-memory files on a read-only open. Keep all those effects private.
+	dir, err := os.MkdirTemp("", "om-preflight-*")
+	if err != nil {
+		return err
 	}
 	defer os.RemoveAll(dir)
 	copied := filepath.Join(dir, "memory.sqlite3")
-	for _, suffix := range []string{"", "-wal"} {
-		if copyErr = copyPreflightFile(ctx, path+suffix, copied+suffix); copyErr != nil {
-			// A concurrent checkpoint may have removed the WAL after the initial probe.
-			if errors.Is(copyErr, os.ErrNotExist) {
-				return probe(path, true)
-			}
-			return copyErr
+	if err = copyPreflightFile(ctx, path, copied); err != nil {
+		return err
+	}
+	for _, suffix := range []string{"-wal", "-journal"} {
+		if err = copyPreflightFile(ctx, path+suffix, copied+suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
 	}
-	return probe(copied, false)
+	return probe(copied)
 }
 
 func copyPreflightFile(ctx context.Context, source, destination string) error {
@@ -268,7 +281,7 @@ func copyPreflightFile(ctx context.Context, source, destination string) error {
 	}
 }
 func openExisting(ctx context.Context, store, path, dir, session string) (*Ledger, error) {
-	db, err := database(ctx, path, false, false)
+	db, err := database(ctx, path, false)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +321,7 @@ func createLedger(ctx context.Context, store, path, session string) (result *Led
 	if err = file.Close(); err != nil {
 		return nil, err
 	}
-	db, err := database(ctx, path, false, false)
+	db, err := database(ctx, path, false)
 	if err != nil {
 		return nil, err
 	}
