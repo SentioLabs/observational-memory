@@ -14,6 +14,8 @@ import (
 
 const SourceLimit = 24000
 const PendingLimit = 48000
+
+// ViewLimit is measured in UTF-8 bytes so host transport limits remain predictable.
 const ViewLimit = 12000
 
 type Source struct {
@@ -69,15 +71,21 @@ type Counts struct {
 	Observations int64 `json:"observations"`
 	Reflections  int64 `json:"reflections"`
 }
+type SessionReference struct {
+	Store   string `json:"store"`
+	Session string `json:"session"`
+}
 type Status struct {
-	Session                string `json:"session"`
-	Database               string `json:"database"`
-	Paused                 bool   `json:"paused"`
-	Through                int64  `json:"through"`
-	PendingSources         int64  `json:"pending_sources"`
-	PendingChars           int64  `json:"pending_chars"`
-	EstimatedPendingTokens int64  `json:"estimated_pending_tokens"`
-	Active                 Counts `json:"active"`
+	Session                string            `json:"session"`
+	Database               string            `json:"database"`
+	Paused                 bool              `json:"paused"`
+	Through                int64             `json:"through"`
+	PendingSources         int64             `json:"pending_sources"`
+	PendingChars           int64             `json:"pending_chars"`
+	EstimatedPendingTokens int64             `json:"estimated_pending_tokens"`
+	LastCheckpointAt       string            `json:"last_checkpoint_at,omitempty"`
+	ImportedFrom           *SessionReference `json:"imported_from,omitempty"`
+	Active                 Counts            `json:"active"`
 }
 type Recall struct {
 	Entry        *Entry   `json:"entry,omitempty"`

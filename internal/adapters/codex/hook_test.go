@@ -70,8 +70,13 @@ func TestLifecycleAndContinuationExclusion(t *testing.T) {
 	}
 	start := event("SessionStart")
 	start["source"] = "compact"
-	if !strings.Contains(fmt.Sprint(invoke(t, store, start)), "Keep the API stable.") {
-		t.Fatal("memory not restored after compaction")
+	restored := fmt.Sprint(invoke(t, store, start))
+	if !strings.Contains(restored, " prime before continuing") || strings.Contains(restored, "Keep the API stable.") {
+		t.Fatal("compaction hook must direct prime without embedding memory")
+	}
+	primed, err := l.Prime()
+	if err != nil || !strings.Contains(primed, "Keep the API stable.") {
+		t.Fatal("prime did not restore memory", err)
 	}
 }
 func TestExcludedEventsAndPause(t *testing.T) {
@@ -91,7 +96,8 @@ func TestExcludedEventsAndPause(t *testing.T) {
 	prompt["agent_id"] = "worker"
 	invoke(t, store, prompt)
 	tool := event("PostToolUse")
-	tool["tool_input"] = map[string]any{"cmd": "/example with spaces/om --session hooks status"}
+	tool["tool_name"] = "Bash"
+	tool["tool_input"] = map[string]any{"command": "'/example with spaces/om' --session hooks status"}
 	invoke(t, store, tool)
 	invoke(t, store, event("Unsupported"))
 	pending, err := l.Pending()

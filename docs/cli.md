@@ -21,19 +21,30 @@ plugin's paths, IDs, sequence numbers, timestamps, support links, and cursors.
 | `capture` | `{kind,text,key}` | JSON `{source_id}` |
 | `pending` | None | JSON `{through,sources}` |
 | `apply` | Checkpoint object below | JSON `{through,observations,reflections,retired}` |
-| `status` | None | JSON session, database path, paused, through, pending counts, active counts |
-| `view` | None | Human-readable active memory, at most 12K characters |
+| `status` | None | JSON session, database path, paused, through, pending/active counts, last_checkpoint_at, imported_from |
+| `prime` | None | Prepared memory with session/store, checkpoint time and pending backlog |
+| `view` | None | Quoted active memory, at most 12K UTF-8 bytes including framing |
 | `view --all` | None | JSON array of active and retired entries |
 | `recall ID` | None | JSON entry and cited sources; reflections also include observations |
 | `pause` / `resume` | None | JSON status; client adapters honor the paused state |
 | `fork --to-session ID` | None | JSON status of a new independent snapshot |
+| `import --from-store PATH --from-session ID` | None | JSON status after importing into an uncheckpointed session |
 
 `kind` is `user`, `assistant`, or `tool`; `key` identifies the capture's origin.
 Source IDs begin with `s-`, observations with `o-`, and reflections with `r-`.
 Identical captures with the same role, origin key, and text are idempotent.
 Explicit capture remains available while automatic adapter capture is paused.
 Fork preserves evidence and checkpoint progress but clears transient adapter
-state. It never overwrites an existing destination session.
+state. It prepares its snapshot before publishing and never overwrites an existing
+destination session. A failed backup does not reserve the destination.
+
+Import handles a destination whose SessionStart hook already opened a ledger.
+It refuses checkpointed or previously imported memory, copies the source history
+and progress, then appends the destination's pending sources (including its initial
+prompt). It preserves the destination pause preference and clears transient Stop
+and reminder state. All changes commit together. A source typo fails without
+creating a new source ledger. `imported_from` records the source store and session
+for both operations; later writes remain isolated.
 
 A checkpoint's arrays are optional:
 
@@ -56,14 +67,15 @@ including its cursor. Identical observations at the same cursor do not duplicate
 or reactivate entries. Stale cursors fail; reread pending before retrying.
 
 Sources over 24K characters retain marked head/tail excerpts. Pending chunks are
-approximately 48K characters. Views prioritize reflections, importance, and
-recency, then display selected entries in ledger order. `view --all` and `recall`
+approximately 48K characters. Views prioritize importance across entry types, then reflections at equal
+importance, then recency. Selected entries display in ledger order with their
+text quoted so embedded newlines cannot impersonate another record. `view --all` and `recall`
 are unbounded inspection commands. Memory grows until its session directory is
 explicitly removed. Timestamps describe capture time, not inferred event time.
 
 CLI failures exit nonzero and write diagnostics to stderr. Input is one JSON
 object limited to 4 MB. Successful machine-readable operations write JSON only
-to stdout; plain `view` is the documented text exception.
+to stdout; `prime` and plain `view` are the documented text exceptions.
 
 ## Codex adapter
 
@@ -72,7 +84,7 @@ om --store /absolute/plugin-data hook --client codex
 ```
 
 Reads one Codex event JSON object from stdin. Handles `SessionStart`,
-`UserPromptSubmit`, `PostToolUse`, and `Stop`; unsupported events and subagent
+`UserPromptSubmit`, `PostToolUse`, `Stop`, and `Interrupt`; unsupported events and subagent
 events with `agent_id` are ignored. The event supplies `session_id`. The caller
 passes `--store` explicitly, typically from Codex's `PLUGIN_DATA`.
 
@@ -81,6 +93,19 @@ bounded checkpoint continuation per turn. It excludes its own continuation and
 ledger tool calls from capture. Errors produce an advisory hook JSON response
 and stderr diagnostics, allowing the user's task to continue. CLI argument
 errors remain nonzero. Native Codex compaction stays in control.
+
+SessionStart emits a small reminder to run `prime`, including the exact ledger
+command, last successful checkpoint and pending count. The model loads memory
+as normal tool output; no memory body is embedded in hook additionalContext.
+Interrupt leaves sources pending and does not initiate model work. Beginning a
+user prompt with `[om:pause]` pauses before capturing that prompt. Ordinary
+natural-language exclusions require the model to act after prompt capture.
+
+Self-capture suppression parses Bash commands without executing them. It skips
+only unambiguous calls to the exact runtime or scoped `om`; mixed commands and
+ordinary project scripts named `scripts/run.sh` remain evidence. Model commands
+need write permission for the store (including SQLite journals), independently
+of hook permissions. Grant only that directory through normal host controls.
 
 The Codex marketplace owns skill instructions and hook registration. A future
 Claude Code adapter will translate its separately verified event contract into

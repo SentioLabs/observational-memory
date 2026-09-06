@@ -82,6 +82,7 @@ func New() *cobra.Command {
 	}
 	root.AddCommand(core("pending", "Read the next source chunk", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) { return l.Pending() }))
 	root.AddCommand(core("status", "Inspect session memory", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) { return l.Status() }))
+	root.AddCommand(core("prime", "Load prepared memory and checkpoint status", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) { return l.Prime() }))
 	root.AddCommand(core("capture", "Capture source JSON from stdin", cobra.NoArgs, func(cmd *cobra.Command, l *ledger.Ledger, _ []string) (any, error) {
 		var capture struct {
 			Kind string  `json:"kind"`
@@ -134,6 +135,13 @@ func New() *cobra.Command {
 	fork := core("fork", "Copy a snapshot to a new session", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) { return l.Fork(destination) })
 	fork.Flags().StringVar(&destination, "to-session", "", "Unused destination session identity")
 	root.AddCommand(fork)
+	var sourceStore, sourceSession string
+	importMemory := core("import", "Import a snapshot, preserving this session's pending sources", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) {
+		return l.Import(sourceStore, sourceSession)
+	})
+	importMemory.Flags().StringVar(&sourceStore, "from-store", "", "Explicit source store")
+	importMemory.Flags().StringVar(&sourceSession, "from-session", "", "Exact source session identity")
+	root.AddCommand(importMemory)
 	root.AddCommand(cobracmd.New(update.New(Version)))
 	return root
 }

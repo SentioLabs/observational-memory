@@ -11,6 +11,10 @@ import (
 	"github.com/sentiolabs/observational-memory/internal/ledger"
 )
 
+// Codex counts approximately four UTF-8 bytes per hook-context token. Keep the
+// complete payload within its configured 2,500-token allowance.
+const ContextLimit = 10000
+
 func field(event map[string]any, key string) string { s, _ := event[key].(string); return s }
 func quote(s string) string                         { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 func contextOutput(event, text string) map[string]any {
@@ -22,7 +26,7 @@ func Handle(ctx context.Context, event map[string]any, store, executable string)
 		return nil, fmt.Errorf("hook input must be an object")
 	}
 	name := field(event, "hook_event_name")
-	if name != "SessionStart" && name != "UserPromptSubmit" && name != "PostToolUse" && name != "Stop" {
+	if name != "SessionStart" && name != "UserPromptSubmit" && name != "PostToolUse" && name != "Stop" && name != "Interrupt" {
 		return empty, nil
 	}
 	if field(event, "agent_id") != "" {
@@ -44,16 +48,35 @@ func Handle(ctx context.Context, event map[string]any, store, executable string)
 	canonical := filepath.Dir(filepath.Dir(l.Path))
 	command := fmt.Sprintf("%s --store %s --session %s", quote(executable), quote(canonical), quote(session))
 	guidance := "Use $observational-memory to checkpoint new decisions, constraints, corrections, completions and blockers before ending substantive work. Ledger command: " + command + ". Read pending and apply a grounded checkpoint; an empty observation list is valid for routine content. This ledger is scoped to this session. Follow the user's current memory preferences. "
+	if len(guidance)+512 > ContextLimit {
+		return nil, fmt.Errorf("ledger command exceeds the hook context budget")
+	}
 	turn := field(event, "turn_id")
 	switch name {
 	case "SessionStart":
-		view, err := l.View()
+		status, err := l.Status()
 		if err != nil {
 			return nil, err
 		}
-		return contextOutput(name, guidance+"\n"+view), nil
+		checkpoint := status.LastCheckpointAt
+		if checkpoint == "" {
+			checkpoint = "none"
+		}
+		prefix := guidance + fmt.Sprintf("\nMemory status: %d pending sources; checkpoint cursor %d; last checkpoint %s.\n", status.PendingSources, status.Through, checkpoint)
+		if status.PendingSources > 0 {
+			prefix += "Prepared memory does not yet cover that backlog. Read pending and checkpoint relevant evidence before relying on this view as complete.\n"
+		}
+		return contextOutput(name, prefix+"Run prime before continuing, using the ledger command above, to load prepared memory as tool output. This hook carries the reminder, not the memory body."), nil
 	case "UserPromptSubmit":
 		prompt := field(event, "prompt")
+		// This explicit prefix is checked before any capture, so an exclusion
+		// can apply to its own prompt without asking a hook to interpret prose.
+		if strings.HasPrefix(strings.TrimSpace(prompt), "[om:pause]") {
+			if err := l.Pause(true); err != nil {
+				return nil, err
+			}
+			return contextOutput(name, "Observational memory is paused. This prompt was not captured. Resume only when the user requests it."), nil
+		}
 		ownPrompt, err := l.State("stop_prompt")
 		if err != nil {
 			return nil, err
@@ -72,11 +95,7 @@ func Handle(ctx context.Context, event map[string]any, store, executable string)
 		}
 		return contextOutput(name, guidance), nil
 	case "PostToolUse":
-		input, err := ledger.JSON(event["tool_input"])
-		if err != nil {
-			return nil, err
-		}
-		if strings.Contains(string(input), executable) || strings.Contains(string(input), "scripts/run.sh") {
+		if memoryCommand(event, executable, canonical, session) {
 			return empty, nil
 		}
 		text, err := ledger.JSON(map[string]any{"tool": event["tool_name"], "input": event["tool_input"], "response": event["tool_response"]})
@@ -105,6 +124,10 @@ func Handle(ctx context.Context, event map[string]any, store, executable string)
 			}
 			return contextOutput(name, guidance+"The observation checkpoint is due now."), nil
 		}
+		return empty, nil
+	case "Interrupt":
+		// Captured evidence remains pending. A later resume displays its backlog;
+		// interruption never starts model work or fabricates an assistant source.
 		return empty, nil
 	case "Stop":
 		key := turn
