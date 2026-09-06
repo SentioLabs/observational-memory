@@ -29,18 +29,6 @@ go build -o om ./cmd/om
 ./om capabilities
 ```
 
-### Upgrading from v0.1.1
-
-The executable is now named `om`. For an existing standalone v0.1.1 installation,
-download and verify the new release archive, then install its `om` binary on PATH.
-The old updater requires an archive member named `observational-memory` and cannot
-perform this rename. After this one-time installation, use `om self update`.
-For a Codex plugin installation, rerun the plugin's setup script.
-
-Continue using the same `--store` directory and session names. The SQLite schema,
-`OBSERVATIONAL_MEMORY_STORE` environment variable, update preferences, repository,
-and `$observational-memory` skill retain their existing names.
-
 ## CLI
 
 Pass an explicit store and session. `OBSERVATIONAL_MEMORY_STORE` is an optional
