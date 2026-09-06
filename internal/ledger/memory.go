@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 	"unicode/utf8"
 )
 
@@ -20,7 +19,7 @@ func (l *Ledger) Pending() (Pending, error) {
 		return Pending{}, err
 	}
 	pending := Pending{Through: through, Sources: []Source{}}
-	rows, err := l.db.QueryContext(l.ctx, "SELECT seq,body FROM sources WHERE seq>? ORDER BY seq", through)
+	rows, err := l.db.QueryContext(l.ctx, "SELECT DISTINCT s.seq,s.body FROM sources s JOIN evidence_units u ON u.source_id=s.id WHERE u.review_state='pending' ORDER BY s.seq")
 	if err != nil {
 		return pending, err
 	}
@@ -40,7 +39,6 @@ func (l *Ledger) Pending() (Pending, error) {
 			break
 		}
 		size += cost
-		pending.Through = s.Seq
 		pending.Sources = append(pending.Sources, s)
 	}
 	return pending, rows.Err()
@@ -116,126 +114,13 @@ func insertEntry(ctx context.Context, q queryer, kind, timestamp, importance, te
 	_, err = q.ExecContext(ctx, "INSERT OR IGNORE INTO entries(id,body,effective_priority) VALUES (?,?,?)", id, string(body), importanceRank(importance))
 	return id, err
 }
-func (l *Ledger) Apply(checkpoint Checkpoint) (Receipt, error) {
-	receipt := Receipt{Observations: []string{}, Reflections: []string{}, Retired: []string{}}
-	if checkpoint.Through == nil {
-		return receipt, fmt.Errorf("checkpoint through is required")
-	}
-	receipt.Through = *checkpoint.Through
-	tx, err := l.db.BeginTx(l.ctx, nil)
-	if err != nil {
-		return receipt, err
-	}
-	defer tx.Rollback()
-	var maximum int64
-	if err = tx.QueryRowContext(l.ctx, "SELECT COALESCE(MAX(seq),0) FROM sources").Scan(&maximum); err != nil {
-		return receipt, err
-	}
-	through, err := cursor(l.ctx, tx)
-	if err != nil {
-		return receipt, err
-	}
-	if through > receipt.Through || receipt.Through > maximum {
-		return receipt, fmt.Errorf("stale or out-of-range checkpoint cursor; reread pending")
-	}
-	for _, proposal := range checkpoint.Observations {
-		support, err := supportIDs(proposal.SourceIDs)
-		if err != nil {
-			return receipt, err
-		}
-		timestamp := ""
-		for _, id := range support {
-			s, err := source(l.ctx, tx, id)
-			if err != nil {
-				return receipt, fmt.Errorf("unknown source %s: %w", id, err)
-			}
-			if s.Seq > receipt.Through {
-				return receipt, fmt.Errorf("source is beyond checkpoint cursor")
-			}
-			if s.Timestamp > timestamp {
-				timestamp = s.Timestamp
-			}
-		}
-		id, err := insertEntry(l.ctx, tx, "observation", timestamp, proposal.Importance, proposal.Text, support)
-		if err != nil {
-			return receipt, err
-		}
-		receipt.Observations = append(receipt.Observations, id)
-	}
-	for _, proposal := range checkpoint.Reflections {
-		support, err := supportIDs(proposal.ObservationIDs)
-		if err != nil {
-			return receipt, err
-		}
-		timestamp := ""
-		for _, id := range support {
-			e, err := entry(l.ctx, tx, id)
-			if err != nil {
-				return receipt, err
-			}
-			if e.Kind != "observation" || !e.Active {
-				return receipt, fmt.Errorf("reflection support must be active observations")
-			}
-			if e.Timestamp > timestamp {
-				timestamp = e.Timestamp
-			}
-		}
-		id, err := insertEntry(l.ctx, tx, "reflection", timestamp, "medium", proposal.Text, support)
-		if err != nil {
-			return receipt, err
-		}
-		receipt.Reflections = append(receipt.Reflections, id)
-	}
-	for _, change := range checkpoint.Retire {
-		old, err := entry(l.ctx, tx, change.ID)
-		if err != nil {
-			return receipt, err
-		}
-		change.Reason, err = cleanText(change.Reason, 1000)
-		if err != nil {
-			return receipt, err
-		}
-		change.Reason = Redact(change.Reason)
-		replacements, err := supportIDs(change.ReplacementIDs)
-		if err != nil {
-			return receipt, err
-		}
-		for _, id := range replacements {
-			newer, err := entry(l.ctx, tx, id)
-			if err != nil {
-				return receipt, err
-			}
-			if !newer.Active || newer.Seq <= old.Seq {
-				return receipt, fmt.Errorf("replacement must be newer and active")
-			}
-			if newer.Kind != old.Kind && !(newer.Kind == "reflection" && slices.Contains(newer.Support, old.ID)) {
-				return receipt, fmt.Errorf("replacement must supersede the same kind or be a supporting reflection")
-			}
-		}
-		body, err := JSON(change)
-		if err != nil {
-			return receipt, err
-		}
-		if _, err = tx.ExecContext(l.ctx, "UPDATE entries SET active=0,retirement=? WHERE id=?", string(body), change.ID); err != nil {
-			return receipt, err
-		}
-		receipt.Retired = append(receipt.Retired, change.ID)
-	}
-	// Development-only legacy checkpoint callers still resolve source spans.
-	// T2 replaces this path with explicit evidence acknowledgments.
-	if _, err = tx.ExecContext(l.ctx, `UPDATE evidence_units SET review_state='reviewed' WHERE review_state='pending' AND source_id IN (SELECT id FROM sources WHERE seq<=?)`, receipt.Through); err != nil {
-		return receipt, err
-	}
-	if err = setMeta(l.ctx, tx, "cursor", strconv.FormatInt(receipt.Through, 10)); err != nil {
-		return receipt, err
-	}
-	if err = setMeta(l.ctx, tx, "last_checkpoint_at", time.Now().UTC().Format(time.RFC3339)); err != nil {
-		return receipt, err
-	}
-	return receipt, tx.Commit()
-}
 func (l *Ledger) Recall(id string) (Recall, error) {
 	result := Recall{Sources: []Source{}}
+	if strings.HasPrefix(id, "e-") {
+		if err := l.db.QueryRowContext(l.ctx, "SELECT source_id FROM evidence_units WHERE id=?", id).Scan(&id); err != nil {
+			return result, err
+		}
+	}
 	if strings.HasPrefix(id, "s-") {
 		s, err := source(l.ctx, l.db, id)
 		if err != nil {
@@ -265,6 +150,11 @@ func (l *Ledger) Recall(id string) (Recall, error) {
 	seen := map[string]bool{}
 	for _, o := range observations {
 		for _, id := range o.Support {
+			var sourceID string
+			if err := l.db.QueryRowContext(l.ctx, "SELECT source_id FROM evidence_units WHERE id=?", id).Scan(&sourceID); err != nil {
+				return result, err
+			}
+			id = sourceID
 			if seen[id] {
 				continue
 			}
@@ -402,32 +292,10 @@ func (l *Ledger) Status() (Status, error) {
 	if status.Revision, err = strconv.ParseInt(revision, 10, 64); err != nil {
 		return status, err
 	}
-	rows, err := conn.QueryContext(l.ctx, `SELECT review_state,COUNT(*),COALESCE(SUM(end_byte-start_byte),0) FROM evidence_units GROUP BY review_state`)
-	if err != nil {
+	if status.Coverage, err = coverageWithinTx(l.ctx, conn); err != nil {
 		return status, err
 	}
-	for rows.Next() {
-		var state ReviewState
-		var count CoverageCount
-		if err = rows.Scan(&state, &count.Units, &count.Bytes); err != nil {
-			rows.Close()
-			return status, err
-		}
-		switch state {
-		case ReviewPending:
-			status.Coverage.Pending = count
-		case ReviewReviewed:
-			status.Coverage.Reviewed = count
-		case ReviewDeferred:
-			status.Coverage.Deferred = count
-		}
-		status.UnitCount += count.Units
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return status, err
-	}
+	status.UnitCount = status.Coverage.Pending.Units + status.Coverage.Reviewed.Units + status.Coverage.Deferred.Units
 	if err = conn.QueryRowContext(l.ctx, `SELECT COUNT(*),COALESCE(SUM(length(CAST(json_extract(body,'$.text') AS BLOB))),0) FROM sources`).Scan(&status.SourceCount, &status.StoredSourceBytes); err != nil {
 		return status, err
 	}

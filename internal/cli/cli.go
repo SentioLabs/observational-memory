@@ -18,7 +18,7 @@ import (
 
 var Version = "dev"
 
-const ProtocolVersion = 1
+const ProtocolVersion = ledger.ProtocolVersionV2
 
 type options struct{ store, session string }
 
@@ -33,7 +33,7 @@ func New() *cobra.Command {
 		return err
 	}})
 	root.AddCommand(&cobra.Command{Use: "capabilities", Short: "Show the CLI contract and supported clients", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		return output(cmd, map[string]any{"version": Version, "protocol_version": ProtocolVersion, "ledger_schema": 1, "clients": []string{"codex"}})
+		return output(cmd, map[string]any{"version": Version, "protocol_version": ProtocolVersion, "ledger_schema": ledger.LedgerSchemaV2, "clients": []string{"codex"}})
 	}})
 	var protocol int
 	var compatibleClient string
@@ -84,11 +84,7 @@ func New() *cobra.Command {
 	root.AddCommand(core("status", "Inspect session memory", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) { return l.Status() }))
 	root.AddCommand(core("prime", "Load prepared memory and checkpoint status", cobra.NoArgs, func(_ *cobra.Command, l *ledger.Ledger, _ []string) (any, error) { return l.Prime() }))
 	root.AddCommand(core("capture", "Capture source JSON from stdin", cobra.NoArgs, func(cmd *cobra.Command, l *ledger.Ledger, _ []string) (any, error) {
-		var capture struct {
-			Kind string  `json:"kind"`
-			Text string  `json:"text"`
-			Key  *string `json:"key"`
-		}
+		var capture ledger.CaptureInput
 		data, err := input(cmd.InOrStdin())
 		if err != nil {
 			return nil, err
@@ -96,22 +92,26 @@ func New() *cobra.Command {
 		if err = ledger.Decode(data, &capture); err != nil {
 			return nil, err
 		}
-		if capture.Key == nil {
+		var fields map[string]json.RawMessage
+		if err = json.Unmarshal(data, &fields); err != nil {
+			return nil, err
+		}
+		key, ok := fields["key"]
+		if !ok || bytes.Equal(bytes.TrimSpace(key), []byte("null")) {
 			return nil, fmt.Errorf("capture key is required")
 		}
-		id, err := l.Capture(capture.Kind, capture.Text, *capture.Key)
-		return map[string]string{"source_id": id}, err
+		return l.CaptureV2(capture)
 	}))
 	root.AddCommand(core("apply", "Apply checkpoint JSON from stdin", cobra.NoArgs, func(cmd *cobra.Command, l *ledger.Ledger, _ []string) (any, error) {
-		var checkpoint ledger.Checkpoint
 		data, err := input(cmd.InOrStdin())
 		if err != nil {
 			return nil, err
 		}
-		if err = ledger.Decode(data, &checkpoint); err != nil {
+		checkpoint, err := ledger.DecodeCheckpointV2(data)
+		if err != nil {
 			return nil, err
 		}
-		return l.Apply(checkpoint)
+		return l.ApplyV2(checkpoint)
 	}))
 	root.AddCommand(core("recall ID", "Recall memory and supporting evidence", cobra.ExactArgs(1), func(_ *cobra.Command, l *ledger.Ledger, args []string) (any, error) { return l.Recall(args[0]) }))
 	var all bool
@@ -182,6 +182,15 @@ func runHook(ctx context.Context, reader io.Reader, store string) (map[string]an
 	return codex.Handle(ctx, event, store, exe)
 }
 func output(cmd *cobra.Command, value any) error {
+	switch value.(type) {
+	case ledger.CaptureReceipt, ledger.ReceiptV2:
+		data, err := ledger.EncodeResponse(value)
+		if err != nil {
+			return err
+		}
+		_, err = cmd.OutOrStdout().Write(data)
+		return err
+	}
 	if text, ok := value.(string); ok {
 		_, err := fmt.Fprintln(cmd.OutOrStdout(), text)
 		return err

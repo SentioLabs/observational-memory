@@ -14,16 +14,14 @@ import (
 
 func TestMixedKindViewKeepsCriticalCorrection(t *testing.T) {
 	l := openTest(t, t.TempDir(), "priority")
-	through, _, observation := observe(t, l, "Earlier background information.")
+	_, _, observation := observe(t, l, "Earlier background information.")
 	for i := range 6 {
-		_, err := l.Apply(Checkpoint{Through: ptr(through), Reflections: []Reflection{{Text: fmt.Sprintf("Background %d: %s", i, strings.Repeat("detail ", 260)), ObservationIDs: []string{observation}}}})
+		_, err := l.ApplyV2(checkpointNow(t, l, CheckpointV2{Reflections: []Reflection{{Text: fmt.Sprintf("Background %d: %s", i, strings.Repeat("detail ", 260)), ObservationIDs: []string{observation}}}}))
 		check(t, err)
 	}
 	source, err := l.Capture("user", "The correction overrides the previous plan.", "new")
 	check(t, err)
-	pending, err := l.Pending()
-	check(t, err)
-	_, err = l.Apply(Checkpoint{Through: ptr(pending.Through), Observations: []Observation{{Text: "CRITICAL CORRECTION: " + strings.Repeat("Keep the new constraint. ", 40), Importance: "critical", SourceIDs: []string{source}}}})
+	_, err = l.ApplyV2(checkpointNow(t, l, CheckpointV2{Acknowledge: pendingIDs(t, l), Observations: []ObservationV2{{Text: "CRITICAL CORRECTION: " + strings.Repeat("Keep the new constraint. ", 40), Importance: "critical", EvidenceIDs: []string{evidenceID(t, l, source)}}}}))
 	check(t, err)
 	view, err := l.View()
 	check(t, err)
@@ -53,8 +51,8 @@ func TestViewByteBudgetAndQuotedEvidence(t *testing.T) {
 func TestRetirementRedactsKnownCredentials(t *testing.T) {
 	l := openTest(t, t.TempDir(), "redaction")
 	_, _, old := observe(t, l, "Previous credential was retired.")
-	through, _, replacement := observe(t, l, "Use the replacement credential.")
-	_, err := l.Apply(Checkpoint{Through: ptr(through), Retire: []Retirement{{ID: old, Reason: "  Revoked sk-FAKESECRETFAKESECRETFAKESECRET  ", ReplacementIDs: []string{replacement}}}})
+	_, _, replacement := observe(t, l, "Use the replacement credential.")
+	_, err := l.ApplyV2(checkpointNow(t, l, CheckpointV2{Retire: []Retirement{{ID: old, Reason: "  Revoked sk-FAKESECRETFAKESECRETFAKESECRET  ", ReplacementIDs: []string{replacement}}}}))
 	check(t, err)
 	recall, err := l.Recall(old)
 	check(t, err)

@@ -35,11 +35,9 @@ func observe(t *testing.T, l *Ledger, text string) (int64, string, string) {
 	t.Helper()
 	sid, err := l.Capture("user", text, text)
 	check(t, err)
-	pending, err := l.Pending()
+	receipt, err := l.ApplyV2(checkpointNow(t, l, CheckpointV2{Acknowledge: pendingIDs(t, l), Observations: []ObservationV2{{Text: text, Importance: "high", EvidenceIDs: []string{evidenceID(t, l, sid)}}}}))
 	check(t, err)
-	receipt, err := l.Apply(Checkpoint{Through: ptr(pending.Through), Observations: []Observation{{Text: text, Importance: "high", SourceIDs: []string{sid}}}})
-	check(t, err)
-	return pending.Through, sid, receipt.Observations[0]
+	return receipt.Through, sid, receipt.Observations[0]
 }
 func TestLegacyRustStoreRefused(t *testing.T) {
 	data, err := os.ReadFile("testdata/rust-schema-1.json")
@@ -81,53 +79,37 @@ func TestLegacyRustStoreRefused(t *testing.T) {
 
 func TestCheckpointRollbackIdempotencyAndStaleCursor(t *testing.T) {
 	l := openTest(t, t.TempDir(), "atomic")
-	sid, err := l.Capture("user", "Keep the API stable.", "one")
+	captured, err := l.CaptureV2(CaptureInput{Kind: "user", Text: "Keep the API stable.", Key: "one"})
 	check(t, err)
-	_, err = l.Apply(Checkpoint{Through: ptr(1), Observations: []Observation{{Text: "Valid fact.", SourceIDs: []string{sid}}, {Text: "Unsupported.", SourceIDs: []string{"s-missing"}}}})
-	if err == nil {
-		t.Fatal("accepted unsupported source")
+	cp := checkpointNow(t, l, CheckpointV2{Acknowledge: []string{captured.FirstUnitID}, Observations: []ObservationV2{{Text: "Valid fact.", EvidenceIDs: []string{captured.FirstUnitID}}, {Text: "Unsupported.", EvidenceIDs: []string{"e-missing"}}}})
+	before := checkpointSnapshot(t, l)
+	if _, err = l.ApplyV2(cp); err == nil || before != checkpointSnapshot(t, l) {
+		t.Fatal("invalid support mutated checkpoint")
 	}
-	entries, err := l.Entries(true)
+	cp.Observations = cp.Observations[:1]
+	one, err := l.ApplyV2(cp)
 	check(t, err)
-	if len(entries) != 0 {
-		t.Fatal("partial checkpoint committed")
-	}
-	status, err := l.Status()
-	check(t, err)
-	if status.Through != 0 {
-		t.Fatal("failed checkpoint advanced cursor")
-	}
-	cp := Checkpoint{Through: ptr(1), Observations: []Observation{{Text: "Stable API.", SourceIDs: []string{sid}}}}
-	one, err := l.Apply(cp)
-	check(t, err)
-	two, err := l.Apply(cp)
+	two, err := l.ApplyV2(cp)
 	check(t, err)
 	if !reflect.DeepEqual(one, two) {
 		t.Fatal("checkpoint not idempotent")
 	}
-	_, err = l.Apply(Checkpoint{Through: ptr(0)})
-	if err == nil {
-		t.Fatal("accepted stale cursor")
-	}
-	_, err = l.Apply(Checkpoint{Through: ptr(99)})
-	if err == nil {
-		t.Fatal("accepted future cursor")
-	}
-	_, err = l.Apply(Checkpoint{})
-	if err == nil {
-		t.Fatal("accepted missing cursor")
+	for _, bad := range []CheckpointV2{{ExpectedThrough: 0}, {ExpectedThrough: 99}, {ExpectedThrough: one.Through, ExpectedRevision: 0}} {
+		if _, err = l.ApplyV2(bad); err == nil {
+			t.Fatal("accepted stale or future cursor/revision")
+		}
 	}
 }
 func TestRetirementAndRecallSurviveReopen(t *testing.T) {
 	store := t.TempDir()
 	l := openTest(t, store, "retire")
 	_, sid, oid := observe(t, l, "Use Rust.")
-	through, _, newID := observe(t, l, "User chose Go, replacing Rust.")
-	_, err := l.Apply(Checkpoint{Through: ptr(through), Retire: []Retirement{{ID: oid, Reason: "Explicit correction", ReplacementIDs: []string{newID}}}})
+	_, _, newID := observe(t, l, "User chose Go, replacing Rust.")
+	_, err := l.ApplyV2(checkpointNow(t, l, CheckpointV2{Retire: []Retirement{{ID: oid, Reason: "Explicit correction", ReplacementIDs: []string{newID}}}}))
 	check(t, err)
-	reflected, err := l.Apply(Checkpoint{Through: ptr(through), Reflections: []Reflection{{Text: "Use Go for this CLI.", ObservationIDs: []string{newID}}}})
+	reflected, err := l.ApplyV2(checkpointNow(t, l, CheckpointV2{Reflections: []Reflection{{Text: "Use Go for this CLI.", ObservationIDs: []string{newID}}}}))
 	check(t, err)
-	_, err = l.Apply(Checkpoint{Through: ptr(through), Retire: []Retirement{{ID: newID, Reason: "Retained in reflection", ReplacementIDs: reflected.Reflections}}})
+	_, err = l.ApplyV2(checkpointNow(t, l, CheckpointV2{Retire: []Retirement{{ID: newID, Reason: "Retained in reflection", ReplacementIDs: reflected.Reflections}}}))
 	check(t, err)
 	check(t, l.Close())
 	l = openTest(t, store, "retire")
@@ -150,22 +132,22 @@ func TestRetirementAndRecallSurviveReopen(t *testing.T) {
 func TestRejectInvalidSupportAndText(t *testing.T) {
 	l := openTest(t, t.TempDir(), "validation")
 	_, _, old := observe(t, l, "First decision.")
-	through, sid, newer := observe(t, l, "Second decision.")
-	reflection, err := l.Apply(Checkpoint{Through: ptr(through), Reflections: []Reflection{{Text: "Second conclusion.", ObservationIDs: []string{newer}}}})
+	_, sid, newer := observe(t, l, "Second decision.")
+	reflection, err := l.ApplyV2(checkpointNow(t, l, CheckpointV2{Reflections: []Reflection{{Text: "Second conclusion.", ObservationIDs: []string{newer}}}}))
 	check(t, err)
-	cases := []Checkpoint{
-		{Observations: []Observation{{Text: "Unsupported", SourceIDs: []string{}}}},
-		{Observations: []Observation{{Text: " ", SourceIDs: []string{sid}}}},
-		{Observations: []Observation{{Text: strings.Repeat("a", 2001), SourceIDs: []string{sid}}}},
-		{Observations: []Observation{{Text: "Bad importance", Importance: "urgent", SourceIDs: []string{sid}}}},
+	cases := []CheckpointV2{
+		{Observations: []ObservationV2{{Text: "Unsupported", EvidenceIDs: []string{}}}},
+		{Observations: []ObservationV2{{Text: " ", EvidenceIDs: []string{evidenceID(t, l, sid)}}}},
+		{Observations: []ObservationV2{{Text: strings.Repeat("a", 2001), EvidenceIDs: []string{evidenceID(t, l, sid)}}}},
+		{Observations: []ObservationV2{{Text: "Bad importance", Importance: "urgent", EvidenceIDs: []string{evidenceID(t, l, sid)}}}},
 		{Reflections: []Reflection{{Text: "Wrong support kind", ObservationIDs: reflection.Reflections}}},
 		{Retire: []Retirement{{ID: old, Reason: "Not covered", ReplacementIDs: reflection.Reflections}}},
 		{Retire: []Retirement{{ID: newer, Reason: "Not newer", ReplacementIDs: []string{old}}}},
 		{Retire: []Retirement{{ID: old, Reason: "No support"}}},
 	}
 	for i, cp := range cases {
-		cp.Through = ptr(through)
-		if _, err = l.Apply(cp); err == nil {
+		cp = checkpointNow(t, l, cp)
+		if _, err = l.ApplyV2(cp); err == nil {
 			t.Errorf("case %d accepted", i)
 		}
 	}
@@ -247,7 +229,11 @@ func TestUnicodeBoundsViewAndRedaction(t *testing.T) {
 			}
 			count++
 		}
-		_, err = l.Apply(Checkpoint{Through: ptr(pending.Through)})
+		deferrals := []SourceDeferral{}
+		for _, s := range pending.Sources {
+			deferrals = append(deferrals, SourceDeferral{SourceID: s.ID, Reason: "Routine retained log"})
+		}
+		_, err = l.ApplyV2(checkpointNow(t, l, CheckpointV2{DeferSources: deferrals}))
 		check(t, err)
 	}
 	if count != 5 {
@@ -258,9 +244,7 @@ func TestUnicodeBoundsViewAndRedaction(t *testing.T) {
 	}
 	sid, err := l.Capture("user", "Never repeat the completed migration.", "critical")
 	check(t, err)
-	pending, err := l.Pending()
-	check(t, err)
-	_, err = l.Apply(Checkpoint{Through: ptr(pending.Through), Observations: []Observation{{Text: "Never repeat the completed migration.", Importance: "critical", SourceIDs: []string{sid}}}})
+	_, err = l.ApplyV2(checkpointNow(t, l, CheckpointV2{Acknowledge: pendingIDs(t, l), Observations: []ObservationV2{{Text: "Never repeat the completed migration.", Importance: "critical", EvidenceIDs: []string{evidenceID(t, l, sid)}}}}))
 	check(t, err)
 	view, err := l.View()
 	check(t, err)
@@ -278,9 +262,9 @@ func TestRecallOrdersEvidence(t *testing.T) {
 	for _, text := range []string{"First", "Second", "Third"} {
 		id, err := l.Capture("user", text, text)
 		check(t, err)
-		ids = append(ids, id)
+		ids = append(ids, evidenceID(t, l, id))
 	}
-	receipt, err := l.Apply(Checkpoint{Through: ptr(3), Observations: []Observation{{Text: "Combined.", SourceIDs: ids}}})
+	receipt, err := l.ApplyV2(checkpointNow(t, l, CheckpointV2{Acknowledge: pendingIDs(t, l), Observations: []ObservationV2{{Text: "Combined.", EvidenceIDs: ids}}}))
 	check(t, err)
 	recall, err := l.Recall(receipt.Observations[0])
 	check(t, err)

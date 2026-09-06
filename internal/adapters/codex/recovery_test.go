@@ -55,15 +55,13 @@ func TestCompactAndResumeRequestPrimeWithBacklog(t *testing.T) {
 	store := t.TempDir()
 	l := open(t, store)
 	for i := range 12 {
-		id, err := l.Capture("user", fmt.Sprintf("Evidence %d", i), fmt.Sprint(i))
+		captured, err := l.CaptureV2(ledger.CaptureInput{Kind: "user", Text: fmt.Sprintf("Evidence %d", i), Key: fmt.Sprint(i)})
 		if err != nil {
 			t.Fatal(err)
 		}
-		pending, err := l.Pending()
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = l.Apply(ledger.Checkpoint{Through: &pending.Through, Observations: []ledger.Observation{{Text: fmt.Sprintf("Fact %d: %s", i, strings.Repeat("🙂", 450)), SourceIDs: []string{id}}}})
+		cp := capturedCheckpoint(t, l)
+		cp.Observations = []ledger.ObservationV2{{Text: fmt.Sprintf("Fact %d: %s", i, strings.Repeat("🙂", 450)), EvidenceIDs: []string{captured.FirstUnitID}}}
+		_, err = l.ApplyV2(cp)
 		if err != nil {
 			t.Fatal(err)
 		}

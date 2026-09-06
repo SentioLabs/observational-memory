@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
@@ -63,8 +64,9 @@ func TestLifecycleAndContinuationExclusion(t *testing.T) {
 	if len(pending.Sources) != 2 || pending.Sources[0].Text != prompt["prompt"] {
 		t.Fatal("continuation entered source evidence")
 	}
-	through := pending.Through
-	_, err = l.Apply(ledger.Checkpoint{Through: &through, Observations: []ledger.Observation{{Text: "Keep the API stable.", SourceIDs: []string{pending.Sources[0].ID}}}})
+	cp := capturedCheckpoint(t, l)
+	cp.Observations = []ledger.ObservationV2{{Text: "Keep the API stable.", EvidenceIDs: []string{cp.Acknowledge[0]}}}
+	_, err = l.ApplyV2(cp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,4 +122,36 @@ func TestThresholdReminderOncePerCursor(t *testing.T) {
 			t.Fatalf("wrong reminder at %d: %v", i, result)
 		}
 	}
+}
+
+// Use stored evidence identities and current status; source sequence numbers do
+// not describe checkpoint progress once a source spans several evidence units.
+func capturedCheckpoint(t *testing.T, l *ledger.Ledger) ledger.CheckpointV2 {
+	t.Helper()
+	status, err := l.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", l.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query("SELECT id FROM evidence_units WHERE review_state='pending' ORDER BY seq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cp := ledger.CheckpointV2{ExpectedThrough: status.Through, ExpectedRevision: status.Revision, Acknowledge: []string{}}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		cp.Acknowledge = append(cp.Acknowledge, id)
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return cp
 }
