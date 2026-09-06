@@ -7,7 +7,7 @@ tasks:
       - go vet ./...
   build:
     cmds:
-      - go build -o observational-memory ./cmd/observational-memory
+      - go build -o om ./cmd/om
   release:
     desc: Build and publish a tagged release with GoReleaser
     cmds:

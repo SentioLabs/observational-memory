@@ -14,7 +14,7 @@ func event(name string) map[string]any {
 }
 func invoke(t *testing.T, store string, e map[string]any) map[string]any {
 	t.Helper()
-	result, err := Handle(context.Background(), e, store, "/example with spaces/observational-memory")
+	result, err := Handle(context.Background(), e, store, "/example with spaces/om")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestExcludedEventsAndPause(t *testing.T) {
 	prompt["agent_id"] = "worker"
 	invoke(t, store, prompt)
 	tool := event("PostToolUse")
-	tool["tool_input"] = map[string]any{"cmd": "/example with spaces/observational-memory --session hooks status"}
+	tool["tool_input"] = map[string]any{"cmd": "/example with spaces/om --session hooks status"}
 	invoke(t, store, tool)
 	invoke(t, store, event("Unsupported"))
 	pending, err := l.Pending()

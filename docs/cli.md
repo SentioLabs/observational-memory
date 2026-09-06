@@ -1,6 +1,6 @@
 # CLI contract, version 1
 
-`observational-memory capabilities` prints one JSON object containing `version`,
+`om capabilities` prints one JSON object containing `version`,
 `protocol_version`, `ledger_schema`, and `clients`. Currently the only client is
 `codex`. `check-compatibility --protocol 1 --client codex` exits zero with
 `{"compatible":true}` when supported, and exits nonzero otherwise. These commands
@@ -68,7 +68,7 @@ to stdout; plain `view` is the documented text exception.
 ## Codex adapter
 
 ```sh
-observational-memory --store /absolute/plugin-data hook --client codex
+om --store /absolute/plugin-data hook --client codex
 ```
 
 Reads one Codex event JSON object from stdin. Handles `SessionStart`,

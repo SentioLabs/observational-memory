@@ -90,7 +90,7 @@ func CheckManaged(path string) error {
 }
 func New(version string) *selfupdate.Updater {
 	return &selfupdate.Updater{
-		Name: "observational-memory", Version: version,
+		Name: "om", Version: version,
 		Source: &selfupdate.GitHubSource{Owner: "sentiolabs", Repo: "observational-memory"},
 		Store:  channelStore{}, Installer: Installer{},
 		PreInstall: func(_ context.Context, _, _ string) error {
@@ -164,7 +164,7 @@ func (Installer) Install(ctx context.Context, tag string) error {
 	if _, err = archive.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	candidate := filepath.Join(dir, "observational-memory")
+	candidate := filepath.Join(dir, "om")
 	if err = extract(archive, candidate); err != nil {
 		return err
 	}
@@ -172,7 +172,7 @@ func (Installer) Install(ctx context.Context, tag string) error {
 	if err != nil {
 		return fmt.Errorf("validate downloaded binary: %w", err)
 	}
-	if strings.TrimSpace(string(output)) != "observational-memory "+version {
+	if strings.TrimSpace(string(output)) != "om "+version {
 		return fmt.Errorf("downloaded binary version mismatch")
 	}
 	return os.Rename(candidate, path)
@@ -236,7 +236,7 @@ func extract(archive io.Reader, candidate string) error {
 		if err != nil {
 			return err
 		}
-		if (header.Name != "observational-memory" && header.Name != "LICENSE") || header.Typeflag != tar.TypeReg {
+		if (header.Name != "om" && header.Name != "LICENSE") || header.Typeflag != tar.TypeReg {
 			return fmt.Errorf("unexpected archive member %q", header.Name)
 		}
 		if header.Name == "LICENSE" {

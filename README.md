@@ -1,7 +1,7 @@
 # Observational Memory
 
-A Go CLI for evidence-backed memory across coding-agent sessions. Capture sources,
-checkpoint observations, distill reflections, and recall the supporting evidence.
+`om` is a Go CLI for evidence-backed memory across coding-agent sessions. Capture
+sources, checkpoint observations, distill reflections, and recall the supporting evidence.
 SQLite provides local persistence, atomic updates, and isolated session ledgers.
 
 The memory core is independent of an agent client. The first integration is
@@ -14,8 +14,8 @@ A Codex adapter does not imply Claude Code compatibility.
 
 Download your host's archive and verify it against `checksums.txt` from
 [releases](https://github.com/sentiolabs/observational-memory/releases).
-Archives contain the executable and LICENSE. Builds cover macOS and Linux on
-amd64 and arm64. The binaries use `modernc.org/sqlite` with CGO disabled and do not
+Archives contain the `om` executable and LICENSE. Install `om` on your PATH.
+Builds cover macOS and Linux on amd64 and arm64. The binaries use `modernc.org/sqlite` with CGO disabled and do not
 require a system SQLite library or a compiler.
 
 For Codex, use the marketplace plugin's setup script. It installs and verifies a
@@ -25,9 +25,21 @@ builds, downloads, or updates a binary.
 For development, use Go 1.26 or later:
 
 ```sh
-go build -o observational-memory ./cmd/observational-memory
-./observational-memory capabilities
+go build -o om ./cmd/om
+./om capabilities
 ```
+
+### Upgrading from v0.1.1
+
+The executable is now named `om`. For an existing standalone v0.1.1 installation,
+download and verify the new release archive, then install its `om` binary on PATH.
+The old updater requires an archive member named `observational-memory` and cannot
+perform this rename. After this one-time installation, use `om self update`.
+For a Codex plugin installation, rerun the plugin's setup script.
+
+Continue using the same `--store` directory and session names. The SQLite schema,
+`OBSERVATIONAL_MEMORY_STORE` environment variable, update preferences, repository,
+and `$observational-memory` skill retain their existing names.
 
 ## CLI
 
@@ -36,11 +48,11 @@ store default. The CLI does not discover another task's session, read private
 agent transcripts, or use native agent memory as a fallback.
 
 ```sh
-observational-memory --store /absolute/writable/memory --session example capture <<'JSON'
+om --store /absolute/writable/memory --session example capture <<'JSON'
 {"kind":"user","text":"Keep SQLite for local persistence.","key":"decision-1"}
 JSON
-observational-memory --store /absolute/writable/memory --session example pending
-observational-memory --store /absolute/writable/memory --session example status
+om --store /absolute/writable/memory --session example pending
+om --store /absolute/writable/memory --session example status
 ```
 
 The agent supplies checkpoint meaning; the runtime validates references and
@@ -58,9 +70,9 @@ instructions or authorization. Each ledger remains until explicitly deleted.
 Standalone installs use [go-selfupdate](https://github.com/SentioLabs/go-selfupdate):
 
 ```sh
-observational-memory self update --check
-observational-memory self update
-observational-memory self channel rc
+om self update --check
+om self update
+om self channel rc
 ```
 
 Updates are explicit. The updater resolves a release, asks for confirmation,
@@ -121,8 +133,7 @@ Stable and RC releases are excluded from nightly cleanup.
 Marketplace plugins release independently and pin a tested runtime version,
 CLI protocol, and archive checksums. Archive names remain
 `observational-memory_<version>_<os>_<arch>.tar.gz` and contain only the executable
-and LICENSE, as required by both installers. The existing v0.1.1 release and its
-published checksums remain unchanged.
+(`om`) and LICENSE, as required by both installers.
 
 The CLI protocol and SQLite schema have their own versions. Compatible additions
 can retain the protocol version; breaking changes require a protocol bump and

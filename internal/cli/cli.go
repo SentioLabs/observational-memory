@@ -24,12 +24,12 @@ type options struct{ store, session string }
 
 func New() *cobra.Command {
 	opts := &options{}
-	root := &cobra.Command{Use: "observational-memory", Short: "Evidence-backed memory for coding agents", Version: Version, SilenceUsage: true, SilenceErrors: true}
-	root.SetVersionTemplate("observational-memory {{.Version}}\n")
+	root := &cobra.Command{Use: "om", Short: "Evidence-backed memory for coding agents", Version: Version, SilenceUsage: true, SilenceErrors: true}
+	root.SetVersionTemplate("om {{.Version}}\n")
 	root.PersistentFlags().StringVar(&opts.store, "store", os.Getenv("OBSERVATIONAL_MEMORY_STORE"), "Writable memory store")
 	root.PersistentFlags().StringVar(&opts.session, "session", "", "Exact session identity")
 	root.AddCommand(&cobra.Command{Use: "version", Short: "Show the runtime version", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		_, err := fmt.Fprintln(cmd.OutOrStdout(), "observational-memory "+Version)
+		_, err := fmt.Fprintln(cmd.OutOrStdout(), "om "+Version)
 		return err
 	}})
 	root.AddCommand(&cobra.Command{Use: "capabilities", Short: "Show the CLI contract and supported clients", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
@@ -53,7 +53,7 @@ func New() *cobra.Command {
 		}
 		result, err := runHook(cmd.Context(), cmd.InOrStdin(), opts.store)
 		if err != nil {
-			fmt.Fprintf(cmd.ErrOrStderr(), "observational-memory: %v\n", err)
+			fmt.Fprintf(cmd.ErrOrStderr(), "om: %v\n", err)
 			result = map[string]any{"systemMessage": "Observational memory unavailable; use its status command to diagnose. The task can continue."}
 		}
 		return output(cmd, result)

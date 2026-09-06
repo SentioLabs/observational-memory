@@ -4,8 +4,8 @@ project_name: observational-memory
 
 builds:
   - id: observational-memory
-    main: ./cmd/observational-memory
-    binary: observational-memory
+    main: ./cmd/om
+    binary: om
     env:
       - CGO_ENABLED=0
     flags:

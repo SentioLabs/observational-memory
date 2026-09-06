@@ -12,7 +12,7 @@ import (
 
 func TestManagedBinaryCannotSelfUpdate(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "observational-memory")
+	path := filepath.Join(dir, "om")
 	if err := CheckManaged(path); err != nil {
 		t.Fatal(err)
 	}
@@ -60,13 +60,13 @@ func archive(t *testing.T, names ...string) []byte {
 	return buf.Bytes()
 }
 func TestArchiveExtraction(t *testing.T) {
-	for _, names := range [][]string{{"../escape"}, {"observational-memory", "observational-memory"}, {"LICENSE"}} {
+	for _, names := range [][]string{{"../escape"}, {"om", "om"}, {"LICENSE"}} {
 		if err := extract(bytes.NewReader(archive(t, names...)), filepath.Join(t.TempDir(), "candidate")); err == nil {
 			t.Fatalf("accepted %v", names)
 		}
 	}
 	path := filepath.Join(t.TempDir(), "candidate")
-	if err := extract(bytes.NewReader(archive(t, "observational-memory", "LICENSE")), path); err != nil {
+	if err := extract(bytes.NewReader(archive(t, "om", "LICENSE")), path); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(path)
