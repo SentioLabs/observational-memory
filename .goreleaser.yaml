@@ -16,6 +16,9 @@ builds:
       - -X github.com/sentiolabs/observational-memory/internal/cli.Version={{.Version}}
     goos: [linux, darwin]
     goarch: [amd64, arm64]
+    ignore:
+      - goos: darwin
+        goarch: amd64
 
 archives:
   - id: default

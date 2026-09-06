@@ -15,7 +15,7 @@ A Codex adapter does not imply Claude Code compatibility.
 Download your host's archive and verify it against `checksums.txt` from
 [releases](https://github.com/sentiolabs/observational-memory/releases).
 Archives contain the `om` executable and LICENSE. Install `om` on your PATH.
-Builds cover macOS and Linux on amd64 and arm64. The binaries use `modernc.org/sqlite` with CGO disabled and do not
+Builds cover Linux on amd64/arm64 and macOS on arm64. The binaries use `modernc.org/sqlite` with CGO disabled and do not
 require a system SQLite library or a compiler.
 
 For Codex, use the marketplace plugin's setup script. It installs and verifies a
@@ -95,7 +95,7 @@ Releases follow the same Release Please and GoReleaser workflow as Arc.
 Conventional commits on `main` maintain a release PR containing the changelog
 and `.release-please-manifest.json` version update. Merge that PR to create the
 stable tag and GitHub release. The release workflow then runs the native tests
-on all four host targets before GoReleaser uploads archives, checksums, and Linux
+on all three host targets before GoReleaser uploads archives, checksums, and Linux
 packages (deb, rpm, and Arch). There is no manually maintained VERSION file.
 
 Both tools run in the same workflow because tags created with `GITHUB_TOKEN`
