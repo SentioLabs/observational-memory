@@ -117,7 +117,13 @@ func TestReadEnvelopeReconstructsClosure(t *testing.T) {
 	}
 	reflection, err := l.ApplyV2(checkpointNow(t, l, CheckpointV2{Reflections: []Reflection{{Text: "twenty sources", ObservationIDs: observations}}}))
 	check(t, err)
-	got = drainRecall(t, l, reflection.Reflections[0])
+	reflectionID := reflection.Reflections[0]
+	storedReflection, err := entry(l.ctx, l.db, reflectionID)
+	check(t, err)
+	got = drainRecall(t, l, reflectionID)
+	if !reflect.DeepEqual(got.relations[reflectionID+"/observation"], storedReflection.Support) {
+		t.Fatal("reflection observation support changed or omitted")
+	}
 	if !reflect.DeepEqual(got.sources, wantSources) || len(got.headers) != 21 {
 		t.Fatal("support closure incomplete")
 	}
