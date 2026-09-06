@@ -186,3 +186,67 @@ func TestReadEnvelopeCLIReconstruction(t *testing.T) {
 		t.Fatal("oversized response partially written")
 	}
 }
+
+func TestSearchCLI(t *testing.T) {
+	store := t.TempDir()
+	base := []string{"--store", store, "--session", "search ' exact"}
+	body, err := run(t, append(base, "capture"), `{"kind":"tool","text":"buried E_PIPE_742 中文","key":"log"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = body
+	output, err := run(t, append(base, "search", "E_PIPE_742", "--sources"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var page ledger.SearchPage
+	if err = json.Unmarshal([]byte(output), &page); err != nil || len(page.Page.Items) != 1 || len(output) > ledger.ReadEnvelopeBytes || !strings.HasSuffix(output, "\n") {
+		t.Fatalf("%s: %v", output, err)
+	}
+	if _, err = run(t, append(base, "search", "query", "--unknown"), ""); err == nil {
+		t.Fatal("unknown flag accepted")
+	}
+}
+
+func TestSearchCursorCLI(t *testing.T) {
+	base := []string{"--store", t.TempDir(), "--session", "search cursor"}
+	data, err := json.Marshal(ledger.CaptureInput{Kind: "tool", Text: strings.Repeat("E_PIPE_742 \x00 "+strings.Repeat("界", 400)+" ", 20), Key: "long"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = run(t, append(base, "capture"), string(data)); err != nil {
+		t.Fatal(err)
+	}
+	var cursor string
+	seen := map[int64]bool{}
+	for pageNo := 0; ; pageNo++ {
+		if pageNo > 30 {
+			t.Fatal("cursor did not finish")
+		}
+		args := append(base, "search", "E_PIPE_742", "--sources", "--include-retired")
+		if cursor != "" {
+			args = append(args, "--cursor", cursor)
+		}
+		out, err := run(t, args, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var page ledger.SearchPage
+		if err = json.Unmarshal([]byte(out), &page); err != nil || len(out) > ledger.ReadEnvelopeBytes || !utf8.ValidString(out) || !strings.HasSuffix(out, "\n") {
+			t.Fatalf("invalid complete output: %v", err)
+		}
+		for _, hit := range page.Page.Items {
+			if seen[hit.StartByte] {
+				t.Fatal("duplicate hit")
+			}
+			seen[hit.StartByte] = true
+		}
+		if page.Page.NextCursor == "" {
+			break
+		}
+		cursor = page.Page.NextCursor
+	}
+	if len(seen) != 20 {
+		t.Fatalf("retrieved %d matches", len(seen))
+	}
+}

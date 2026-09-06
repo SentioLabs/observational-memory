@@ -121,6 +121,15 @@ func New() *cobra.Command {
 	})
 	recall.Flags().StringVar(&recallCursor, "cursor", "", "Opaque continuation token")
 	root.AddCommand(recall)
+	var searchOptions ledger.SearchOptions
+	search := core("search QUERY", "Search literal memory text; optionally include retained sources", cobra.ExactArgs(1), func(_ *cobra.Command, l *ledger.Ledger, args []string) (any, error) {
+		return l.ReadSearch(args[0], searchOptions)
+	})
+	search.Long = "Search literal text in active memories. Results list memories first, then optional sources; BM25 scores from these separate indexes are not comparable. Use recall on a result ID for complete evidence."
+	search.Flags().BoolVar(&searchOptions.IncludeRetired, "include-retired", false, "Include retired memories and their replacement IDs")
+	search.Flags().BoolVar(&searchOptions.Sources, "sources", false, "Also search complete retained source text")
+	search.Flags().StringVar(&searchOptions.Cursor, "cursor", "", "Opaque continuation token")
+	root.AddCommand(search)
 	var all bool
 	var viewCursor string
 	view := core("view", "Show prepared memory", cobra.NoArgs, func(cmd *cobra.Command, l *ledger.Ledger, _ []string) (any, error) {

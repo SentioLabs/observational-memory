@@ -12,10 +12,11 @@ import (
 // Positions are data, never SQL. Offset is a UTF-8 field byte offset or a
 // support ordinal; Evidence is the last emitted evidence sequence.
 type readPosition struct {
-	Record   int64  `json:"record"`
-	Phase    string `json:"phase"`
-	Offset   int64  `json:"offset"`
-	Evidence int64  `json:"evidence"`
+	Record   int64                 `json:"record"`
+	Phase    string                `json:"phase"`
+	Offset   int64                 `json:"offset"`
+	Evidence int64                 `json:"evidence"`
+	Search   *rankedSearchPosition `json:"search,omitempty"`
 }
 type readCursor struct {
 	Version          int          `json:"version"`
@@ -68,7 +69,7 @@ func decodeCursor(token string) (readCursor, error) {
 		return c, fmt.Errorf("unsupported cursor; restart pagination")
 	}
 	switch c.Position.Phase {
-	case "", "header", "text", "reason", "support", "replacement", "evidence":
+	case "", "header", "text", "reason", "support", "replacement", "evidence", "search":
 	default:
 		return c, fmt.Errorf("invalid cursor position; restart pagination")
 	}
@@ -113,6 +114,9 @@ func (l *Ledger) pageCursor(q queryer, token, command, arguments string, search 
 	}
 	if old.Store != c.Store || old.Session != c.Session || old.Epoch != c.Epoch || old.Command != command || old.ArgumentDigest != c.ArgumentDigest || old.MemoryRevision != c.MemoryRevision || old.SearchGeneration != c.SearchGeneration || old.SourceHighWater > c.SourceHighWater {
 		return c, fmt.Errorf("cursor scope or snapshot changed; restart pagination")
+	}
+	if !search && old.Position.Search != nil {
+		return c, fmt.Errorf("invalid read position; restart pagination")
 	}
 	return old, nil
 }
