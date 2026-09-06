@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-15
+          - os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/Library/Caches/go-build
+          key: ${{ runner.os }}-${{ runner.arch }}-go-${{ hashFiles('go.sum', 'mise.toml') }}
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - run: goreleaser check
+      - run: go mod verify
+      - run: go test -race ./...
+      - run: go vet ./...

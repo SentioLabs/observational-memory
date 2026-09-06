@@ -1,0 +1,75 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+project_name: observational-memory
+
+builds:
+  - id: observational-memory
+    main: ./cmd/observational-memory
+    binary: observational-memory
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -mod=readonly
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/sentiolabs/observational-memory/internal/cli.Version={{.Version}}
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # The standalone updater and marketplace installer accept exactly these files.
+    files:
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Bug Fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Performance
+      regexp: '^.*?perf(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: Refactoring
+      regexp: '^.*?refactor(\([[:word:]]+\))??!?:.+$'
+      order: 3
+    - title: Other
+      order: 999
+  filters:
+    exclude: ["^chore", "^docs", "^test", "^Merge"]
+
+nfpms:
+  - id: packages
+    package_name: observational-memory
+    vendor: Sentio Labs
+    homepage: https://github.com/sentiolabs/observational-memory
+    maintainer: Sentio Labs <packages@sentiolabs.dev>
+    description: Evidence-backed memory for coding agents
+    license: MIT
+    formats: [deb, rpm, archlinux]
+    bindir: /usr/bin
+    contents:
+      - src: ./README.md
+        dst: /usr/share/doc/observational-memory/README.md
+
+release:
+  github:
+    owner: sentiolabs
+    name: observational-memory
+  draft: false
+  prerelease: auto
+  name_template: "v{{.Version}}"

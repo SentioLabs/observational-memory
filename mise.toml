@@ -1,0 +1,5 @@
+# Development and CI tools, following the Arc toolchain conventions.
+[tools]
+go = "1.26.6"
+task = "3"
+goreleaser = "2.17.1"

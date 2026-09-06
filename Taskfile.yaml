@@ -8,3 +8,15 @@ tasks:
   build:
     cmds:
       - go build -o observational-memory ./cmd/observational-memory
+  release:
+    desc: Build and publish a tagged release with GoReleaser
+    cmds:
+      - goreleaser release --clean
+  release:snapshot:
+    desc: Build release artifacts locally without publishing
+    cmds:
+      - goreleaser release --snapshot --clean
+  release:check:
+    desc: Validate GoReleaser configuration
+    cmds:
+      - goreleaser check

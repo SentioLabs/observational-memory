@@ -86,10 +86,43 @@ original Rust CLI verifies existing SQLite data and hash compatibility, includin
 Unicode and JSON escaping. The choice of Go is explained in
 [the language assessment](docs/language-choice.md).
 
-Update VERSION, then push a matching `v<version>` tag. The release workflow tests
-all four host targets and publishes archives plus `checksums.txt` only after all
-checks and builds succeed. Marketplace plugins release independently and pin a
-tested runtime version, CLI protocol, and archive checksums.
+Releases follow the same Release Please and GoReleaser workflow as Arc.
+Conventional commits on `main` maintain a release PR containing the changelog
+and `.release-please-manifest.json` version update. Merge that PR to create the
+stable tag and GitHub release. The release workflow then runs the native tests
+on all four host targets before GoReleaser uploads archives, checksums, and Linux
+packages (deb, rpm, and Arch). There is no manually maintained VERSION file.
+
+Both tools run in the same workflow because tags created with `GITHUB_TOKEN`
+do not trigger another push workflow. No personal access token is required.
+Release Please's bot-created PR also does not automatically trigger PR checks;
+close and reopen it as a maintainer to run the Tests workflow before merging.
+
+Use `mise install` to provision the Go, Task, and GoReleaser versions from
+`mise.toml`. Local release commands are:
+
+```sh
+task release:check
+task release:snapshot  # builds all artifacts without publishing
+task release          # publishes the checked-out tag; normally handled by CI
+```
+
+Release candidates use dotted counters such as `v0.1.2-rc.1` and `v0.1.2-rc.2`.
+Push a prerelease tag to run the tests and GoReleaser with prerelease detection.
+The workflow also supports beta and alpha tags. For a failed publication, rerun
+the workflow on the existing tag.
+
+The nightly workflow runs at 06:00 UTC, checks for new commits, and tags
+`v<next patch>-nightly.<YYYYMMDD>` using the last stable manifest version.
+It explicitly dispatches the prerelease workflow and retains seven days of
+nightly releases. Repeating a run on the same day leaves the existing tag intact.
+Stable and RC releases are excluded from nightly cleanup.
+
+Marketplace plugins release independently and pin a tested runtime version,
+CLI protocol, and archive checksums. Archive names remain
+`observational-memory_<version>_<os>_<arch>.tar.gz` and contain only the executable
+and LICENSE, as required by both installers. The existing v0.1.1 release and its
+published checksums remain unchanged.
 
 The CLI protocol and SQLite schema have their own versions. Compatible additions
 can retain the protocol version; breaking changes require a protocol bump and
