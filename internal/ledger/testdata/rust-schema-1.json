@@ -1,0 +1,16 @@
+{
+  "generated_by": "Original Rust CLI from agent-marketplace d3d82b9",
+  "session": "legacy <&> 🙂  literal \\u2028",
+  "directory": "session-e2a6d7319c56c9c6c1cb8cda",
+  "source_id": "s-a0d0816f936aca12e74686b5",
+  "source_text": "Keep SQLite and exact evidence <&> 🙂   literal \\u2028.",
+  "observation_id": "o-96a9fd79fc6751319006ead6",
+  "observation": {
+    "text": "Keep SQLite and evidence <&> 🙂 .",
+    "importance": "high",
+    "source_ids": [
+      "s-a0d0816f936aca12e74686b5"
+    ]
+  },
+  "reflection_id": "r-4cd43206803f277e07be3336"
+}

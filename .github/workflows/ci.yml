@@ -16,47 +16,47 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
           - os: macos-15
-            target: aarch64-apple-darwin
+            goos: darwin
+            goarch: arm64
           - os: macos-15-intel
-            target: x86_64-apple-darwin
+            goos: darwin
+            goarch: amd64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
         with:
-          components: rustfmt, clippy
-          targets: ${{ matrix.target }}
-      - name: Install musl compiler
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo fmt --check
-      - run: cargo test --locked --target ${{ matrix.target }}
-      - run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+          go-version-file: go.mod
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - run: go mod verify
+      - run: go test -race ./...
+      - run: go vet ./...
       - name: Check release tag
         if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          python3 - <<'PY'
-          import os, pathlib, tomllib
-          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
-          assert os.environ['GITHUB_REF_NAME'] == 'v' + version, 'Tag must match Cargo.toml version'
-          PY
-      - name: Build release
-        if: startsWith(github.ref, 'refs/tags/')
-        run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package release
+        run: test "${GITHUB_REF_NAME#v}" = "$(cat VERSION)"
+      - name: Build and package
         if: startsWith(github.ref, 'refs/tags/')
         env:
-          OM_TARGET: ${{ matrix.target }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
         run: |
           mkdir dist
-          om_archive="observational-memory-${GITHUB_REF_NAME#v}-${OM_TARGET}.tar.gz"
-          tar -czf "dist/$om_archive" -C "target/$OM_TARGET/release" observational-memory -C "$GITHUB_WORKSPACE" LICENSE
+          om_version=$(cat VERSION)
+          go build -mod=readonly -trimpath -ldflags="-s -w -X github.com/sentiolabs/observational-memory/internal/cli.Version=$om_version" -o dist/observational-memory ./cmd/observational-memory
+          cp LICENSE dist/LICENSE
+          tar -czf "dist/observational-memory_${om_version}_${GOOS}_${GOARCH}.tar.gz" -C dist observational-memory LICENSE
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          name: release-${{ matrix.target }}
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*.tar.gz
           if-no-files-found: error
 

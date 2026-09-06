@@ -88,3 +88,11 @@ the same core operations; the core has no dependency on Codex event fields.
 
 [Official Codex hook contract](https://learn.chatgpt.com/docs/hooks), checked
 2026-09-06 against advertised CLI version 0.153.4.
+
+## Standalone updates
+
+`self update [--check] [--force] [-y]` and `self channel [stable|rc|nightly] [-y]`
+use go-selfupdate. These are explicit user-facing operations with text output;
+they are outside the memory JSON contract and can use the network. No hook calls
+them. Plugin-managed binaries reject replacement through self-update. The plugin
+pins an exact release and owns its installation lifecycle.
