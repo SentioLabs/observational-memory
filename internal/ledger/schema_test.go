@@ -1,16 +1,21 @@
 package ledger
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestSchemaPreflightPreservesIncompatibleStore(t *testing.T) {
@@ -181,9 +186,32 @@ func TestSchemaPreflightWaitsForCreatorAndCanCancel(t *testing.T) {
 		}
 		result <- err
 	}()
+	canonical, err := filepath.EvalSymlinks(dir)
+	check(t, err)
+	waitingPath := filepath.Join(canonical, "memory.sqlite3")
+	deadline := time.Now().Add(time.Second)
+	for {
+		preflightReaders.Lock()
+		retained := preflightReaders.paths[waitingPath] != nil
+		preflightReaders.Unlock()
+		if retained {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("waiting opener did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	cancel()
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("wanted cancellation, got %v", err)
+	}
+	preflightReaders.Lock()
+	retained := preflightReaders.paths[waitingPath] != nil
+	preflightReaders.Unlock()
+	if retained {
+		t.Fatal("canceled opener retained reader lease")
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatal("contender removed creator marker")
@@ -261,7 +289,8 @@ func TestSchemaPreflightWALRefusalDoesNotCreateSidecars(t *testing.T) {
 		check(t, err)
 		check(t, os.WriteFile(compatible+suffix, data, 0644))
 	}
-	check(t, preflightExisting(context.Background(), compatible, "old"))
+	_, err = preflightExisting(context.Background(), compatible, "old")
+	check(t, err)
 	_, err = db.Exec(`PRAGMA wal_checkpoint(TRUNCATE); UPDATE meta SET value='1' WHERE key='version'`)
 	check(t, err)
 	store := t.TempDir()
@@ -310,9 +339,224 @@ func TestSchemaPreflightCrashWriter(t *testing.T) {
 	}
 	db, err := sql.Open("sqlite", path)
 	check(t, err)
-	_, err = db.Exec(`PRAGMA cache_size=5; BEGIN IMMEDIATE; UPDATE meta SET value='2' WHERE key='version'; UPDATE payload SET value=randomblob(4096)`)
+	if os.Getenv("OM_TEST_CRASH_KIND") == "contender" {
+		_, err = db.Exec(`PRAGMA busy_timeout=0; BEGIN IMMEDIATE`)
+		if err == nil {
+			os.Exit(23)
+		}
+		if !strings.Contains(err.Error(), "locked") {
+			t.Fatal(err)
+		}
+		os.Exit(0)
+	}
+	if os.Getenv("OM_TEST_CRASH_KIND") == "compatible" {
+		_, err = db.Exec(`PRAGMA journal_mode=DELETE; PRAGMA cache_size=1; BEGIN IMMEDIATE;
+UPDATE meta SET value='999' WHERE key='revision';
+UPDATE evidence_units SET review_state='pending',deferral_reason='';
+DELETE FROM checkpoint_receipts; DELETE FROM working_state; DELETE FROM entries;
+UPDATE sources SET body=json_set(body,'$.text',replace(json_extract(body,'$.text'),'retained','unfinish'))`)
+		check(t, err)
+		fmt.Println("ready to kill")
+		time.Sleep(time.Minute)
+		t.Fatal("writer was not killed")
+	}
+	_, err = db.Exec(`PRAGMA cache_size=5; BEGIN IMMEDIATE; UPDATE meta SET value='2' WHERE key='version'; UPDATE meta SET value='crash' WHERE key='session'; UPDATE payload SET value=randomblob(4096)`)
 	check(t, err)
 	os.Exit(0) // Simulate a crash after dirty pages spill, without rollback/close.
+}
+
+func TestSchemaPreflightRecoversCompatibleHotJournal(t *testing.T) {
+	store := t.TempDir()
+	l := openTest(t, store, "compatible-crash")
+	text := strings.Repeat("retained evidence line\n", 20000)
+	log, err := l.CaptureV2(CaptureInput{Kind: "tool", Text: text, Key: "log"})
+	check(t, err)
+	fact, err := l.CaptureV2(CaptureInput{Kind: "user", Text: "Keep the committed constraint", Key: "fact"})
+	check(t, err)
+	cp := CheckpointV2{Acknowledge: []string{fact.FirstUnitID}, DeferSources: []SourceDeferral{{SourceID: log.SourceID, Reason: "Retained for exact recall"}},
+		Observations: []ObservationV2{{Text: "Committed constraint", EvidenceIDs: []string{fact.FirstUnitID}}},
+		WorkingState: &WorkingState{Objective: &WorkingFact{Text: "Preserve committed work", EvidenceIDs: []string{fact.FirstUnitID}}}}
+	receipt, err := l.ApplyV2(cp)
+	check(t, err)
+	before := checkpointSnapshot(t, l)
+	status, err := l.Status()
+	check(t, err)
+	path := l.Path
+	check(t, l.Close())
+	cmd := exec.Command(os.Args[0], "-test.run=^TestSchemaPreflightCrashWriter$")
+	cmd.Env = append(os.Environ(), "OM_TEST_CRASH_PATH="+path, "OM_TEST_CRASH_KIND=compatible")
+	stdout, err := cmd.StdoutPipe()
+	check(t, err)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	check(t, cmd.Start())
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	ready := make(chan bool, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		ready <- scanner.Scan() && scanner.Text() == "ready to kill"
+	}()
+	select {
+	case ok := <-ready:
+		if !ok {
+			_ = cmd.Wait()
+			t.Fatalf("writer failed before crash: %s", &stderr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("writer did not spill transaction")
+	}
+	check(t, cmd.Process.Kill())
+	if err = cmd.Wait(); err == nil {
+		t.Fatal("writer exited without being killed")
+	}
+	journal, err := os.ReadFile(path + "-journal")
+	check(t, err)
+	if len(journal) < 512 || bytes.Equal(journal[:8], make([]byte, 8)) {
+		t.Fatal("fixture did not leave a hot journal")
+	}
+	l, err = Open(context.Background(), store, "compatible-crash")
+	check(t, err)
+	defer l.Close()
+	if before != checkpointSnapshot(t, l) {
+		t.Fatal("recovery changed committed checkpoint state")
+	}
+	gotStatus, err := l.Status()
+	check(t, err)
+	if !reflect.DeepEqual(gotStatus, status) {
+		t.Fatal("recovery changed status", gotStatus, status)
+	}
+	gotSource, err := source(context.Background(), l.db, log.SourceID)
+	check(t, err)
+	if gotSource.Text != text {
+		t.Fatal("recovery lost committed source text")
+	}
+	var reconstructed strings.Builder
+	for _, unit := range readTestUnits(t, l, log.SourceID) {
+		reconstructed.WriteString(unit.Text)
+	}
+	if reconstructed.String() != text {
+		t.Fatal("recovered evidence no longer reconstructs source")
+	}
+	retry, err := l.ApplyV2(cp)
+	check(t, err)
+	want, err := EncodeResponse(receipt)
+	check(t, err)
+	got, err := EncodeResponse(retry)
+	check(t, err)
+	if !bytes.Equal(got, want) {
+		t.Fatal("recovery changed retry receipt")
+	}
+	_, err = l.CaptureV2(CaptureInput{Kind: "assistant", Text: "Resumed after crash", Key: "resumed"})
+	check(t, err)
+}
+
+func TestSchemaPreflightSnapshotGuardRejectsChangedOriginal(t *testing.T) {
+	for _, mutation := range []string{"bytes", "replacement", "sidecar", "canceled"} {
+		t.Run(mutation, func(t *testing.T) {
+			store := t.TempDir()
+			l := openTest(t, store, "crash")
+			// A small independent payload forces journal spill without needing a
+			// checkpoint fixture; public Open must refuse any stale validation.
+			_, err := l.db.Exec(`CREATE TABLE payload(value BLOB); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<40) INSERT INTO payload SELECT zeroblob(4096) FROM n`)
+			check(t, err)
+			path := l.Path
+			check(t, l.Close())
+			runSchemaCrash(t, path, "journal")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			guard, err := preflightExisting(ctx, path, "crash")
+			check(t, err)
+			if guard == nil {
+				t.Fatal("hot journal did not require guarded recovery")
+			}
+			data, err := os.ReadFile(path)
+			check(t, err)
+			switch mutation {
+			case "bytes":
+				info, err := os.Stat(path)
+				check(t, err)
+				data[len(data)-1] ^= 1
+				check(t, os.WriteFile(path, data, 0600))
+				// Restoring size/mtime does not defeat the content guard.
+				check(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
+			case "replacement":
+				check(t, os.Rename(path, path+".previous"))
+				check(t, os.WriteFile(path, data, 0600))
+			case "sidecar":
+				check(t, os.WriteFile(path+"-wal", []byte("concurrent sidecar"), 0600))
+			case "canceled":
+				cancel()
+			}
+			before := make(map[string][]byte)
+			for _, suffix := range []string{"", "-journal"} {
+				before[suffix], err = os.ReadFile(path + suffix)
+				check(t, err)
+			}
+			if opened, err := openExisting(ctx, store, path, filepath.Dir(path), "crash", guard); err == nil {
+				opened.Close()
+				t.Fatal("recovered a changed/canceled original")
+			}
+			for suffix, want := range before {
+				got, err := os.ReadFile(path + suffix)
+				check(t, err)
+				if !bytes.Equal(got, want) {
+					t.Fatal("failed guard changed original", suffix)
+				}
+			}
+		})
+	}
+}
+
+func TestSchemaPreflightHealthyOpenNeedsNoTemporaryCopy(t *testing.T) {
+	store := t.TempDir()
+	l := openTest(t, store, "healthy")
+	check(t, l.Close())
+	t.Setenv("TMPDIR", filepath.Join(store, "unavailable-temp"))
+	l, err := Open(context.Background(), store, "healthy")
+	check(t, err)
+	check(t, l.Close())
+}
+
+func TestSchemaPreflightRefusesExternalSuperJournal(t *testing.T) {
+	l := openTest(t, t.TempDir(), "crash")
+	_, err := l.db.Exec(`CREATE TABLE payload(value BLOB); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<40) INSERT INTO payload SELECT zeroblob(4096) FROM n`)
+	check(t, err)
+	check(t, l.Close())
+	runSchemaCrash(t, l.Path, "journal")
+	external := filepath.Join(t.TempDir(), "super-journal")
+	check(t, os.WriteFile(external, []byte(l.Path+"-journal\x00"), 0644))
+	journal, err := os.ReadFile(l.Path + "-journal")
+	check(t, err)
+	var footer [16]byte
+	binary.BigEndian.PutUint32(footer[:4], uint32(len(external)))
+	var checksum uint32
+	for _, b := range []byte(external) {
+		checksum += uint32(b)
+	}
+	binary.BigEndian.PutUint32(footer[4:8], checksum)
+	copy(footer[8:], []byte{0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7})
+	journal = append(journal, []byte(external)...)
+	journal = append(journal, footer[:]...)
+	check(t, os.WriteFile(l.Path+"-journal", journal, 0600))
+	before := make(map[string][]byte)
+	for _, path := range []string{l.Path, l.Path + "-journal", external} {
+		before[path], err = os.ReadFile(path)
+		check(t, err)
+	}
+	opened, err := Open(context.Background(), l.store, "crash")
+	if opened != nil {
+		opened.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "super-journal") {
+		t.Fatal("did not refuse external journal reference", err)
+	}
+	for path, want := range before {
+		got, err := os.ReadFile(path)
+		check(t, err)
+		if !bytes.Equal(got, want) {
+			t.Fatal("preflight modified journal family", path)
+		}
+	}
 }
 
 func runSchemaCrash(t *testing.T, path, kind string) {
@@ -343,57 +587,67 @@ func TestSchemaPreflightReopensCommittedAbandonedMarker(t *testing.T) {
 }
 
 func TestSchemaPreflightRefusesHotJournalWithoutRecovery(t *testing.T) {
-	store := t.TempDir()
-	name, err := identity("session-", "crash")
-	check(t, err)
-	dir := filepath.Join(store, name)
-	check(t, os.Mkdir(dir, 0755))
-	path := filepath.Join(dir, "memory.sqlite3")
-	db, err := sql.Open("sqlite", path)
-	check(t, err)
-	_, err = db.Exec(`CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO meta VALUES('version','1'),('session','crash'); CREATE TABLE payload(value BLOB); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<400) INSERT INTO payload SELECT zeroblob(4096) FROM n;`)
-	check(t, err)
-	check(t, db.Close())
-	runSchemaCrash(t, path, "journal")
-	probe, err := sql.Open("sqlite", fileURI(path)+"?mode=ro&immutable=1")
-	check(t, err)
-	version, err := meta(context.Background(), probe, "version")
-	check(t, err)
-	check(t, probe.Close())
-	if version != "2" {
-		t.Fatalf("fixture did not spill uncommitted metadata: %q", version)
-	}
-	before := map[string][]byte{}
-	for _, suffix := range []string{"", "-journal"} {
-		check(t, os.Chmod(path+suffix, 0644))
-		before[suffix], err = os.ReadFile(path + suffix)
-		check(t, err)
-	}
-	if len(before["-journal"]) < 512 || bytes.Equal(before["-journal"][:8], make([]byte, 8)) {
-		t.Fatal("fixture is not a hot journal")
-	}
-	if l, err := Open(context.Background(), store, "crash"); err == nil {
-		l.Close()
-		t.Fatal("accepted incompatible hot journal")
-	}
-	for suffix, want := range before {
-		got, err := os.ReadFile(path + suffix)
-		check(t, err)
-		info, err := os.Stat(path + suffix)
-		check(t, err)
-		if !bytes.Equal(got, want) || info.Mode().Perm() != 0644 {
-			t.Fatal("refusal recovered or changed original", suffix)
-		}
-	}
-	info, err := os.Stat(dir)
-	check(t, err)
-	if info.Mode().Perm() != 0755 {
-		t.Fatal("refusal changed directory mode")
-	}
-	entries, err := os.ReadDir(dir)
-	check(t, err)
-	if len(entries) != 2 {
-		t.Fatal("refusal changed sidecar inventory")
+	for _, version := range []string{"1", "2"} {
+		t.Run("committed-version-"+version, func(t *testing.T) {
+			committedSession := "crash"
+			if version == "2" {
+				committedSession = "wrong-session"
+			}
+			store := t.TempDir()
+			name, err := identity("session-", "crash")
+			check(t, err)
+			dir := filepath.Join(store, name)
+			check(t, os.Mkdir(dir, 0755))
+			path := filepath.Join(dir, "memory.sqlite3")
+			db, err := sql.Open("sqlite", path)
+			check(t, err)
+			_, err = db.Exec(`CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO meta VALUES('version',?),('session',?); CREATE TABLE payload(value BLOB); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<400) INSERT INTO payload SELECT zeroblob(4096) FROM n;`, version, committedSession)
+			check(t, err)
+			check(t, db.Close())
+			runSchemaCrash(t, path, "journal")
+			probe, err := sql.Open("sqlite", fileURI(path)+"?mode=ro&immutable=1")
+			check(t, err)
+			spilledVersion, err := meta(context.Background(), probe, "version")
+			check(t, err)
+			spilledSession, err := meta(context.Background(), probe, "session")
+			check(t, err)
+			check(t, probe.Close())
+			if spilledVersion != "2" || spilledSession != "crash" {
+				t.Fatalf("fixture did not spill uncommitted metadata: %q %q", spilledVersion, spilledSession)
+			}
+			before := map[string][]byte{}
+			for _, suffix := range []string{"", "-journal"} {
+				check(t, os.Chmod(path+suffix, 0644))
+				before[suffix], err = os.ReadFile(path + suffix)
+				check(t, err)
+			}
+			if len(before["-journal"]) < 512 || bytes.Equal(before["-journal"][:8], make([]byte, 8)) {
+				t.Fatal("fixture is not a hot journal")
+			}
+			if l, err := Open(context.Background(), store, "crash"); err == nil {
+				l.Close()
+				t.Fatal("accepted incompatible hot journal")
+			}
+			for suffix, want := range before {
+				got, err := os.ReadFile(path + suffix)
+				check(t, err)
+				info, err := os.Stat(path + suffix)
+				check(t, err)
+				if !bytes.Equal(got, want) || info.Mode().Perm() != 0644 {
+					t.Fatal("refusal recovered or changed original", suffix)
+				}
+			}
+			info, err := os.Stat(dir)
+			check(t, err)
+			if info.Mode().Perm() != 0755 {
+				t.Fatal("refusal changed directory mode")
+			}
+			entries, err := os.ReadDir(dir)
+			check(t, err)
+			if len(entries) != 2 {
+				t.Fatal("refusal changed sidecar inventory")
+			}
+		})
 	}
 }
 
@@ -464,10 +718,129 @@ func TestSchemaPreflightDuringActiveRollbackWriter(t *testing.T) {
 	if value != "" {
 		t.Fatal("preflight/open exposed uncommitted state")
 	}
+	// Another process must still be excluded: closing a raw database descriptor
+	// in this process would silently release the existing SQLite writer's locks.
+	runSchemaCrash(t, l.Path, "contender")
 	check(t, tx.Commit())
 	value, err = opened.State("inflight")
 	check(t, err)
 	if value != "not committed" {
 		t.Fatal("reader did not see later committed state")
+	}
+}
+
+func TestSchemaPreflightAliasesKeepWriterLocked(t *testing.T) {
+	for _, alias := range []string{"hardlink", "symlink"} {
+		t.Run(alias, func(t *testing.T) {
+			l := openTest(t, t.TempDir(), "alias")
+			store := t.TempDir()
+			name, err := identity("session-", "alias")
+			check(t, err)
+			dir := filepath.Join(store, name)
+			if alias == "hardlink" {
+				check(t, os.Mkdir(dir, 0700))
+				check(t, os.Link(l.Path, filepath.Join(dir, "memory.sqlite3")))
+			} else {
+				check(t, os.Symlink(filepath.Dir(l.Path), dir))
+			}
+			tx, err := l.db.BeginTx(context.Background(), nil)
+			check(t, err)
+			defer tx.Rollback()
+			check(t, setMeta(context.Background(), tx, "inflight", "alias lock"))
+			other, err := Open(context.Background(), store, "alias")
+			check(t, err)
+			check(t, other.Close())
+			runSchemaCrash(t, l.Path, "contender")
+			check(t, tx.Commit())
+		})
+	}
+}
+
+func TestSchemaPreflightReaderLifetimeAndReuse(t *testing.T) {
+	store := t.TempDir()
+	l := openTest(t, store, "readers")
+	for range 30 {
+		other, err := Open(context.Background(), store, "readers")
+		check(t, err)
+		check(t, other.Close())
+		check(t, other.Close())
+	}
+	info, err := os.Stat(l.Path)
+	check(t, err)
+	var readers []*os.File
+	preflightReaders.Lock()
+	for _, pinned := range preflightReaders.files {
+		if pinned.info != nil && os.SameFile(info, pinned.info) {
+			readers = append(readers, pinned.file)
+		}
+	}
+	preflightReaders.Unlock()
+	if len(readers) != 1 {
+		t.Fatalf("repeated opens retained %d raw descriptors", len(readers))
+	}
+	check(t, l.Close())
+	for _, f := range readers {
+		if _, err = f.Stat(); !errors.Is(err, os.ErrClosed) {
+			t.Fatal("last close left raw descriptor open", err)
+		}
+	}
+	preflightReaders.Lock()
+	remaining := preflightReaders.paths[l.Path] != nil
+	preflightReaders.Unlock()
+	if remaining {
+		t.Fatal("last close retained path lease")
+	}
+	// A refusal also drops the lease without touching the incompatible file.
+	db, err := sql.Open("sqlite", l.Path)
+	check(t, err)
+	_, err = db.Exec(`UPDATE meta SET value='1' WHERE key='version'`)
+	check(t, err)
+	check(t, db.Close())
+	if opened, err := Open(context.Background(), store, "readers"); err == nil {
+		opened.Close()
+		t.Fatal("accepted old schema")
+	}
+	preflightReaders.Lock()
+	remaining = preflightReaders.paths[l.Path] != nil
+	preflightReaders.Unlock()
+	if remaining {
+		t.Fatal("failed open retained path lease")
+	}
+}
+
+func TestSchemaPreflightCloseWaitsForTransaction(t *testing.T) {
+	l := openTest(t, t.TempDir(), "close-writer")
+	other, err := Open(context.Background(), l.store, "close-writer")
+	check(t, err)
+	check(t, other.Close()) // Ensure preflight has a pinned descriptor.
+	tx, err := l.db.BeginTx(context.Background(), nil)
+	check(t, err)
+	defer tx.Rollback()
+	check(t, setMeta(context.Background(), tx, "inflight", "finish before close"))
+	closed := make(chan error, 1)
+	go func() { closed <- l.Close() }()
+	deadline := time.Now().Add(time.Second)
+	for l.db.Stats().WaitCount == 0 {
+		select {
+		case err := <-closed:
+			t.Fatalf("Close returned with an active transaction: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not wait for transaction")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	runSchemaCrash(t, l.Path, "contender")
+	check(t, tx.Commit())
+	check(t, <-closed)
+	check(t, l.Close())
+	opened, err := Open(context.Background(), l.store, "close-writer")
+	check(t, err)
+	defer opened.Close()
+	value, err := opened.State("inflight")
+	check(t, err)
+	if value != "finish before close" {
+		t.Fatal("concurrent Close lost committed transaction")
 	}
 }

@@ -3,18 +3,22 @@ package ledger
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const schema = `
@@ -42,11 +46,14 @@ CREATE TABLE root_turns (id TEXT PRIMARY KEY, completed_ordinal INTEGER UNIQUE,
 `
 
 type Ledger struct {
-	db      *sql.DB
-	ctx     context.Context
-	Path    string
-	session string
-	store   string
+	db        *sql.DB
+	ctx       context.Context
+	Path      string
+	session   string
+	store     string
+	release   func()
+	closeOnce sync.Once
+	closeErr  error
 }
 type queryer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
@@ -95,6 +102,28 @@ func Open(ctx context.Context, store, session string) (*Ledger, error) {
 		}
 	}() // Empty directories only.
 	path := filepath.Join(dir, "memory.sqlite3")
+	release := retainPreflightReaders(path)
+	retained := false
+	defer func() {
+		if !retained {
+			release()
+		}
+	}()
+	publish := func(l *Ledger, err error) (*Ledger, error) {
+		if l != nil {
+			if info, statErr := os.Stat(path); statErr == nil {
+				preflightReaders.Lock()
+				rememberPreflightInode(preflightReaders.paths[path], info)
+				preflightReaders.Unlock()
+			} else {
+				_ = l.Close()
+				return nil, statErr
+			}
+			l.release = release
+			retained = true
+		}
+		return l, err
+	}
 	marker := filepath.Join(dir, ".initializing")
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -105,8 +134,8 @@ func Open(ctx context.Context, store, session string) (*Ledger, error) {
 			// A process can exit after committing but before removing its marker.
 			// A successful committed-state probe lets us proceed without deleting any
 			// state that could still belong to a live creator.
-			if preflightExisting(ctx, path, session) == nil {
-				return openExisting(ctx, absolute, path, dir, session)
+			if guard, probeErr := preflightExisting(ctx, path, session); probeErr == nil {
+				return publish(openExisting(ctx, absolute, path, dir, session, guard))
 			}
 			if !time.Now().Before(deadline) {
 				return nil, fmt.Errorf("ledger initialization still in progress; retry opening session")
@@ -123,14 +152,15 @@ func Open(ctx context.Context, store, session string) (*Ledger, error) {
 			return nil, err
 		}
 		if _, err = os.Stat(path); err == nil {
-			if err = preflightExisting(ctx, path, session); err != nil {
+			guard, probeErr := preflightExisting(ctx, path, session)
+			if probeErr != nil {
 				// A creator may have published its marker between our two stat calls.
 				if _, pending := os.Stat(marker); pending == nil {
 					continue
 				}
-				return nil, err
+				return nil, probeErr
 			}
-			return openExisting(ctx, absolute, path, dir, session)
+			return publish(openExisting(ctx, absolute, path, dir, session, guard))
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
@@ -158,8 +188,118 @@ func Open(ctx context.Context, store, session string) (*Ledger, error) {
 			}
 		}
 		_ = os.Remove(marker)
-		return l, err
+		return publish(l, err)
 	}
+}
+
+// POSIX closes release all of this process's byte locks on an inode, including
+// locks owned by another SQLite connection. Keep raw main-file readers pinned
+// until every managed Open/Ledger for that inode (including aliases) has closed
+// its SQLite handles.
+// Reuse each inode's descriptor; SectionReader gives each caller its own offset.
+var preflightReaders = struct {
+	sync.Mutex
+	paths map[string]*preflightReadersForPath
+	files []preflightPinnedFile
+}{paths: make(map[string]*preflightReadersForPath)}
+
+type preflightReadersForPath struct {
+	refs   int
+	inodes []os.FileInfo
+}
+
+type preflightPinnedFile struct {
+	file *os.File
+	info os.FileInfo
+}
+
+func rememberPreflightInode(state *preflightReadersForPath, info os.FileInfo) {
+	for _, known := range state.inodes {
+		if os.SameFile(known, info) {
+			return
+		}
+	}
+	state.inodes = append(state.inodes, info)
+}
+
+func retainPreflightReaders(path string) func() {
+	preflightReaders.Lock()
+	state := preflightReaders.paths[path]
+	if state == nil {
+		state = &preflightReadersForPath{}
+		preflightReaders.paths[path] = state
+	}
+	state.refs++
+	if info, err := os.Stat(path); err == nil {
+		rememberPreflightInode(state, info)
+	}
+	preflightReaders.Unlock()
+	return func() {
+		preflightReaders.Lock()
+		defer preflightReaders.Unlock()
+		state.refs--
+		if state.refs == 0 {
+			delete(preflightReaders.paths, path)
+			retained := preflightReaders.files[:0]
+			for _, pinned := range preflightReaders.files {
+				active := false
+				for _, other := range preflightReaders.paths {
+					for _, info := range other.inodes {
+						if pinned.info == nil || os.SameFile(pinned.info, info) {
+							active = true
+						}
+					}
+				}
+				if active {
+					retained = append(retained, pinned)
+				} else {
+					_ = pinned.file.Close()
+				}
+			}
+			preflightReaders.files = retained
+		}
+	}
+}
+
+type preflightReadCloser struct {
+	*io.SectionReader
+}
+
+func (r preflightReadCloser) Close() error { return nil }
+
+func preflightReader(path string) (io.ReadCloser, error) {
+	preflightReaders.Lock()
+	defer preflightReaders.Unlock()
+	state := preflightReaders.paths[path]
+	if state == nil {
+		// Private copies and unlocked sidecars.
+		return os.Open(path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("cannot preflight nonregular SQLite file")
+	}
+	rememberPreflightInode(state, info)
+	for _, pinned := range preflightReaders.files {
+		if pinned.info != nil && os.SameFile(info, pinned.info) {
+			return preflightReadCloser{io.NewSectionReader(pinned.file, 0, math.MaxInt64)}, nil
+		}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	// Retain even a replaced inode: closing it could unlock an older Ledger.
+	opened, statErr := f.Stat()
+	preflightReaders.files = append(preflightReaders.files, preflightPinnedFile{f, opened})
+	if statErr != nil {
+		return nil, statErr
+	}
+	rememberPreflightInode(state, opened)
+	return preflightReadCloser{io.NewSectionReader(f, 0, math.MaxInt64)}, nil
 }
 
 func database(ctx context.Context, path string, readOnly bool) (*sql.DB, error) {
@@ -200,58 +340,185 @@ func validateStore(ctx context.Context, q queryer, session string) error {
 	}
 	return nil
 }
-func preflightExisting(ctx context.Context, path, session string) error {
-	probe := func(path string) error {
-		db, err := database(ctx, path, true)
+func preflightExisting(ctx context.Context, path, session string) (func() error, error) {
+	probe := func(path string, readOnly bool) error {
+		db, err := database(ctx, path, readOnly)
 		if err != nil {
 			return err
 		}
 		defer db.Close()
 		return validateStore(ctx, db, session)
 	}
-	// A normal read-only rollback-mode connection honors locks and reads only
-	// committed pages. A hot journal fails with READONLY_ROLLBACK before recovery
-	// can modify either original file. Immutable mode would expose dirty pages.
-	file, err := os.Open(path)
+	// Healthy rollback databases need no copy. Read-only mode honors locks and
+	// refuses hot-journal recovery; immutable mode would expose dirty pages.
+	file, err := preflightReader(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	header := make([]byte, 20)
 	_, readErr := io.ReadFull(file, header)
 	_ = file.Close()
 	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
-		return readErr
+		return nil, readErr
 	}
 	walMode := header[18] == 2 || header[19] == 2
 	if _, err = os.Stat(path + "-wal"); err == nil {
 		walMode = true
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+		return nil, err
 	}
 	if !walMode {
-		return probe(path)
+		err = probe(path, true)
+		var sqliteErr *sqlite.Error
+		if !errors.As(err, &sqliteErr) || sqliteErr.Code() != sqlite3.SQLITE_READONLY_ROLLBACK {
+			return nil, err
+		}
 	}
-	// Even a checkpointed WAL-mode database with no current log can create WAL
-	// shared-memory files on a read-only open. Keep all those effects private.
+	// Both hot-journal rollback and WAL shared-memory creation must stay private
+	// until committed version/session metadata has authorized the original.
 	dir, err := os.MkdirTemp("", "om-preflight-*")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer os.RemoveAll(dir)
 	copied := filepath.Join(dir, "memory.sqlite3")
-	if err = copyPreflightFile(ctx, path, copied); err != nil {
-		return err
+	// Capture identities before copying any file and compare both metadata and
+	// bytes afterward. A writer/recovery racing this exceptional path must cause
+	// a retry, never make a mixed main/journal snapshot authority for mutation.
+	files := make(map[string]preflightFile)
+	for _, suffix := range []string{"", "-wal", "-journal", "-shm"} {
+		info, statErr := os.Stat(path + suffix)
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return nil, statErr
+		}
+		files[suffix] = preflightFile{info: info}
 	}
-	for _, suffix := range []string{"-wal", "-journal"} {
-		if err = copyPreflightFile(ctx, path+suffix, copied+suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+	for suffix, state := range files {
+		if state.info == nil || suffix == "-shm" {
+			continue
+		}
+		if !state.info.Mode().IsRegular() {
+			return nil, fmt.Errorf("cannot preflight nonregular SQLite file")
+		}
+		if err = copyPreflightFile(ctx, path+suffix, copied+suffix); err != nil {
+			return nil, err
+		}
+		state.digest, err = preflightDigest(ctx, copied+suffix)
+		if err != nil {
+			return nil, err
+		}
+		files[suffix] = state
+	}
+	guard := func() error { return checkPreflightFiles(ctx, path, files) }
+	if err = guard(); err != nil {
+		return nil, err
+	}
+	// A super-journal names files outside the private directory. Refuse it rather
+	// than letting private recovery consult or delete any original sibling file.
+	if err = refuseSuperJournal(copied + "-journal"); err != nil {
+		return nil, err
+	}
+	if err = probe(copied, false); err != nil {
+		return nil, err
+	}
+	if err = guard(); err != nil {
+		return nil, err
+	}
+	return guard, nil
+}
+
+type preflightFile struct {
+	info   os.FileInfo
+	digest [sha256.Size]byte
+}
+
+func preflightDigest(ctx context.Context, path string) ([sha256.Size]byte, error) {
+	var digest [sha256.Size]byte
+	f, err := preflightReader(path)
+	if err != nil {
+		return digest, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	buffer := make([]byte, 64*1024)
+	for {
+		if err = ctx.Err(); err != nil {
+			return digest, err
+		}
+		n, readErr := f.Read(buffer)
+		_, _ = h.Write(buffer[:n])
+		if readErr == io.EOF {
+			copy(digest[:], h.Sum(nil))
+			return digest, nil
+		}
+		if readErr != nil {
+			return digest, readErr
 		}
 	}
-	return probe(copied)
+}
+
+func checkPreflightFiles(ctx context.Context, path string, files map[string]preflightFile) error {
+	changed := fmt.Errorf("ledger changed during preflight; retry opening session")
+	checkMetadata := func() error {
+		for suffix, state := range files {
+			info, err := os.Stat(path + suffix)
+			if state.info == nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					return changed
+				}
+				continue
+			}
+			if err != nil || !os.SameFile(info, state.info) || info.Size() != state.info.Size() || info.Mode() != state.info.Mode() || !info.ModTime().Equal(state.info.ModTime()) {
+				return changed
+			}
+		}
+		return ctx.Err()
+	}
+	if err := checkMetadata(); err != nil {
+		return err
+	}
+	for suffix, state := range files {
+		if state.info != nil && suffix != "-shm" {
+			digest, err := preflightDigest(ctx, path+suffix)
+			if err != nil {
+				return err
+			}
+			if digest != state.digest {
+				return changed
+			}
+		}
+	}
+	return checkMetadata()
+}
+
+func refuseSuperJournal(path string) error {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() < 16 {
+		return nil
+	}
+	var magic [8]byte
+	if _, err = f.ReadAt(magic[:], info.Size()-8); err != nil {
+		return err
+	}
+	if magic == [8]byte{0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7} {
+		return fmt.Errorf("cannot safely preflight SQLite super-journal; recover with the originating application")
+	}
+	return nil
 }
 
 func copyPreflightFile(ctx context.Context, source, destination string) error {
-	from, err := os.Open(source)
+	from, err := preflightReader(source)
 	if err != nil {
 		return err
 	}
@@ -280,7 +547,12 @@ func copyPreflightFile(ctx context.Context, source, destination string) error {
 		}
 	}
 }
-func openExisting(ctx context.Context, store, path, dir, session string) (*Ledger, error) {
+func openExisting(ctx context.Context, store, path, dir, session string, guard func() error) (*Ledger, error) {
+	if guard != nil {
+		if err := guard(); err != nil {
+			return nil, err
+		}
+	}
 	db, err := database(ctx, path, false)
 	if err != nil {
 		return nil, err
@@ -352,7 +624,22 @@ func createLedger(ctx context.Context, store, path, session string) (result *Led
 	}
 	return &Ledger{db: db, ctx: ctx, Path: path, session: session, store: store}, nil
 }
-func (l *Ledger) Close() error { return l.db.Close() }
+func (l *Ledger) Close() error {
+	l.closeOnce.Do(func() {
+		// DB.Close alone can return with a transaction's connection still in use.
+		// Own the single connection first, then close the pool and that connection
+		// before releasing raw descriptors shared with other Ledger handles.
+		conn, err := l.db.Conn(context.Background())
+		l.closeErr = l.db.Close()
+		if err == nil {
+			l.closeErr = errors.Join(l.closeErr, conn.Close())
+		}
+		if l.release != nil {
+			l.release()
+		}
+	})
+	return l.closeErr
+}
 func meta(ctx context.Context, q queryer, key string) (string, error) {
 	var value string
 	err := q.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", key).Scan(&value)
