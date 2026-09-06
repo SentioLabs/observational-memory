@@ -18,6 +18,107 @@ const PendingLimit = 48000
 // ViewLimit is measured in UTF-8 bytes so host transport limits remain predictable.
 const ViewLimit = 12000
 
+const (
+	ProtocolVersionV2      = 2
+	LedgerSchemaV2         = 2
+	ReadEnvelopeBytes      = 12000
+	EvidenceTextJSONBytes  = 2048
+	WorkingStateBytes      = 3500
+	MaxCheckpointItems     = 64
+	MaxPendingPageItems    = 24
+	MaxDeferralReasonBytes = 256
+)
+
+type ReviewState string
+
+const (
+	ReviewPending  ReviewState = "pending"
+	ReviewReviewed ReviewState = "reviewed"
+	ReviewDeferred ReviewState = "deferred"
+)
+
+type CoverageCount struct {
+	Units int64 `json:"units"`
+	Bytes int64 `json:"bytes"`
+}
+
+type Coverage struct {
+	Pending  CoverageCount `json:"pending"`
+	Reviewed CoverageCount `json:"reviewed"`
+	Deferred CoverageCount `json:"deferred"`
+}
+
+type SourceDeferral struct {
+	SourceID string `json:"source_id"`
+	Reason   string `json:"reason"`
+}
+
+type EvidenceUnit struct {
+	Seq              int64       `json:"seq"`
+	ID               string      `json:"id"`
+	SourceID         string      `json:"source_id"`
+	Kind             string      `json:"kind"`
+	Timestamp        string      `json:"timestamp"`
+	StartByte        int64       `json:"start_byte"`
+	EndByte          int64       `json:"end_byte"`
+	Text             string      `json:"text"`
+	SourceIncomplete bool        `json:"source_incomplete"`
+	ReviewState      ReviewState `json:"review_state"`
+	DeferralReason   string      `json:"deferral_reason,omitempty"`
+}
+
+type Page[T any] struct {
+	Items      []T    `json:"items"`
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+type PendingPage struct {
+	Through  int64              `json:"through"`
+	Revision int64              `json:"revision"`
+	Coverage Coverage           `json:"coverage"`
+	Page     Page[EvidenceUnit] `json:"page"`
+}
+
+type WorkingFact struct {
+	Text        string   `json:"text"`
+	EvidenceIDs []string `json:"evidence_ids"`
+}
+
+type WorkingState struct {
+	Objective   *WorkingFact  `json:"objective"`
+	Constraints []WorkingFact `json:"constraints"`
+	Completed   []WorkingFact `json:"completed"`
+	Open        []WorkingFact `json:"open"`
+	Next        []WorkingFact `json:"next"`
+}
+
+type ObservationV2 struct {
+	Text        string   `json:"text"`
+	Importance  string   `json:"importance,omitempty"`
+	EvidenceIDs []string `json:"evidence_ids"`
+}
+
+type CheckpointV2 struct {
+	ExpectedThrough  int64            `json:"expected_through"`
+	ExpectedRevision int64            `json:"expected_revision"`
+	Acknowledge      []string         `json:"acknowledge"`
+	DeferSources     []SourceDeferral `json:"defer_sources,omitempty"`
+	ReviewDeferred   []string         `json:"review_deferred,omitempty"`
+	Observations     []ObservationV2  `json:"observations,omitempty"`
+	Reflections      []Reflection     `json:"reflections,omitempty"`
+	Retire           []Retirement     `json:"retire,omitempty"`
+	WorkingState     *WorkingState    `json:"working_state,omitempty"`
+}
+
+type ReceiptV2 struct {
+	Through      int64    `json:"through"`
+	Revision     int64    `json:"revision"`
+	Observations []string `json:"observations"`
+	Reflections  []string `json:"reflections"`
+	Retired      []string `json:"retired"`
+	Coverage     Coverage `json:"coverage"`
+}
+
 type Source struct {
 	Seq       int64  `json:"seq"`
 	ID        string `json:"id"`
@@ -76,21 +177,146 @@ type SessionReference struct {
 	Session string `json:"session"`
 }
 type Status struct {
-	Session                string            `json:"session"`
-	Database               string            `json:"database"`
-	Paused                 bool              `json:"paused"`
-	Through                int64             `json:"through"`
-	PendingSources         int64             `json:"pending_sources"`
-	PendingChars           int64             `json:"pending_chars"`
-	EstimatedPendingTokens int64             `json:"estimated_pending_tokens"`
-	LastCheckpointAt       string            `json:"last_checkpoint_at,omitempty"`
-	ImportedFrom           *SessionReference `json:"imported_from,omitempty"`
-	Active                 Counts            `json:"active"`
+	Session                string                `json:"session"`
+	Database               string                `json:"database"`
+	Paused                 bool                  `json:"paused"`
+	Through                int64                 `json:"through"`
+	PendingSources         int64                 `json:"pending_sources"`
+	PendingChars           int64                 `json:"pending_chars"`
+	EstimatedPendingTokens int64                 `json:"estimated_pending_tokens"`
+	LastCheckpointAt       string                `json:"last_checkpoint_at,omitempty"`
+	ImportedFrom           *SessionReference     `json:"imported_from,omitempty"`
+	Active                 Counts                `json:"active"`
+	Revision               int64                 `json:"revision"`
+	Coverage               Coverage              `json:"coverage"`
+	StoredSourceBytes      int64                 `json:"stored_source_bytes"`
+	SourceCount            int64                 `json:"source_count"`
+	UnitCount              int64                 `json:"unit_count"`
+	OldestPendingAgeTurns  int64                 `json:"oldest_pending_age_turns"`
+	WorkingState           *WorkingStateMetadata `json:"working_state,omitempty"`
 }
 type Recall struct {
 	Entry        *Entry   `json:"entry,omitempty"`
 	Observations []Entry  `json:"observations,omitempty"`
 	Sources      []Source `json:"sources"`
+}
+
+// Additional planning contracts: establish alongside the approved wire types.
+type CaptureInput struct {
+	Kind                    string `json:"kind"`
+	Text                    string `json:"text"`
+	Key                     string `json:"key"`
+	RootTurnID              string `json:"root_turn_id,omitempty"`
+	OriginCompletionOrdinal *int64 `json:"origin_completion_ordinal,omitempty"`
+	SourceIncomplete        bool   `json:"source_incomplete,omitempty"`
+}
+
+type CaptureReceipt struct {
+	SourceID    string `json:"source_id"`
+	UnitCount   int64  `json:"unit_count"`
+	FirstUnitID string `json:"first_unit_id"`
+}
+
+type RecordHeader struct {
+	ID                  string `json:"id"`
+	Kind                string `json:"kind"`
+	Seq                 int64  `json:"seq"`
+	Timestamp           string `json:"timestamp"`
+	Active              bool   `json:"active"`
+	Importance          string `json:"importance"`
+	EffectiveImportance string `json:"effective_importance"`
+}
+
+type FieldFragment struct {
+	RecordID   string `json:"record_id"`
+	Field      string `json:"field"`
+	Text       string `json:"text"`
+	StartByte  int64  `json:"start_byte"`
+	EndByte    int64  `json:"end_byte"`
+	TotalBytes int64  `json:"total_bytes"`
+}
+
+type SupportReference struct {
+	RecordID string `json:"record_id"`
+	Relation string `json:"relation"`
+	TargetID string `json:"target_id"`
+	Ordinal  int64  `json:"ordinal"`
+}
+
+// Exactly one payload is non-nil. Headers never embed record text/support.
+type InspectionItem struct {
+	Header   *RecordHeader     `json:"header,omitempty"`
+	Field    *FieldFragment    `json:"field,omitempty"`
+	Support  *SupportReference `json:"support,omitempty"`
+	Evidence *EvidenceUnit     `json:"evidence,omitempty"`
+}
+
+type InspectionPage struct {
+	Page Page[InspectionItem] `json:"page"`
+}
+
+type RecallPage struct {
+	ID   string               `json:"id"`
+	Kind string               `json:"kind"`
+	Page Page[InspectionItem] `json:"page"`
+}
+
+type SearchOptions struct {
+	Cursor         string
+	IncludeRetired bool
+	Sources        bool
+}
+
+type SearchHit struct {
+	ID             string        `json:"id"`
+	Kind           string        `json:"kind"`
+	Active         bool          `json:"active"`
+	ReplacementIDs []string      `json:"replacement_ids,omitempty"`
+	Snippet        string        `json:"snippet"`
+	SourceID       string        `json:"source_id,omitempty"`
+	StartByte      int64         `json:"start_byte,omitempty"`
+	EndByte        int64         `json:"end_byte,omitempty"`
+	Evidence       *EvidenceUnit `json:"evidence,omitempty"`
+}
+
+type SearchPage struct {
+	Page Page[SearchHit] `json:"page"`
+}
+
+type PendingDebt struct {
+	ThroughSeq int64
+	Bytes      int64
+}
+
+type PendingDebtStatus struct {
+	Bytes          int64
+	OldestAgeTurns int64
+}
+
+type WorkingStateMetadata struct {
+	Revision     int64  `json:"revision"`
+	UpdatedAt    string `json:"updated_at"`
+	AgeRootTurns int64  `json:"age_root_turns"`
+}
+
+// The interface is a contract, not a stub Ledger implementation. Add its
+// concrete compile-time assertion only once T1-T6 implement every method.
+type ContinuityLedger interface {
+	CaptureV2(CaptureInput) (CaptureReceipt, error)
+	ApplyV2(CheckpointV2) (ReceiptV2, error)
+	ReadPending(string) (PendingPage, error)
+	ReadEntries(string) (InspectionPage, error)
+	ReadRecall(string, string) (RecallPage, error)
+	ReadSearch(string, SearchOptions) (SearchPage, error)
+	Status() (Status, error)
+	CompleteRootTurn(string) (int64, error)
+	CapturePendingDebt() (PendingDebt, error)
+	PendingDebtAfterRoot(PendingDebt) (PendingDebtStatus, error)
+	ClaimStopContinuation(string, string) (bool, error)
+	Prime() (string, error)
+	View() (string, error)
+	Fork(string) (Status, error)
+	Import(string, string) (Status, error)
 }
 
 func Decode(data []byte, target any) error {
