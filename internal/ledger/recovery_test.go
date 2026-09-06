@@ -111,6 +111,16 @@ func TestImportPreservesNewSessionPromptAndIsolation(t *testing.T) {
 	if pending.Sources[1].ID != promptID || pending.Sources[1].Seq <= pending.Sources[0].Seq {
 		t.Fatal("destination prompt was lost or not left pending")
 	}
+	incomingUnits := readTestUnits(t, target, pending.Sources[0].ID)
+	localUnits := readTestUnits(t, target, promptID)
+	if localUnits[0].Seq <= incomingUnits[len(incomingUnits)-1].Seq || localUnits[0].ReviewState != ReviewPending {
+		t.Fatal("destination evidence units were not appended as pending")
+	}
+	sourceStatus, err := source.Status()
+	check(t, err)
+	if status.UnitCount != sourceStatus.UnitCount+int64(len(localUnits)) || status.StoredSourceBytes != sourceStatus.StoredSourceBytes+int64(len(pending.Sources[1].Text)) {
+		t.Fatal("handoff lost v2 source/unit rows")
+	}
 	_, err = target.Recall(observation)
 	check(t, err)
 	if state, _ := target.State("prompt_id"); state != promptID {
@@ -170,5 +180,40 @@ func TestImportRefusesPreparedAndConcurrentTargets(t *testing.T) {
 	}
 	if succeeded != 1 {
 		t.Fatalf("wanted exactly one import, got %d", succeeded)
+	}
+}
+
+func TestHandoffCopiesFullV2SourceColumnsAndUnitRanges(t *testing.T) {
+	store := t.TempDir()
+	source := openTest(t, store, "original")
+	text := strings.Repeat("界🙂\n", 1200)
+	receipt, err := source.CaptureV2(CaptureInput{Kind: "tool", Text: text, Key: "origin-key", RootTurnID: "root", OriginCompletionOrdinal: ptr(42), SourceIncomplete: true})
+	check(t, err)
+	units := readTestUnits(t, source, receipt.SourceID)
+	_, err = source.db.Exec(`UPDATE evidence_units SET review_state='deferred',deferral_reason='retained log' WHERE id=?`, units[0].ID)
+	check(t, err)
+	_, err = source.Fork("forked")
+	check(t, err)
+	forked := openTest(t, store, "forked")
+	imported := openTest(t, t.TempDir(), "imported")
+	_, err = imported.Import(store, "original")
+	check(t, err)
+	for _, target := range []*Ledger{forked, imported} {
+		copied := readTestUnits(t, target, receipt.SourceID)
+		if len(copied) != len(units) || copied[0].ReviewState != ReviewDeferred || copied[0].DeferralReason != "retained log" {
+			t.Fatal("unit states/ranges lost")
+		}
+		for i := range units {
+			if units[i].ID != copied[i].ID || units[i].Text != copied[i].Text {
+				t.Fatal("source evidence changed")
+			}
+		}
+		var origin, key, root string
+		var ordinal int64
+		var incomplete bool
+		check(t, target.db.QueryRow(`SELECT origin_session,origin_key,root_turn_id,origin_completion_ordinal,source_incomplete FROM sources WHERE id=?`, receipt.SourceID).Scan(&origin, &key, &root, &ordinal, &incomplete))
+		if origin != "original" || key != "origin-key" || root != "root" || ordinal != 42 || !incomplete {
+			t.Fatal("immutable source provenance lost")
+		}
 	}
 }

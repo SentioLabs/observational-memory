@@ -2,6 +2,8 @@ package ledger
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -11,31 +13,6 @@ import (
 	"unicode/utf8"
 )
 
-func (l *Ledger) Capture(kind, text, key string) (string, error) {
-	if kind != "user" && kind != "assistant" && kind != "tool" {
-		return "", fmt.Errorf("invalid source kind %q", kind)
-	}
-	if _, err := cleanText(text, 1000000); err != nil {
-		return "", err
-	}
-	text = Redact(text)
-	id, err := identity("s-", []any{kind, key, text})
-	if err != nil {
-		return "", err
-	}
-	chars := []rune(text)
-	truncated := len(chars) > SourceLimit
-	if truncated {
-		text = string(chars[:SourceLimit/2]) + "\n[CAPTURE TRUNCATED]\n" + string(chars[len(chars)-SourceLimit/2:])
-	}
-	record := Source{ID: id, Kind: kind, Timestamp: time.Now().UTC().Format(time.RFC3339), Text: text, Truncated: truncated}
-	body, err := JSON(record)
-	if err != nil {
-		return "", err
-	}
-	_, err = l.db.ExecContext(l.ctx, "INSERT OR IGNORE INTO sources(id,body) VALUES (?,?)", id, string(body))
-	return id, err
-}
 func (l *Ledger) Pending() (Pending, error) {
 	through, err := cursor(l.ctx, l.db)
 	if err != nil {
@@ -135,7 +112,7 @@ func insertEntry(ctx context.Context, q queryer, kind, timestamp, importance, te
 	if err != nil {
 		return "", err
 	}
-	_, err = q.ExecContext(ctx, "INSERT OR IGNORE INTO entries(id,body) VALUES (?,?)", id, string(body))
+	_, err = q.ExecContext(ctx, "INSERT OR IGNORE INTO entries(id,body,effective_priority) VALUES (?,?,?)", id, string(body), importanceRank(importance))
 	return id, err
 }
 func (l *Ledger) Apply(checkpoint Checkpoint) (Receipt, error) {
@@ -242,6 +219,11 @@ func (l *Ledger) Apply(checkpoint Checkpoint) (Receipt, error) {
 			return receipt, err
 		}
 		receipt.Retired = append(receipt.Retired, change.ID)
+	}
+	// Development-only legacy checkpoint callers still resolve source spans.
+	// T2 replaces this path with explicit evidence acknowledgments.
+	if _, err = tx.ExecContext(l.ctx, `UPDATE evidence_units SET review_state='reviewed' WHERE review_state='pending' AND source_id IN (SELECT id FROM sources WHERE seq<=?)`, receipt.Through); err != nil {
+		return receipt, err
 	}
 	if err = setMeta(l.ctx, tx, "cursor", strconv.FormatInt(receipt.Through, 10)); err != nil {
 		return receipt, err
@@ -380,33 +362,93 @@ func (l *Ledger) ViewWithin(limit int) (string, error) {
 }
 func (l *Ledger) Status() (Status, error) {
 	status := Status{Session: l.session, Database: l.Path}
-	var err error
-	if status.Through, err = cursor(l.ctx, l.db); err != nil {
+	conn, err := l.db.Conn(l.ctx)
+	if err != nil {
 		return status, err
 	}
-	if status.Paused, err = l.Paused(); err != nil {
+	defer conn.Close()
+	// Explicit DEFERRED gives a coherent read snapshot without claiming a writer.
+	if _, err = conn.ExecContext(l.ctx, "BEGIN DEFERRED"); err != nil {
 		return status, err
 	}
-	if status.LastCheckpointAt, err = l.State("last_checkpoint_at"); err != nil {
+	defer conn.ExecContext(context.Background(), "ROLLBACK")
+	if status.Through, err = cursor(l.ctx, conn); err != nil {
 		return status, err
 	}
-	parent, err := l.State("forked_from")
+	paused, err := meta(l.ctx, conn, "paused")
+	if err != nil {
+		return status, err
+	}
+	status.Paused = paused == "1"
+	if status.LastCheckpointAt, err = meta(l.ctx, conn, "last_checkpoint_at"); err != nil {
+		return status, err
+	}
+	parent, err := meta(l.ctx, conn, "forked_from")
 	if err != nil {
 		return status, err
 	}
 	if parent != "" {
-		store, err := l.State("forked_from_store")
+		store, err := meta(l.ctx, conn, "forked_from_store")
 		if err != nil {
 			return status, err
 		}
 		status.ImportedFrom = &SessionReference{Store: store, Session: parent}
 	}
-	if err = l.db.QueryRowContext(l.ctx, "SELECT COUNT(*),COALESCE(SUM(length(json_extract(body,'$.text'))),0) FROM sources WHERE seq>?", status.Through).Scan(&status.PendingSources, &status.PendingChars); err != nil {
+	revision, err := meta(l.ctx, conn, "revision")
+	if err != nil {
 		return status, err
 	}
-	if err = l.db.QueryRowContext(l.ctx, "SELECT COALESCE(SUM(json_extract(body,'$.kind')='observation'),0),COALESCE(SUM(json_extract(body,'$.kind')='reflection'),0) FROM entries WHERE active=1").Scan(&status.Active.Observations, &status.Active.Reflections); err != nil {
+	if status.Revision, err = strconv.ParseInt(revision, 10, 64); err != nil {
+		return status, err
+	}
+	rows, err := conn.QueryContext(l.ctx, `SELECT review_state,COUNT(*),COALESCE(SUM(end_byte-start_byte),0) FROM evidence_units GROUP BY review_state`)
+	if err != nil {
+		return status, err
+	}
+	for rows.Next() {
+		var state ReviewState
+		var count CoverageCount
+		if err = rows.Scan(&state, &count.Units, &count.Bytes); err != nil {
+			rows.Close()
+			return status, err
+		}
+		switch state {
+		case ReviewPending:
+			status.Coverage.Pending = count
+		case ReviewReviewed:
+			status.Coverage.Reviewed = count
+		case ReviewDeferred:
+			status.Coverage.Deferred = count
+		}
+		status.UnitCount += count.Units
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return status, err
+	}
+	if err = conn.QueryRowContext(l.ctx, `SELECT COUNT(*),COALESCE(SUM(length(CAST(json_extract(body,'$.text') AS BLOB))),0) FROM sources`).Scan(&status.SourceCount, &status.StoredSourceBytes); err != nil {
+		return status, err
+	}
+	if err = conn.QueryRowContext(l.ctx, `SELECT COUNT(DISTINCT s.id),COALESCE(SUM(length(CAST(substr(CAST(json_extract(s.body,'$.text') AS BLOB),u.start_byte+1,u.end_byte-u.start_byte) AS TEXT))),0)
+ FROM evidence_units u JOIN sources s ON s.id=u.source_id WHERE u.review_state='pending'`).Scan(&status.PendingSources, &status.PendingChars); err != nil {
+		return status, err
+	}
+	if err = conn.QueryRowContext(l.ctx, `SELECT COALESCE(SUM(json_extract(body,'$.kind')='observation'),0),COALESCE(SUM(json_extract(body,'$.kind')='reflection'),0) FROM entries WHERE active=1`).Scan(&status.Active.Observations, &status.Active.Reflections); err != nil {
+		return status, err
+	}
+	if err = conn.QueryRowContext(l.ctx, `SELECT COALESCE(MAX(MAX(0,CAST((SELECT value FROM meta WHERE key='root_completed_ordinal') AS INTEGER)-s.local_origin_ordinal)),0)
+ FROM sources s WHERE EXISTS(SELECT 1 FROM evidence_units u WHERE u.source_id=s.id AND u.review_state='pending')`).Scan(&status.OldestPendingAgeTurns); err != nil {
+		return status, err
+	}
+	var metadata WorkingStateMetadata
+	err = conn.QueryRowContext(l.ctx, `SELECT revision,updated_at,MAX(0,CAST((SELECT value FROM meta WHERE key='root_completed_ordinal') AS INTEGER)-local_origin_ordinal) FROM working_state WHERE singleton=1`).Scan(&metadata.Revision, &metadata.UpdatedAt, &metadata.AgeRootTurns)
+	if err == nil {
+		status.WorkingState = &metadata
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return status, err
 	}
 	status.EstimatedPendingTokens = (status.PendingChars + 3) / 4
-	return status, nil
+	_, err = conn.ExecContext(l.ctx, "COMMIT")
+	return status, err
 }

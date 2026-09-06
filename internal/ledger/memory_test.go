@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -40,7 +41,7 @@ func observe(t *testing.T, l *Ledger, text string) (int64, string, string) {
 	check(t, err)
 	return pending.Through, sid, receipt.Observations[0]
 }
-func TestLegacyRustStoreAndIDs(t *testing.T) {
+func TestLegacyRustStoreRefused(t *testing.T) {
 	data, err := os.ReadFile("testdata/rust-schema-1.json")
 	check(t, err)
 	var fixture struct {
@@ -63,41 +64,21 @@ func TestLegacyRustStoreAndIDs(t *testing.T) {
 	_, err = db.Exec(string(schema))
 	check(t, err)
 	check(t, db.Close())
-	l := openTest(t, store, fixture.Session)
-	if filepath.Base(filepath.Dir(l.Path)) != fixture.Directory {
-		t.Fatalf("session hash changed: %s", l.Path)
-	}
-	recalled, err := l.Recall(fixture.ReflectionID)
+	before, err := os.ReadFile(filepath.Join(dir, "memory.sqlite3"))
 	check(t, err)
-	if len(recalled.Sources) != 1 || recalled.Sources[0].Text != fixture.SourceText {
-		t.Fatalf("lost legacy evidence: %+v", recalled)
+	if l, err := Open(context.Background(), store, fixture.Session); err == nil {
+		l.Close()
+		t.Fatal("accepted unsupported legacy schema")
+	} else if !strings.Contains(err.Error(), "unsupported ledger version") {
+		t.Fatal(err)
 	}
-	old, err := l.Recall(fixture.ObservationID)
+	after, err := os.ReadFile(filepath.Join(dir, "memory.sqlite3"))
 	check(t, err)
-	if old.Entry.Active {
-		t.Fatal("retired observation reactivated")
-	}
-	id, err := l.Capture("user", fixture.SourceText, "legacy")
-	check(t, err)
-	if id != fixture.SourceID {
-		t.Fatalf("source hash changed: %s", id)
-	}
-	receipt, err := l.Apply(Checkpoint{Through: ptr(1), Observations: []Observation{fixture.Observation}})
-	check(t, err)
-	if receipt.Observations[0] != fixture.ObservationID {
-		t.Fatalf("observation hash changed: %s", receipt.Observations[0])
-	}
-	pending, err := l.Pending()
-	check(t, err)
-	if len(pending.Sources) != 0 || pending.Through != 1 {
-		t.Fatal("cursor changed")
-	}
-	active, err := l.Entries(false)
-	check(t, err)
-	if len(active) != 1 || active[0].ID != fixture.ReflectionID {
-		t.Fatal("active memory changed")
+	if !bytes.Equal(before, after) {
+		t.Fatal("legacy store changed")
 	}
 }
+
 func TestCheckpointRollbackIdempotencyAndStaleCursor(t *testing.T) {
 	l := openTest(t, t.TempDir(), "atomic")
 	sid, err := l.Capture("user", "Keep the API stable.", "one")
@@ -261,8 +242,8 @@ func TestUnicodeBoundsViewAndRedaction(t *testing.T) {
 			break
 		}
 		for _, s := range pending.Sources {
-			if !s.Truncated || utf8.RuneCountInString(s.Text) > 24100 {
-				t.Fatal("unbounded source")
+			if s.Truncated || s.Text != strings.Repeat("🙂", 30000) {
+				t.Fatal("source was not retained completely")
 			}
 			count++
 		}

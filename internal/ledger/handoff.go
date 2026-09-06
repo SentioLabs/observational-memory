@@ -84,7 +84,7 @@ func (l *Ledger) snapshot(destination string) (path string, status Status, clean
 		return "", status, cleanup, err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(l.ctx, "DELETE FROM meta WHERE key NOT IN ('version','cursor','paused','last_checkpoint_at')"); err != nil {
+	if _, err = tx.ExecContext(l.ctx, "DELETE FROM meta WHERE key NOT IN ('version','cursor','paused','last_checkpoint_at','revision','search_generation','root_completed_ordinal','pagination_epoch')"); err != nil {
 		return "", status, cleanup, err
 	}
 	for key, value := range map[string]string{"session": destination, "forked_from": l.session, "forked_from_store": l.store} {
@@ -200,13 +200,18 @@ func (l *Ledger) Import(sourceStore, sourceSession string) (Status, error) {
 		return Status{}, fmt.Errorf("destination already has checkpointed or imported memory; use a new session")
 	}
 	for _, statement := range []string{
-		"CREATE TEMP TABLE pending_import AS SELECT seq,id,body FROM main.sources",
+		"CREATE TEMP TABLE pending_import AS SELECT * FROM main.sources",
+		"CREATE TEMP TABLE pending_units_import AS SELECT * FROM main.evidence_units",
+		"DELETE FROM main.evidence_units",
 		"DELETE FROM main.sources",
-		"INSERT INTO main.sources(seq,id,body) SELECT seq,id,body FROM incoming.sources ORDER BY seq",
-		"INSERT OR IGNORE INTO main.sources(id,body) SELECT id,body FROM pending_import ORDER BY seq",
+		"INSERT INTO main.sources(seq,id,body,origin_session,origin_key,root_turn_id,local_origin_ordinal,origin_completion_ordinal,source_incomplete) SELECT seq,id,body,origin_session,origin_key,root_turn_id,local_origin_ordinal,origin_completion_ordinal,source_incomplete FROM incoming.sources ORDER BY seq",
+		"INSERT INTO main.evidence_units(seq,id,source_id,start_byte,end_byte,review_state,deferral_reason) SELECT seq,id,source_id,start_byte,end_byte,review_state,deferral_reason FROM incoming.evidence_units ORDER BY seq",
+		"INSERT OR IGNORE INTO main.sources(id,body,origin_session,origin_key,root_turn_id,local_origin_ordinal,origin_completion_ordinal,source_incomplete) SELECT id,body,origin_session,origin_key,root_turn_id,local_origin_ordinal,origin_completion_ordinal,source_incomplete FROM pending_import ORDER BY seq",
+		"INSERT OR IGNORE INTO main.evidence_units(id,source_id,start_byte,end_byte,review_state,deferral_reason) SELECT id,source_id,start_byte,end_byte,review_state,deferral_reason FROM pending_units_import ORDER BY seq",
+		"DROP TABLE pending_units_import",
 		"DROP TABLE pending_import",
 		"INSERT INTO main.entries SELECT * FROM incoming.entries",
-		"INSERT OR REPLACE INTO main.meta SELECT key,value FROM incoming.meta WHERE key IN ('cursor','last_checkpoint_at','forked_from','forked_from_store')",
+		"INSERT OR REPLACE INTO main.meta SELECT key,value FROM incoming.meta WHERE key IN ('cursor','last_checkpoint_at','forked_from','forked_from_store','revision','search_generation','root_completed_ordinal','pagination_epoch')",
 		"DELETE FROM main.meta WHERE key IN ('stop_turn','stop_prompt','notified_cursor')",
 	} {
 		if _, err = tx.ExecContext(l.ctx, statement); err != nil {
