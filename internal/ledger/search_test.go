@@ -403,6 +403,11 @@ func TestSearchTokenSpansMatchSQLite(t *testing.T) {
 	check(t, err)
 	defer tokenizer.close()
 	cases := []struct{ text, query string }{
+		{strings.Repeat("a", 40000), strings.Repeat("a", 32768)},
+		{strings.Repeat("a", 32768), strings.Repeat("a", 40000)},
+		{strings.Repeat("é", 40000), strings.Repeat("é", 32768)},
+		{strings.Repeat("界", 14000), strings.Repeat("界", 11000)},
+		{strings.Repeat("界", 14000), strings.Repeat("界", 10922) + "畍"},
 		{"a b c a b c", "a_b b_c"},
 		{"a b c x b x c", "b a_b_c c"},
 		{"a b a b", "a b"},
@@ -444,7 +449,7 @@ func TestSearchTokenSpansMatchSQLite(t *testing.T) {
 		got, err := matcher.spans(l.ctx, tokenizer, tc.text)
 		check(t, err)
 		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("case %d query %q spans=%v want=%v", i, tc.query, got, want)
+			t.Fatalf("case %d query bytes=%d spans=%v want=%v", i, len(tc.query), got, want)
 		}
 	}
 }
@@ -546,5 +551,50 @@ func TestSearchQueryUsesSQLiteTokenCategories(t *testing.T) {
 		if len(hits) != 1 {
 			t.Fatalf("query %q dropped a SQLite unicode61 token: %v", query, hits)
 		}
+	}
+}
+
+func TestSearchOversizedTokenKeys(t *testing.T) {
+	cases := []struct {
+		name, text, query string
+		matches           bool
+	}{
+		{"ASCII document cap", strings.Repeat("a", 40000), strings.Repeat("a", 32768), true},
+		{"ASCII query cap", strings.Repeat("a", 32768), strings.Repeat("a", 40000), true},
+		{"normalize before cap", strings.Repeat("é", 40000), strings.Repeat("é", 32768), true},
+		{"UTF8 byte split", strings.Repeat("界", 14000), strings.Repeat("界", 11000), true},
+		{"UTF8 key suffix collision", strings.Repeat("界", 14000), strings.Repeat("界", 10922) + "畍", true},
+		{"UTF8 shorter key stays distinct", strings.Repeat("界", 14000), strings.Repeat("界", 10922), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := openTest(t, t.TempDir(), "oversized")
+			log, err := l.CaptureV2(CaptureInput{Kind: "tool", Text: tc.text, Key: "one-token"})
+			check(t, err)
+			var indexedMatches int
+			check(t, l.db.QueryRow(`SELECT count(*) FROM source_fts WHERE source_fts MATCH ?`, literalQuery(tc.query)).Scan(&indexedMatches))
+			if (indexedMatches == 1) != tc.matches {
+				t.Fatalf("SQLite oracle matched %d rows", indexedMatches)
+			}
+			hits := searchAll(t, l, tc.query, SearchOptions{Sources: true})
+			if !tc.matches {
+				if len(hits) != 0 {
+					t.Fatal("short key incorrectly matches capped token")
+				}
+				return
+			}
+			var reconstructed strings.Builder
+			next := int64(0)
+			for _, hit := range hits {
+				if hit.SourceID != log.SourceID || hit.StartByte != next {
+					t.Fatal("oversized token has missing or unordered evidence")
+				}
+				reconstructed.WriteString(hit.Snippet)
+				next = hit.EndByte
+			}
+			if reconstructed.String() != tc.text || len(hits) != len(readTestUnits(t, l, log.SourceID)) {
+				t.Fatalf("recovered %d of %d token bytes in %d hits", reconstructed.Len(), len(tc.text), len(hits))
+			}
+		})
 	}
 }

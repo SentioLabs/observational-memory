@@ -454,6 +454,10 @@ func searchTokenCallback(_ *libc.TLS, handle uintptr, flags int32, token uintptr
 		return sqlite3.SQLITE_ERROR
 	}
 	visitor.previousEnd = int(end)
+	// FTS5 clamps normalized query/index keys after tokenization, by bytes.
+	// The capped key may end within a UTF-8 rune; only this private comparison
+	// key is truncated. Original source offsets and evidence remain complete.
+	n = min(n, int32(sqlite3.FTS5_MAX_TOKEN_SIZE))
 	visitor.visit(string(unsafe.Slice(searchNativePointer[byte](token), n)), int(start), int(end))
 	return sqlite3.SQLITE_OK
 }
