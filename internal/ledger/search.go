@@ -1,13 +1,20 @@
 package ledger
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"math"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
+	"unsafe"
+
+	"modernc.org/libc"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Modes are ordered, not blended: BM25 from the memory and source corpora is
@@ -25,71 +32,23 @@ type rankedSearchPosition struct {
 
 func literalQuery(query string) string {
 	parts := []string{}
+	for _, word := range literalWords(query) {
+		parts = append(parts, `"`+strings.ReplaceAll(word, `"`, `""`)+`"`)
+	}
+	return strings.Join(parts, " AND ")
+}
+
+func literalWords(query string) []string {
+	parts := []string{}
 	for _, word := range strings.Fields(query) {
 		// unicode61 indexes letters, numbers and private-use characters. Punctuation
 		// alone contributes no searchable token and must not turn an AND into false.
 		if !strings.ContainsFunc(word, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.Is(unicode.Co, r) }) {
 			continue
 		}
-		parts = append(parts, `"`+strings.ReplaceAll(word, `"`, `""`)+`"`)
+		parts = append(parts, word)
 	}
-	return strings.Join(parts, " AND ")
-}
-
-// matchSpans validates the entire reconstruction before trusting any offset.
-// Markers must be absent from the original, including literal marker-like logs.
-func matchSpans(original, highlighted, openMarker, closeMarker string) ([]byteRange, error) {
-	bad := fmt.Errorf("search highlight does not reconstruct retained text")
-	if openMarker == "" || closeMarker == "" || openMarker == closeMarker || strings.Contains(original, openMarker) || strings.Contains(original, closeMarker) {
-		return nil, bad
-	}
-	var reconstructed strings.Builder
-	spans := []byteRange{}
-	for {
-		at := strings.Index(highlighted, openMarker)
-		if at < 0 {
-			if strings.Contains(highlighted, closeMarker) {
-				return nil, bad
-			}
-			reconstructed.WriteString(highlighted)
-			break
-		}
-		plain := highlighted[:at]
-		if strings.Contains(plain, closeMarker) {
-			return nil, bad
-		}
-		reconstructed.WriteString(plain)
-		highlighted = highlighted[at+len(openMarker):]
-		end := strings.Index(highlighted, closeMarker)
-		if end <= 0 || strings.Contains(highlighted[:end], openMarker) {
-			return nil, bad
-		}
-		start := reconstructed.Len()
-		reconstructed.WriteString(highlighted[:end])
-		spans = append(spans, byteRange{start, reconstructed.Len()})
-		highlighted = highlighted[end+len(closeMarker):]
-	}
-	// Only the FTS representation changes NUL to U+0001, both unicode61
-	// separators of equal UTF-8 width. Validate it, then restore precisely the
-	// original NUL positions (preserving preexisting U+0001) and verify base bytes.
-	restored := []byte(reconstructed.String())
-	if string(restored) != strings.ReplaceAll(original, "\x00", "\x01") {
-		return nil, bad
-	}
-	for i := 0; i < len(original); i++ {
-		if original[i] == 0 {
-			restored[i] = 0
-		}
-	}
-	if string(restored) != original {
-		return nil, bad
-	}
-	for _, span := range spans {
-		if !utf8.ValidString(original[span.start:span.end]) {
-			return nil, bad
-		}
-	}
-	return spans, nil
+	return parts
 }
 
 func (l *Ledger) ReadSearch(query string, options SearchOptions) (SearchPage, error) {
@@ -119,6 +78,17 @@ func (l *Ledger) ReadSearch(query string, options SearchOptions) (SearchPage, er
 		}
 	}
 	stream := searchStream{l: l, q: q, cursor: c, query: literalQuery(query), options: options}
+	if stream.query != "" {
+		stream.tokenizer, err = newSearchTokenizer()
+		if err != nil {
+			return result, err
+		}
+		defer stream.tokenizer.close()
+		stream.matcher, err = newSearchPhrases(l.ctx, stream.tokenizer, literalWords(query))
+		if err != nil {
+			return result, err
+		}
+	}
 	result.Page, err = packPage(c, ReadEnvelopeBytes, stream.next, func(p Page[SearchHit]) any { return SearchPage{Page: p} })
 	return result, err
 }
@@ -129,12 +99,14 @@ type searchSource struct {
 	spans    []byteRange
 }
 type searchStream struct {
-	l       *Ledger
-	q       queryer
-	cursor  readCursor
-	query   string
-	options SearchOptions
-	cached  *searchSource
+	l         *Ledger
+	q         queryer
+	cursor    readCursor
+	query     string
+	options   SearchOptions
+	cached    *searchSource
+	tokenizer *searchTokenizer
+	matcher   *searchPhrases
 }
 
 func (s *searchStream) next(p readPosition) (SearchHit, readPosition, bool, error) {
@@ -223,7 +195,7 @@ func (s *searchStream) memory(p rankedSearchPosition) (SearchHit, rankedSearchPo
 		}
 		hit.ReplacementIDs = r.ReplacementIDs
 	}
-	spans, err := s.highlight(0, after.Seq, original)
+	spans, err := s.matcher.spans(s.l.ctx, s.tokenizer, original)
 	if err != nil {
 		return hit, after, err
 	}
@@ -258,7 +230,7 @@ func (s *searchStream) source(p rankedSearchPosition) (*searchSource, error) {
 	if err != nil {
 		return nil, err
 	}
-	src.spans, err = s.highlight(1, src.position.Seq, src.text)
+	src.spans, err = s.matcher.spans(s.l.ctx, s.tokenizer, src.text)
 	if err != nil {
 		return nil, err
 	}
@@ -266,22 +238,249 @@ func (s *searchStream) source(p rankedSearchPosition) (*searchSource, error) {
 	return src, nil
 }
 
-func (s *searchStream) highlight(mode int, seq int64, original string) ([]byteRange, error) {
-	var openMarker, closeMarker string
-	for i := 0; ; i++ {
-		openMarker = fmt.Sprintf("<om-match-%d>", i)
-		closeMarker = fmt.Sprintf("</om-match-%d>", i)
-		if !strings.Contains(original, openMarker) && !strings.Contains(original, closeMarker) {
-			break
+// searchPhrases is an Aho-Corasick automaton over SQLite's normalized tokens.
+// Literal fields are phrases joined with AND by FTS5. Ranking already establishes
+// that all phrases occur; here we find their union. For matches ending at the
+// same token, the longest phrase contains every shorter match.
+type searchPhraseNode struct {
+	next   map[string]int
+	fail   int
+	length int
+}
+type searchPhrases struct {
+	nodes   []searchPhraseNode
+	longest int
+}
+
+func newSearchPhrases(ctx context.Context, tokenizer *searchTokenizer, words []string) (*searchPhrases, error) {
+	p := &searchPhrases{nodes: []searchPhraseNode{{next: map[string]int{}}}}
+	for _, word := range words {
+		state, length := 0, 0
+		err := tokenizer.visit(ctx, word, sqlite3.FTS5_TOKENIZE_QUERY, func(token string, _, _ int) {
+			child, ok := p.nodes[state].next[token]
+			if !ok {
+				child = len(p.nodes)
+				p.nodes[state].next[token] = child
+				p.nodes = append(p.nodes, searchPhraseNode{next: map[string]int{}})
+			}
+			state = child
+			length++
+		})
+		if err != nil {
+			return nil, err
+		}
+		p.nodes[state].length = max(p.nodes[state].length, length)
+		p.longest = max(p.longest, length)
+	}
+	queue := []int{0}
+	for head := 0; head < len(queue); head++ {
+		state := queue[head]
+		for token, child := range p.nodes[state].next {
+			queue = append(queue, child)
+			if state == 0 {
+				continue
+			}
+			fallback := p.nodes[state].fail
+			for fallback != 0 && p.nodes[fallback].next[token] == 0 {
+				fallback = p.nodes[fallback].fail
+			}
+			p.nodes[child].fail = p.nodes[fallback].next[token]
+			p.nodes[child].length = max(p.nodes[child].length, p.nodes[p.nodes[child].fail].length)
 		}
 	}
-	query := `SELECT highlight(entry_fts,0,?,?) FROM entry_fts WHERE entry_fts MATCH ? AND rowid=?`
-	if mode == 1 {
-		query = `SELECT highlight(source_fts,0,?,?) FROM source_fts WHERE source_fts MATCH ? AND rowid=?`
+	return p, nil
+}
+func (p *searchPhrases) spans(ctx context.Context, tokenizer *searchTokenizer, text string) ([]byteRange, error) {
+	spans := []byteRange{}
+	if p.longest == 0 {
+		return spans, nil
 	}
-	var highlighted string
-	if err := s.q.QueryRowContext(s.l.ctx, query, openMarker, closeMarker, s.query, seq).Scan(&highlighted); err != nil {
+	starts := make([]int, p.longest)
+	state, position := 0, 0
+	err := tokenizer.visit(ctx, text, sqlite3.FTS5_TOKENIZE_DOCUMENT, func(token string, start, end int) {
+		starts[position%len(starts)] = start
+		for state != 0 && p.nodes[state].next[token] == 0 {
+			state = p.nodes[state].fail
+		}
+		state = p.nodes[state].next[token]
+		if length := p.nodes[state].length; length > 0 {
+			span := byteRange{starts[(position-length+1)%len(starts)], end}
+			// Overlap, not adjacency, matches FTS5 highlight's shared-token union.
+			// A later longer phrase may subsume several prior shorter spans.
+			for len(spans) > 0 && span.start < spans[len(spans)-1].end {
+				span.start = min(span.start, spans[len(spans)-1].start)
+				spans = spans[:len(spans)-1]
+			}
+			spans = append(spans, span)
+		}
+		position++
+	})
+	return spans, err
+}
+
+// The driver exposes FTS5's documented API through its translated SQLite C ABI,
+// but has no database/sql tokenizer API and does not compile fts3tokenize.
+// This bridge owns a separate in-memory connection solely to obtain unicode61.
+// It never accesses a stored ledger connection or private driver struct fields.
+// Keep its tokenizer configuration identical to source_fts and entry_fts.
+//
+// modernc v1.44.2 represents C pointers/function pointers as uintptr. The only
+// pointer reinterpretation below is for SQLite/TLS-owned memory or declared Go
+// callback functions, using the same ABI as the driver. A numeric callback handle
+// prevents any Go heap pointer from crossing that ABI. Each search owns its TLS,
+// connection and tokenizer until synchronous callbacks finish. All supported
+// targets (darwin/arm64, linux/arm64, linux/amd64) use this 64-bit ABI.
+type searchTokenizer struct {
+	tls      *libc.TLS
+	db       uintptr
+	instance uintptr
+	module   sqlite3.Tfts5_tokenizer
+}
+type searchTokenizerSetup struct {
+	db, statement, api, context, instance uintptr
+	module                                sqlite3.Tfts5_tokenizer
+}
+
+// SQLite returns addresses into its translated C allocator, outside Go's heap.
+// Reinterpret the address value as a pointer without pretending it is a Go
+// object or permitting pointer arithmetic/lifetimes outside the owning call.
+func searchNativePointer[T any](address uintptr) *T {
+	return *(**T)(unsafe.Pointer(&address))
+}
+func newSearchTokenizer() (_ *searchTokenizer, err error) {
+	t := &searchTokenizer{tls: libc.NewTLS()}
+	defer func() {
+		if err != nil {
+			t.close()
+		}
+	}()
+	size := int(unsafe.Sizeof(searchTokenizerSetup{}))
+	memory := t.tls.Alloc(size)
+	defer t.tls.Free(size)
+	setup := searchNativePointer[searchTokenizerSetup](memory)
+	*setup = searchTokenizerSetup{}
+	literals := []string{":memory:", "SELECT fts5(?)", "fts5_api_ptr", "unicode61"}
+	cstrings := make([]uintptr, len(literals))
+	defer func() {
+		for _, p := range cstrings {
+			libc.Xfree(t.tls, p)
+		}
+	}()
+	for i, text := range literals {
+		cstrings[i], err = libc.CString(text)
+		if err != nil {
+			return nil, err
+		}
+	}
+	checkCode := func(stage string, code int32) error {
+		if code != sqlite3.SQLITE_OK {
+			return fmt.Errorf("search tokenizer %s: SQLite error %d", stage, code)
+		}
+		return nil
+	}
+	code := sqlite3.Xsqlite3_open_v2(t.tls, cstrings[0], uintptr(unsafe.Pointer(&setup.db)), sqlite3.SQLITE_OPEN_READWRITE|sqlite3.SQLITE_OPEN_CREATE, 0)
+	t.db = setup.db
+	if err = checkCode("open", code); err != nil {
 		return nil, err
 	}
-	return matchSpans(original, highlighted, openMarker, closeMarker)
+	if err = checkCode("prepare", sqlite3.Xsqlite3_prepare_v2(t.tls, t.db, cstrings[1], -1, uintptr(unsafe.Pointer(&setup.statement)), 0)); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if setup.statement != 0 {
+			sqlite3.Xsqlite3_finalize(t.tls, setup.statement)
+		}
+	}()
+	if err = checkCode("bind API", sqlite3.Xsqlite3_bind_pointer(t.tls, setup.statement, 1, uintptr(unsafe.Pointer(&setup.api)), cstrings[2], 0)); err != nil {
+		return nil, err
+	}
+	if code = sqlite3.Xsqlite3_step(t.tls, setup.statement); code != sqlite3.SQLITE_ROW {
+		return nil, fmt.Errorf("search tokenizer API: SQLite error %d", code)
+	}
+	if setup.api == 0 {
+		return nil, fmt.Errorf("search tokenizer FTS5 API unavailable")
+	}
+	api := searchNativePointer[sqlite3.Tfts5_api](setup.api)
+	if api.FiVersion < 2 || api.FxFindTokenizer == 0 {
+		return nil, fmt.Errorf("search tokenizer requires FTS5 API version 2")
+	}
+	find := *(*func(*libc.TLS, uintptr, uintptr, uintptr, uintptr) int32)(unsafe.Pointer(&api.FxFindTokenizer))
+	if err = checkCode("find unicode61", find(t.tls, setup.api, cstrings[3], uintptr(unsafe.Pointer(&setup.context)), uintptr(unsafe.Pointer(&setup.module)))); err != nil {
+		return nil, err
+	}
+	t.module = setup.module
+	if t.module.FxCreate == 0 || t.module.FxDelete == 0 || t.module.FxTokenize == 0 {
+		return nil, fmt.Errorf("search tokenizer methods unavailable")
+	}
+	create := *(*func(*libc.TLS, uintptr, uintptr, int32, uintptr) int32)(unsafe.Pointer(&t.module.FxCreate))
+	code = create(t.tls, setup.context, 0, 0, uintptr(unsafe.Pointer(&setup.instance)))
+	t.instance = setup.instance
+	if err = checkCode("create unicode61", code); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+func (t *searchTokenizer) close() {
+	if t.instance != 0 {
+		destroy := *(*func(*libc.TLS, uintptr))(unsafe.Pointer(&t.module.FxDelete))
+		destroy(t.tls, t.instance)
+	}
+	if t.db != 0 {
+		sqlite3.Xsqlite3_close(t.tls, t.db)
+	}
+	t.tls.Close()
+}
+
+type searchTokenVisitor struct {
+	ctx         context.Context
+	input       string
+	previousEnd int
+	visit       func(string, int, int)
+	err         error
+}
+
+var searchTokenVisitors sync.Map
+var searchTokenHandle atomic.Uint64
+
+func searchTokenCallback(_ *libc.TLS, handle uintptr, flags int32, token uintptr, n, start, end int32) int32 {
+	value, ok := searchTokenVisitors.Load(handle)
+	if !ok {
+		return sqlite3.SQLITE_ABORT
+	}
+	visitor := value.(*searchTokenVisitor)
+	if visitor.err = visitor.ctx.Err(); visitor.err != nil {
+		return sqlite3.SQLITE_INTERRUPT
+	}
+	if flags != 0 || n <= 0 || start < int32(visitor.previousEnd) || end <= start || int(end) > len(visitor.input) || !utf8.ValidString(visitor.input[start:end]) {
+		visitor.err = fmt.Errorf("search tokenizer returned invalid Unicode61 offsets")
+		return sqlite3.SQLITE_ERROR
+	}
+	visitor.previousEnd = int(end)
+	visitor.visit(string(unsafe.Slice(searchNativePointer[byte](token), n)), int(start), int(end))
+	return sqlite3.SQLITE_OK
+}
+func (t *searchTokenizer) visit(ctx context.Context, text string, mode int32, visit func(string, int, int)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	input, err := libc.CString(text)
+	if err != nil {
+		return err
+	}
+	defer libc.Xfree(t.tls, input)
+	visitor := &searchTokenVisitor{ctx: ctx, input: text, visit: visit}
+	handle := uintptr(searchTokenHandle.Add(1))
+	searchTokenVisitors.Store(handle, visitor)
+	defer searchTokenVisitors.Delete(handle)
+	callback := searchTokenCallback
+	callbackPointer := *(*uintptr)(unsafe.Pointer(&callback))
+	tokenize := *(*func(*libc.TLS, uintptr, uintptr, int32, uintptr, int32, uintptr) int32)(unsafe.Pointer(&t.module.FxTokenize))
+	code := tokenize(t.tls, t.instance, handle, mode, input, int32(len(text)), callbackPointer)
+	if visitor.err != nil {
+		return visitor.err
+	}
+	if code != sqlite3.SQLITE_OK {
+		return fmt.Errorf("search tokenizer failed: SQLite error %d", code)
+	}
+	return nil
 }

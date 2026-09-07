@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,21 +21,6 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// Register before any connection opens so trigger normalization participates
-// in the base transaction on capture, checkpoint and snapshot-copy connections.
-// The argument is a BLOB: driver scalar-function TEXT conversion stops at NUL.
-func init() {
-	sqlite.MustRegisterDeterministicScalarFunction("om_fts_text", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-		text, ok := args[0].([]byte)
-		if !ok {
-			return nil, fmt.Errorf("FTS text must be a byte string")
-		}
-		return strings.ReplaceAll(string(text), "\x00", "\x01"), nil
-	})
-}
-
-// FTS alone normalizes NUL to the equal-width token separator U+0001: SQLite
-// highlight/snippet truncate unmatched spans at NUL. Base JSON remains exact.
 const schema = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE sources (seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,12 +43,12 @@ CREATE TABLE working_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  local_origin_ordinal INTEGER NOT NULL);
 CREATE TABLE root_turns (id TEXT PRIMARY KEY, completed_ordinal INTEGER UNIQUE,
  continuation_claimed INTEGER NOT NULL DEFAULT 0, continuation_prompt TEXT NOT NULL DEFAULT '');
-CREATE VIRTUAL TABLE source_fts USING fts5(text);
-CREATE VIRTUAL TABLE entry_fts USING fts5(text);
-INSERT INTO source_fts(rowid,text) SELECT seq,om_fts_text(CAST(json_extract(body,'$.text') AS BLOB)) FROM sources;
-INSERT INTO entry_fts(rowid,text) SELECT seq,om_fts_text(CAST(json_extract(body,'$.text') AS BLOB)) FROM entries;
+CREATE VIRTUAL TABLE source_fts USING fts5(text, tokenize='unicode61');
+CREATE VIRTUAL TABLE entry_fts USING fts5(text, tokenize='unicode61');
+INSERT INTO source_fts(rowid,text) SELECT seq,json_extract(body,'$.text') FROM sources;
+INSERT INTO entry_fts(rowid,text) SELECT seq,json_extract(body,'$.text') FROM entries;
 CREATE TRIGGER source_search_insert AFTER INSERT ON sources BEGIN
- INSERT INTO source_fts(rowid,text) VALUES(new.seq,om_fts_text(CAST(json_extract(new.body,'$.text') AS BLOB)));
+ INSERT INTO source_fts(rowid,text) VALUES(new.seq,json_extract(new.body,'$.text'));
  UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='search_generation';
 END;
 CREATE TRIGGER source_search_delete AFTER DELETE ON sources BEGIN
@@ -74,11 +57,11 @@ CREATE TRIGGER source_search_delete AFTER DELETE ON sources BEGIN
 END;
 CREATE TRIGGER source_search_update AFTER UPDATE ON sources BEGIN
  DELETE FROM source_fts WHERE rowid=old.seq;
- INSERT INTO source_fts(rowid,text) VALUES(new.seq,om_fts_text(CAST(json_extract(new.body,'$.text') AS BLOB)));
+ INSERT INTO source_fts(rowid,text) VALUES(new.seq,json_extract(new.body,'$.text'));
  UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='search_generation';
 END;
 CREATE TRIGGER entry_search_insert AFTER INSERT ON entries BEGIN
- INSERT INTO entry_fts(rowid,text) VALUES(new.seq,om_fts_text(CAST(json_extract(new.body,'$.text') AS BLOB)));
+ INSERT INTO entry_fts(rowid,text) VALUES(new.seq,json_extract(new.body,'$.text'));
  UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='search_generation';
 END;
 CREATE TRIGGER entry_search_delete AFTER DELETE ON entries BEGIN
@@ -87,7 +70,7 @@ CREATE TRIGGER entry_search_delete AFTER DELETE ON entries BEGIN
 END;
 CREATE TRIGGER entry_search_update AFTER UPDATE ON entries BEGIN
  DELETE FROM entry_fts WHERE rowid=old.seq;
- INSERT INTO entry_fts(rowid,text) VALUES(new.seq,om_fts_text(CAST(json_extract(new.body,'$.text') AS BLOB)));
+ INSERT INTO entry_fts(rowid,text) VALUES(new.seq,json_extract(new.body,'$.text'));
  UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='search_generation';
 END;
 `

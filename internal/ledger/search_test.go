@@ -1,9 +1,16 @@
 package ledger
 
 import (
+	"context"
 	"fmt"
+	"math/rand"
+	"os"
+	"os/exec"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -139,6 +146,11 @@ func TestSearchNULPreservesSourceOffsets(t *testing.T) {
 	for i, text := range []string{"pre\x00omitted until E_PIPE_742 suffix", "E_PIPE_742 a\x00suffix remains", "a\x00before E_PIPE_742 after\x00tail", "E_PIPE_742\x00E_PIPE_742", "x\x01y\x00 E_PIPE_742 \x00end"} {
 		_, err := l.CaptureV2(CaptureInput{Kind: "tool", Text: text, Key: fmt.Sprint(i)})
 		check(t, err)
+		var indexed string
+		check(t, l.db.QueryRow(`SELECT text FROM source_fts ORDER BY rowid DESC LIMIT 1`).Scan(&indexed))
+		if indexed != text {
+			t.Fatal("index did not retain complete original text")
+		}
 	}
 	hits := searchAll(t, l, "E_PIPE_742", SearchOptions{Sources: true})
 	if len(hits) != 6 {
@@ -282,5 +294,245 @@ func TestSearchLiteralOperatorsAndInvalidInput(t *testing.T) {
 		if _, err := l.ReadSearch(query, SearchOptions{}); err == nil {
 			t.Fatal("invalid query accepted")
 		}
+	}
+}
+
+// A subprocess deadline catches a regression even if an SQLite auxiliary
+// function does not promptly observe cancellation during a long C-API call.
+func TestSearchDenseSourcePage(t *testing.T) {
+	if os.Getenv("OM_TEST_DENSE_SEARCH") == "1" {
+		l := openTest(t, t.TempDir(), "dense")
+		_, err := l.CaptureV2(CaptureInput{Kind: "tool", Text: strings.Repeat("needle ", 100000), Key: "dense"})
+		check(t, err)
+		started := time.Now()
+		first, err := l.ReadSearch("needle", SearchOptions{Sources: true})
+		check(t, err)
+		if len(first.Page.Items) == 0 || first.Page.NextCursor == "" {
+			t.Fatal("missing bounded dense page")
+		}
+		second, err := l.ReadSearch("needle", SearchOptions{Sources: true, Cursor: first.Page.NextCursor})
+		check(t, err)
+		if len(second.Page.Items) == 0 || second.Page.Items[0].StartByte <= first.Page.Items[len(first.Page.Items)-1].StartByte {
+			t.Fatal("dense continuation lost position")
+		}
+		t.Logf("first and continued dense pages: %s", time.Since(started))
+		tokenizer, err := newSearchTokenizer()
+		check(t, err)
+		defer tokenizer.close()
+		matcher, err := newSearchPhrases(l.ctx, tokenizer, []string{"needle"})
+		check(t, err)
+		spans, err := matcher.spans(l.ctx, tokenizer, strings.Repeat("needle ", 100000))
+		check(t, err)
+		if len(spans) != 100000 || spans[0] != (byteRange{0, 6}) || spans[len(spans)-1] != (byteRange{699993, 699999}) {
+			t.Fatal("dense spans were capped or dropped")
+		}
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSearchDenseSourcePage$", "-test.v")
+	cmd.Env = append(os.Environ(), "OM_TEST_DENSE_SEARCH=1")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dense source page failed (deadline: %v): %v\n%s", ctx.Err(), err, output)
+	}
+	t.Log(string(output))
+}
+
+// matchSpans validates the entire reconstruction before trusting any offset.
+// Markers must be absent from the original, including literal marker-like logs.
+func matchSpans(original, highlighted, openMarker, closeMarker string) ([]byteRange, error) {
+	bad := fmt.Errorf("search highlight does not reconstruct retained text")
+	if openMarker == "" || closeMarker == "" || openMarker == closeMarker || strings.Contains(original, openMarker) || strings.Contains(original, closeMarker) {
+		return nil, bad
+	}
+	var reconstructed strings.Builder
+	spans := []byteRange{}
+	for {
+		at := strings.Index(highlighted, openMarker)
+		if at < 0 {
+			if strings.Contains(highlighted, closeMarker) {
+				return nil, bad
+			}
+			reconstructed.WriteString(highlighted)
+			break
+		}
+		plain := highlighted[:at]
+		if strings.Contains(plain, closeMarker) {
+			return nil, bad
+		}
+		reconstructed.WriteString(plain)
+		highlighted = highlighted[at+len(openMarker):]
+		end := strings.Index(highlighted, closeMarker)
+		if end <= 0 || strings.Contains(highlighted[:end], openMarker) {
+			return nil, bad
+		}
+		start := reconstructed.Len()
+		reconstructed.WriteString(highlighted[:end])
+		spans = append(spans, byteRange{start, reconstructed.Len()})
+		highlighted = highlighted[end+len(closeMarker):]
+	}
+	// Only the FTS representation changes NUL to U+0001, both unicode61
+	// separators of equal UTF-8 width. Validate it, then restore precisely the
+	// original NUL positions (preserving preexisting U+0001) and verify base bytes.
+	restored := []byte(reconstructed.String())
+	if string(restored) != strings.ReplaceAll(original, "\x00", "\x01") {
+		return nil, bad
+	}
+	for i := 0; i < len(original); i++ {
+		if original[i] == 0 {
+			restored[i] = 0
+		}
+	}
+	if string(restored) != original {
+		return nil, bad
+	}
+	for _, span := range spans {
+		if !utf8.ValidString(original[span.start:span.end]) {
+			return nil, bad
+		}
+	}
+	return spans, nil
+}
+
+func TestSearchTokenSpansMatchSQLite(t *testing.T) {
+	l := openTest(t, t.TempDir(), "token-oracle")
+	_, err := l.db.Exec(`CREATE VIRTUAL TABLE temp.search_oracle USING fts5(text, tokenize='unicode61')`)
+	check(t, err)
+	tokenizer, err := newSearchTokenizer()
+	check(t, err)
+	defer tokenizer.close()
+	cases := []struct{ text, query string }{
+		{"a b c a b c", "a_b b_c"},
+		{"a b c x b x c", "b a_b_c c"},
+		{"a b a b", "a b"},
+		{"Café CAFÉ cafe cãfé", "cafe"},
+		{"Άλφα άλφα АЛЬФА альфа", "Άλφα АЛЬФА"},
+		{"中文🙂 中文🙂", "中文🙂"},
+		{"a\x00b a\x01b tail\x00", "a_b"},
+		{"<om-match-0> E PIPE 742 </om-match-0> E_PIPE_742", "E_PIPE_742"},
+		{strings.Repeat("界", 680) + " E PIPE 742 " + strings.Repeat("🙂", 900), "E_PIPE_742"},
+		{"a " + strings.Repeat("b ", 700) + "c", "a_" + strings.Repeat("b_", 700) + "c"},
+	}
+	rng := rand.New(rand.NewSource(742))
+	alphabet := []string{"a", "b", "c", "CAFÉ", "中文", "é", "OR"}
+	for i := 0; i < 200; i++ {
+		tokens := make([]string, 50)
+		for j := range tokens {
+			tokens[j] = alphabet[rng.Intn(len(alphabet))]
+		}
+		terms := make([]string, 4)
+		for j := range terms {
+			start := rng.Intn(46)
+			terms[j] = strings.Join(tokens[start:start+1+rng.Intn(4)], "_")
+		}
+		cases = append(cases, struct{ text, query string }{strings.Join(tokens, " "), strings.Join(terms, " ")})
+	}
+	for i, tc := range cases {
+		_, err = l.db.Exec(`DELETE FROM search_oracle`)
+		check(t, err)
+		// SQLite highlight drops unmatched NUL suffixes. Equal-width separator
+		// normalization is only an oracle workaround, never production storage.
+		_, err = l.db.Exec(`INSERT INTO search_oracle(text) VALUES(?)`, strings.ReplaceAll(tc.text, "\x00", "\x01"))
+		check(t, err)
+		var highlighted string
+		check(t, l.db.QueryRow(`SELECT highlight(search_oracle,0,'<oracle-open>','<oracle-close>') FROM search_oracle WHERE search_oracle MATCH ?`, literalQuery(tc.query)).Scan(&highlighted))
+		want, err := matchSpans(tc.text, highlighted, "<oracle-open>", "<oracle-close>")
+		check(t, err)
+		matcher, err := newSearchPhrases(l.ctx, tokenizer, literalWords(tc.query))
+		check(t, err)
+		got, err := matcher.spans(l.ctx, tokenizer, tc.text)
+		check(t, err)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("case %d query %q spans=%v want=%v", i, tc.query, got, want)
+		}
+	}
+}
+
+func TestSearchDenseCrossingPhraseCompleteness(t *testing.T) {
+	l := openTest(t, t.TempDir(), "dense-phrase")
+	// This long phrase repeatedly overlaps itself and crosses several units.
+	// A separate tail match also ensures union does not merge adjacent matches.
+	text := strings.Repeat("a ", 2600) + "tail"
+	log, err := l.CaptureV2(CaptureInput{Kind: "tool", Text: text, Key: "overlap"})
+	check(t, err)
+	hits := searchAll(t, l, "a_a tail", SearchOptions{Sources: true})
+	var reconstructed string
+	units := readTestUnits(t, l, log.SourceID)
+	if len(hits) != len(units)+1 {
+		t.Fatalf("got %d hits for %d units", len(hits), len(units))
+	}
+	for i, hit := range hits {
+		if i < len(units) {
+			reconstructed += hit.Snippet
+		} else if hit.Snippet != "tail" {
+			t.Fatal(hit)
+		}
+	}
+	if reconstructed != strings.TrimSuffix(text, " tail") {
+		t.Fatalf("overlap span lost bytes: %d", len(reconstructed))
+	}
+}
+
+func TestSearchTokenizerLifetimeAndCancellation(t *testing.T) {
+	for i := 0; i < 8; i++ {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			t.Parallel()
+			tokenizer, err := newSearchTokenizer()
+			check(t, err)
+			defer tokenizer.close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			count := 0
+			err = tokenizer.visit(ctx, strings.Repeat("é ", 50), 4, func(token string, start, end int) {
+				if token != "e" || end-start != 2 {
+					t.Errorf("bad token %q [%d,%d)", token, start, end)
+				}
+				count++
+				if count == 2 {
+					runtime.GC()
+				}
+				if count == 4 {
+					cancel()
+				}
+			})
+			if err != context.Canceled || count != 4 {
+				t.Fatalf("cancellation: count=%d error=%v", count, err)
+			}
+			// The tokenizer can be used again after abort; no visitor or input survives.
+			count = 0
+			err = tokenizer.visit(context.Background(), "café", 4, func(token string, _, _ int) {
+				if token != "cafe" {
+					t.Error(token)
+				}
+				count++
+			})
+			check(t, err)
+			if count != 1 {
+				t.Fatal("tokenizer did not recover after cancellation")
+			}
+		})
+	}
+}
+
+func TestSearchConcurrentIndependentReaders(t *testing.T) {
+	store := t.TempDir()
+	writer := openTest(t, store, "parallel-readers")
+	_, err := writer.CaptureV2(CaptureInput{Kind: "tool", Text: strings.Repeat("needle CAFÉ 中文🙂\x00 ", 30), Key: "shared"})
+	check(t, err)
+	for i := 0; i < 8; i++ {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			t.Parallel()
+			reader := openTest(t, store, "parallel-readers")
+			hits := searchAll(t, reader, "cafe", SearchOptions{Sources: true})
+			if len(hits) != 30 {
+				t.Fatalf("parallel reader got %d hits", len(hits))
+			}
+			for _, hit := range hits {
+				if hit.Snippet != "CAFÉ" {
+					t.Fatal("parallel tokenizer mixed source spans")
+				}
+			}
+		})
 	}
 }
