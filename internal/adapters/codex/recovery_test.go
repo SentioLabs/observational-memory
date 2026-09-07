@@ -1,7 +1,10 @@
 package codex
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -106,5 +109,59 @@ func TestPausePrefixExcludesItsOwnPromptAndFollowingTools(t *testing.T) {
 	pending, err := l.ReadPending("")
 	if err != nil || len(pending.Page.Items) != 1 || pending.Page.Items[0].Text != e["prompt"] {
 		t.Fatal("resume did not retain only permitted evidence", err)
+	}
+}
+
+func TestRecoveryBoundedReminderAndFailure(t *testing.T) {
+	for _, source := range []string{"startup", "resume", "compact"} {
+		store := t.TempDir()
+		promptRoot(t, store, "root", "Current correction")
+		invoke(t, store, event("Interrupt"))
+		e := event("SessionStart")
+		e["source"] = source
+		out, err := Handle(context.Background(), e, store, "/quoted ' path/om")
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := ledger.JSON(out)
+		if err != nil || len(encoded)+1 > ContextLimit {
+			t.Fatal("unbounded hook payload", len(encoded), err)
+		}
+		text := fmt.Sprint(out)
+		for _, required := range []string{"at most one pending page", "apply one checkpoint", "pending/deferred coverage", "user's task", "Deferred logs remain searchable", "'\"'\"'"} {
+			if !strings.Contains(text, required) {
+				t.Fatalf("missing %q: %s", required, text)
+			}
+		}
+		s, err := open(t, store).Status()
+		if err != nil || s.SourceCount != 1 || s.Through != 0 {
+			t.Fatal("interrupt/recovery altered evidence", s, err)
+		}
+	}
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("unchanged"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		for _, name := range []string{"SessionStart", "Stop"} {
+			out, err := Handle(context.Background(), event(name), blocked, "/om")
+			if err == nil || out["decision"] == "block" {
+				t.Fatal("unavailable store requested work", out, err)
+			}
+		}
+	}
+	data, err := os.ReadFile(blocked)
+	if err != nil || string(data) != "unchanged" {
+		t.Fatal("failure mutated store", err)
+	}
+}
+func TestRecoverySerializedContextLimit(t *testing.T) {
+	e := event("SessionStart")
+	out, err := Handle(context.Background(), e, t.TempDir(), strings.Repeat("\"", 6000))
+	if err == nil {
+		encoded, err := ledger.JSON(out)
+		if err != nil || len(encoded)+1 > ContextLimit {
+			t.Fatalf("serialized context exceeds limit: %d", len(encoded)+1)
+		}
 	}
 }
