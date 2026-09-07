@@ -536,3 +536,15 @@ func TestSearchConcurrentIndependentReaders(t *testing.T) {
 		})
 	}
 }
+
+func TestSearchQueryUsesSQLiteTokenCategories(t *testing.T) {
+	l := openTest(t, t.TempDir(), "sqlite-query")
+	_, err := l.CaptureV2(CaptureInput{Kind: "tool", Text: "🙂 🫠 needle", Key: "tokens"})
+	check(t, err)
+	for _, query := range []string{"🙂", "🫠", "🙂 * --"} {
+		hits := searchAll(t, l, query, SearchOptions{Sources: true})
+		if len(hits) != 1 {
+			t.Fatalf("query %q dropped a SQLite unicode61 token: %v", query, hits)
+		}
+	}
+}

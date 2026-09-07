@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"unicode"
 	"unicode/utf8"
 	"unsafe"
 
@@ -38,18 +37,7 @@ func literalQuery(query string) string {
 	return strings.Join(parts, " AND ")
 }
 
-func literalWords(query string) []string {
-	parts := []string{}
-	for _, word := range strings.Fields(query) {
-		// unicode61 indexes letters, numbers and private-use characters. Punctuation
-		// alone contributes no searchable token and must not turn an AND into false.
-		if !strings.ContainsFunc(word, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.Is(unicode.Co, r) }) {
-			continue
-		}
-		parts = append(parts, word)
-	}
-	return parts
-}
+func literalWords(query string) []string { return strings.Fields(query) }
 
 func (l *Ledger) ReadSearch(query string, options SearchOptions) (SearchPage, error) {
 	result := SearchPage{}
@@ -88,6 +76,7 @@ func (l *Ledger) ReadSearch(query string, options SearchOptions) (SearchPage, er
 		if err != nil {
 			return result, err
 		}
+		stream.query = stream.matcher.query
 	}
 	result.Page, err = packPage(c, ReadEnvelopeBytes, stream.next, func(p Page[SearchHit]) any { return SearchPage{Page: p} })
 	return result, err
@@ -248,12 +237,14 @@ type searchPhraseNode struct {
 	length int
 }
 type searchPhrases struct {
+	query   string
 	nodes   []searchPhraseNode
 	longest int
 }
 
 func newSearchPhrases(ctx context.Context, tokenizer *searchTokenizer, words []string) (*searchPhrases, error) {
 	p := &searchPhrases{nodes: []searchPhraseNode{{next: map[string]int{}}}}
+	queryWords := []string{}
 	for _, word := range words {
 		state, length := 0, 0
 		err := tokenizer.visit(ctx, word, sqlite3.FTS5_TOKENIZE_QUERY, func(token string, _, _ int) {
@@ -269,9 +260,16 @@ func newSearchPhrases(ctx context.Context, tokenizer *searchTokenizer, words []s
 		if err != nil {
 			return nil, err
 		}
+		// Only SQLite decides whether a literal field contains a token. Its
+		// unicode61 Unicode version differs from Go's current character tables.
+		// Omit zero-token punctuation fields without dropping SQLite tokens.
+		if length > 0 {
+			queryWords = append(queryWords, word)
+		}
 		p.nodes[state].length = max(p.nodes[state].length, length)
 		p.longest = max(p.longest, length)
 	}
+	p.query = literalQuery(strings.Join(queryWords, " "))
 	queue := []int{0}
 	for head := 0; head < len(queue); head++ {
 		state := queue[head]
