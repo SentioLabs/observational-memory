@@ -11,6 +11,7 @@ import ast
 import copy
 from dataclasses import dataclass, field
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -1057,44 +1058,118 @@ def stage_plugin(config, budget):
             'version_substitution': original != staged, 'data': str(data), 'installed': str(installed[0])}
 
 
-def install_meter(data):
-    """Meter every candidate invocation, including native hook maintenance.
+def meter_main(real, meter):
+    """Standalone staged bridge; copied into the temporary executable wrapper."""
+    import fcntl
+    import json
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import time
 
-    This transparent temporary wrapper never changes the CLI input/output contract.
-    Its metadata (not text or auth) is append-only and not in the model workspace.
+    real, meter = Path(real), Path(meter)
+    args = sys.argv[1:]
+    command, session = None, None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ('--store', '--session', '--client'):
+            if index + 1 < len(args) and arg == '--session':
+                session = args[index + 1]
+            index += 2
+        elif arg.startswith('--session='):
+            session = arg.partition('=')[2]
+            index += 1
+        elif arg.startswith('-'):
+            index += 1
+        else:
+            command = command or arg
+            index += 1
+    raw = sys.stdin.buffer.read() if command in ('hook', 'capture', 'apply') else b''
+    try:
+        payload = json.loads(raw) if raw else {}
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    hook = command == 'hook'
+    if hook:
+        session = payload.get('session_id')
+    started = time.monotonic()
+    entry = {'input_bytes': len(raw), 'hook': hook, 'session': session,
+             'deferrals': [], 'hook_unavailable': False, 'staged_command_substitution': False,
+             'owned_prompt_restored': False}
+    # Serialize the exact per-session Stop map and each append. No ledger state is
+    # edited. A mapping exists only after this bridge emitted that owned reason.
+    with (meter.parent / 'meter.lock').open('a+b') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        mappings_path = meter.parent / 'meter-stop-prompts.json'
+        mappings = json.loads(mappings_path.read_text()) if mappings_path.exists() else {}
+        mapping = mappings.get(session) if isinstance(session, str) else None
+        delivered = raw
+        if (hook and payload.get('hook_event_name') == 'UserPromptSubmit' and mapping
+                and payload.get('prompt') == mapping['emitted']):
+            payload['prompt'] = mapping['raw']
+            delivered = json.dumps(payload, ensure_ascii=False).encode()
+            entry['owned_prompt_restored'] = True
+        result = subprocess.run([str(real)] + args, input=delivered, capture_output=True)
+        output = result.stdout
+        try:
+            response = json.loads(output)
+        except ValueError:
+            response = None  # Plaintext prime is a valid CLI response.
+        if hook:
+            entry['hook_unavailable'] = (result.returncode != 0 or not isinstance(response, dict)
+                                         or bool(response.get('systemMessage')))
+            if not entry['hook_unavailable']:
+                quote = lambda value: "'" + str(value).replace("'", "'\"'\"'") + "'"
+                old = quote(real) + ' --store '
+                # Assignment applies only to this command. The native recognizer
+                # already suppresses bare om with the exact store/session scope.
+                new = 'PATH=' + quote(real.parent) + ' om --store '
+                context = response.get('hookSpecificOutput', {})
+                if isinstance(context, dict) and isinstance(context.get('additionalContext'), str):
+                    text = context['additionalContext']
+                    context['additionalContext'] = text.replace(old, new, 1)
+                    entry['staged_command_substitution'] |= context['additionalContext'] != text
+                if response.get('decision') == 'block' and isinstance(response.get('reason'), str):
+                    original = response['reason']
+                    response['reason'] = original.replace(old, new, 1)
+                    entry['staged_command_substitution'] |= response['reason'] != original
+                    if response['reason'] != original and isinstance(session, str):
+                        mappings[session] = {'raw': original, 'emitted': response['reason']}
+                        temporary = mappings_path.with_suffix('.tmp')
+                        temporary.write_text(json.dumps(mappings, ensure_ascii=False))
+                        temporary.replace(mappings_path)
+                output = (json.dumps(response, ensure_ascii=False) + '\n').encode()
+                if len(output) > 10000:
+                    output = b'{"systemMessage":"Evaluation hook staging exceeded the context bound."}\n'
+                    entry['hook_unavailable'] = True
+        if command == 'apply' and result.returncode == 0:
+            entry['deferrals'] = [d['source_id'] for d in payload.get('defer_sources', [])]
+        entry.update({'output_bytes': len(output), 'stderr_bytes': len(result.stderr),
+                      'candidate_input_bytes': len(delivered), 'candidate_output_bytes': len(result.stdout),
+                      'seconds': time.monotonic() - started, 'exit_code': result.returncode})
+        with meter.open('a') as log:
+            log.write(json.dumps(entry) + '\n')
+    sys.stdout.buffer.write(output)
+    sys.stderr.buffer.write(result.stderr)
+    sys.exit(result.returncode)
+
+
+def install_meter(data):
+    """Stage a metered command and reversible hook-guidance bridge.
+
+    Candidate bytes stay unchanged. Only generated ledger-command guidance and
+    exact owned Stop prompts are translated; ordinary evidence is not rewritten.
     """
-    binary = data / 'bin/om'
-    real = data / 'bin/om-candidate'
+    binary, real = data / 'bin/om', data / 'bin/om-candidate'
     binary.rename(real)
     meter = data / 'calls.jsonl'
     meter.write_text('')
-    wrapper = '''#!{python}
-import json, os, subprocess, sys, time
-args = sys.argv[1:]
-needs_input = any(a in ('hook', 'capture', 'apply') for a in args)
-raw = sys.stdin.buffer.read() if needs_input else b''
-started = time.monotonic()
-r = subprocess.run([{real}] + args, input=raw, capture_output=True)
-entry = {{'input_bytes': len(raw), 'output_bytes': len(r.stdout), 'stderr_bytes': len(r.stderr),
-          'seconds': time.monotonic()-started, 'exit_code': r.returncode,
-          'hook': 'hook' in args, 'session': None, 'deferrals': [], 'hook_unavailable': False}}
-try:
-    payload = json.loads(raw) if raw else {{}}
-    response = json.loads(r.stdout)
-    if '--session' in args:
-        entry['session'] = args[args.index('--session')+1]
-    if 'hook' in args:
-        entry['session'] = payload.get('session_id')
-        entry['hook_unavailable'] = 'unavailable' in str(response).lower()
-    if 'apply' in args and r.returncode == 0:
-        entry['deferrals'] = [d['source_id'] for d in payload.get('defer_sources', [])]
-except (ValueError, KeyError, IndexError, TypeError):
-    pass
-fd = os.open({meter}, os.O_APPEND | os.O_WRONLY)
-os.write(fd, (json.dumps(entry)+'\\n').encode()); os.close(fd)
-sys.stdout.buffer.write(r.stdout); sys.stderr.buffer.write(r.stderr)
-sys.exit(r.returncode)
-'''.format(python=sys.executable, real=repr(str(real)), meter=repr(str(meter)))
+    wrapper = ('#!' + sys.executable + '\n' + inspect.getsource(meter_main) +
+               '\nmeter_main(' + repr(str(real)) + ', ' + repr(str(meter)) + ')\n')
     binary.write_text(wrapper)
     binary.chmod(0o755)
     return meter
@@ -1131,10 +1206,30 @@ def verify_deferrals(client):
             seen.add(cursor)
         units.sort(key=lambda u: u['start_byte'])
         text = ''.join(u['text'] for u in units)
+        offset, intact = 0, bool(units)
+        for unit in units:
+            end = offset + len(unit['text'].encode())
+            intact &= (unit.get('source_id') == source and unit.get('kind') == 'tool'
+                       and unit.get('start_byte') == offset and unit.get('end_byte') == end
+                       and unit.get('source_incomplete') is False)
+            offset = end
+        # Native PostToolUse retains its whole JSON envelope. Compare the decoded
+        # response exactly; JSON escaping is storage framing, not lost source text.
+        content, representation = text, 'raw-tool-source'
+        try:
+            envelope = json.loads(text)
+        except ValueError:
+            envelope = None
+        if (isinstance(envelope, dict) and set(envelope) == {'tool', 'input', 'response'}
+                and envelope['tool'] == 'Bash' and isinstance(envelope['input'], dict)
+                and isinstance(envelope['response'], str)):
+            content, representation = envelope['response'], 'native-PostToolUse-envelope'
+        audited = any(u.get('deferral_reason') for u in units)
         for line in wanted:
-            if line in text and any(u.get('deferral_reason') for u in units) and not any(u.get('source_incomplete') for u in units):
+            if intact and audited and content == line:
                 matched.add(line)
         audits.append({'source_id': source, 'bytes': len(text.encode()), 'source_sha256': digest(text.encode()),
+                       'representation': representation, 'source_integrity_verified': bool(intact),
                        'deferred_units': sum(u.get('review_state') == 'deferred' for u in units),
                        'deferral_audit_units': sum(bool(u.get('deferral_reason')) for u in units)})
     client.variant.deferral_evidence = {'verified': len(matched) == len(wanted) and bool(wanted),
@@ -1382,6 +1477,9 @@ def live(config, fixture, variants, budget, metadata):
         data = Path(metadata['candidate']['data'])
         meter = install_meter(data)
         metadata['meter_sha256'] = digest((data / 'bin/om').read_bytes())
+        metadata['meter_staging'] = {'command': 'scoped PATH assignment to metered om',
+            'owned_stop_prompt': 'exact per-session emitted-to-native mapping before hook delivery',
+            'candidate_bytes_unchanged': True}
         clients = []
         try:
             for name in VARIANTS:

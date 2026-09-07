@@ -27,6 +27,12 @@ hashes are null unless `--om-binary` and `--plugin-root` are supplied. Supply th
 paths during the operator preview to record their real identities without
 launching either binary. Preview results are `incomplete`, never release PASS.
 
+The default unittest gate builds a fresh local Go candidate and runs real metered
+hooks/ledger commands, including quoted paths and session names. An explicit
+`OM_EVAL_TEST_BINARY` may supply a candidate instead; absence never skips these
+integration checks. Set the ordinary Go cache environment when needed. No model
+or authentication calls are involved.
+
 The fixture separates model-visible files/events from gold cases. It includes
 repeated corrections, rejected proposals, a completed migration, a changed
 objective, an interrupted turn, Unicode and a 48KB log with a middle error.
@@ -108,7 +114,24 @@ the temporary runtime version pin, installs the explicitly supplied binary with
 `--from`, and verifies its content hash. It does not download a released runtime.
 Results retain original/staged hashes and the version substitution. A temporary
 binary wrapper measures CLI calls/bytes and successful explicit source deferrals,
-including hook maintenance. Effective native memories use/generation are disabled
+including hook maintenance. The candidate bytes remain unchanged at
+`bin/om-candidate`. Because Go advertises that running executable, the staged
+bridge changes only the generated ledger command to
+`PATH='<staged bin directory>' om --store '<canonical store>' --session '<session>'`.
+The assignment affects only that invocation and routes the exact advertised
+command through the meter. Native scoped bare-`om` recognition continues to
+exclude memory commands from source capture. Store/session quoting is preserved,
+including spaces, apostrophes and Unicode. This temporary transformation is
+recorded in `meter_staging` metadata.
+
+A Stop reason is also stored verbatim by the runtime for continuation ownership.
+The bridge records the exact raw/emitted reason per session and restores the
+native reason only when that same session delivers the exact emitted
+`UserPromptSubmit` prompt. Similar ordinary user text and other sessions are
+unchanged. The bridge never edits ledger state. Meter records distinguish emitted
+bytes from candidate bytes and record command/prompt transformations. Hook
+unavailability is classified from the runtime's structural `systemMessage`
+advisory or failure response, not the word “unavailable” inside healthy guidance. Effective native memories use/generation are disabled
 in both processes. Actual schemas, model/reasoning, skills and effective settings
 are checked afresh; unsupported contracts, rerouting, mismatched tools, unknown
 approval requests or missing usage stop the run. Global configuration is never
@@ -134,6 +157,12 @@ aliases, imports from arbitrary programs and complex shell control flow are not
 generally interpreted. This is behavioral instrumentation, not a security boundary
 against a malicious agent. OM's deferred-log setup requires a successful explicit
 apply and complete retained source verified through bounded public recall pages.
+The audit validates source identity, tool kind, contiguous UTF-8 ranges and
+incompleteness flags. It accepts an exact raw tool capture or the exact decoded
+string response of the native `{tool,input,response}` PostToolUse envelope. JSON
+escaping does not count as truncation; an error marker or substring alone does
+not count as complete recovery. Unsupported response representations remain
+unverified. Deferral audit metadata remains required.
 Coverage is not a claim of understanding.
 
 Release quality requires 50 scored actual cycles per variant, every OM critical

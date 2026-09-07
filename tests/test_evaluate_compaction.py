@@ -448,7 +448,8 @@ class OMAndShutdownTests(unittest.TestCase):
                         'review_state': 'deferred', 'deferral_reason': 'bulky build output', 'source_incomplete': False}}]}}
         def pages(*args, **kwargs):
             offset = 10000 * pages.n
-            unit = copy.deepcopy(page['page']['items'][0]['evidence']); unit['text'] = line[offset:offset + 10000]; unit['start_byte'] = offset
+            unit = copy.deepcopy(page['page']['items'][0]['evidence']); unit['text'] = line[offset:offset + 10000]; unit['start_byte'] = len(line[:offset].encode())
+            unit['end_byte'] = unit['start_byte'] + len(unit['text'].encode()); unit['kind'] = 'tool'
             pages.n += 1
             return json.dumps({'page': {'items': [{'evidence': unit}], 'next_cursor': str(pages.n) if offset + 10000 < len(line) else ''}}, ensure_ascii=False)
         pages.n = 0
@@ -835,6 +836,190 @@ class CorrectiveRegressionTests(unittest.TestCase):
             'item': {'id': 'cmd', 'type': 'commandExecution', 'cwd': str(workspace / 'actions'),
                      'command': 'python3 migrate.py'}}})
         self.assertEqual(v.scorecard()['repeated_completed_actions'], 1)
+
+
+class StagedCandidateTests(unittest.TestCase):
+    """Real candidate executable, metered commands and public ledger effects."""
+    @classmethod
+    def setUpClass(cls):
+        import os, subprocess
+        cls.build = tempfile.TemporaryDirectory(prefix='om-eval-candidate-')
+        cls.candidate = Path(cls.build.name) / 'om'
+        supplied = os.environ.get('OM_EVAL_TEST_BINARY')
+        if supplied:
+            import shutil
+            shutil.copy2(supplied, cls.candidate)
+        else:
+            subprocess.run(['go', 'build', '-ldflags',
+                '-X github.com/sentiolabs/observational-memory/internal/cli.Version=0.4.0-eval-test',
+                '-o', str(cls.candidate), './cmd/om'], cwd=ROOT, check=True, capture_output=True, timeout=120)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.build.cleanup()
+
+    def setUp(self):
+        import shutil
+        self.temp = tempfile.TemporaryDirectory(prefix="om staging '雪 ")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name)
+        self.data = self.path / "data 'λ"
+        (self.data / 'bin').mkdir(parents=True)
+        shutil.copy2(self.candidate, self.data / 'bin/om')
+        self.meter = evalmod.install_meter(self.data)
+        self.assertEqual((self.data / 'bin/om-candidate').read_bytes(), self.candidate.read_bytes())
+        self.session = "owned '雪 session"
+        self.fixture = evalmod.Fixture.load(ROOT / 'eval/fixtures/continuity.json', 'release')
+        self.log = self.fixture.workload['files']['evidence/build.log']
+        self.base = [str(self.data / 'bin/om'), '--store', str(self.data), '--session', self.session]
+
+    def call(self, args, payload=None, shell=False):
+        import subprocess
+        result = subprocess.run(args, input=json.dumps(payload, ensure_ascii=False).encode() if payload is not None else b'',
+                                shell=shell, capture_output=True, check=True, timeout=10)
+        self.assertLessEqual(len(result.stdout), 12000)
+        return result.stdout
+
+    def hook(self, name, **fields):
+        return json.loads(self.call(self.base + ['hook', '--client', 'codex'],
+            {'hook_event_name': name, 'session_id': self.session, **fields}))
+
+    def command(self, response):
+        context = response.get('reason') or response['hookSpecificOutput']['additionalContext']
+        return context.split('Ledger command: ', 1)[1].split('. Review at most', 1)[0]
+
+    def calls(self):
+        return [json.loads(line) for line in self.meter.read_text().splitlines()]
+
+    def capture(self, mode, text=None, incomplete=False):
+        text = self.log if text is None else text
+        if mode == 'native':
+            self.hook('PostToolUse', turn_id='root', tool_use_id='build-log', tool_name='Bash',
+                      tool_input={'command': 'cat evidence/build.log'}, tool_response=text, source_incomplete=incomplete)
+        else:
+            self.call(self.base + ['capture'], {'kind': 'tool', 'text': text, 'key': 'manual-log',
+                                               'source_incomplete': incomplete})
+        page = json.loads(self.call(self.base + ['pending']))
+        return page, page['page']['items'][0]['source_id']
+
+    def defer(self, command, page, source):
+        return self.call(command + ' apply', {'expected_through': page['through'], 'expected_revision': page['revision'],
+            'acknowledge': [], 'defer_sources': [{'source_id': source, 'reason': 'Retain full log for later exact recovery.'}]}, shell=True)
+
+    def audit(self):
+        from types import SimpleNamespace
+        variant = evalmod.VariantRun('om', self.fixture, evalmod.RunBudget(30, 1000)); variant.start_thread(self.session)
+        client = SimpleNamespace(variant=variant, data=self.data,
+                                 config=SimpleNamespace(args=SimpleNamespace(om_home=self.path / 'home')))
+        evalmod.verify_deferrals(client)
+        return variant.deferral_evidence
+
+    def test_healthy_guidance_and_structural_unavailable_advisory(self):
+        healthy = self.hook('SessionStart', source='startup')
+        self.assertIn('If unavailable, skip memory', healthy['hookSpecificOutput']['additionalContext'])
+        self.assertFalse(self.calls()[-1]['hook_unavailable'])
+        blocked = self.path / 'not-a-directory'; blocked.write_text('owned test fixture')
+        advisory = json.loads(self.call([str(self.data / 'bin/om'), '--store', str(blocked), 'hook', '--client', 'codex'],
+                                       {'hook_event_name': 'SessionStart', 'session_id': self.session, 'source': 'startup'}))
+        self.assertIn('systemMessage', advisory)
+        self.assertTrue(self.calls()[-1]['hook_unavailable'])
+
+    def test_exact_advertised_prime_pending_apply_are_metered(self):
+        command = self.command(self.hook('SessionStart', source='startup'))
+        count = len(self.calls()); prime = self.call(command + ' prime', shell=True)
+        self.assertEqual(len(self.calls()), count + 1)
+        self.assertEqual(self.calls()[-1]['output_bytes'], len(prime))
+        self.assertEqual(self.calls()[-1]['session'], self.session)
+        page, source = self.capture('native')
+        count = len(self.calls()); page = json.loads(self.call(command + ' pending', shell=True))
+        self.assertEqual(len(self.calls()), count + 1)
+        self.defer(command, page, source)
+        self.assertIn(source, self.calls()[-1]['deferrals'])
+        self.assertGreater(self.calls()[-1]['input_bytes'], 0)
+        self.assertTrue(self.audit()['verified'])
+
+    def test_native_and_raw_complete_sources_are_accepted(self):
+        command = self.command(self.hook('SessionStart', source='startup'))
+        for mode in ('native', 'raw'):
+            with self.subTest(mode=mode):
+                self.session = mode + " '雪"
+                self.base[-1] = self.session
+                command = self.command(self.hook('SessionStart', source='startup'))
+                page, source = self.capture(mode)
+                self.defer(command, page, source)
+                evidence = self.audit()
+                self.assertTrue(evidence['verified'])
+                self.assertEqual(evidence['sources'][0]['source_id'], source)
+
+    def test_truncated_wrong_and_incomplete_sources_are_rejected(self):
+        for name, text, incomplete in (('truncated', self.log[:10000], False),
+                                       ('wrong', self.log.replace('E_PIPE_742', 'E_PIPE_WRONG'), False),
+                                       ('incomplete', self.log, True),
+                                       ('contains-only', 'unrelated prefix\n' + self.log, False)):
+            with self.subTest(name=name):
+                self.session = name; self.base[-1] = name
+                command = self.command(self.hook('SessionStart', source='startup'))
+                page, source = self.capture('native', text, incomplete)
+                self.defer(command, page, source)
+                with self.assertRaisesRegex(evalmod.HarnessError, 'deferred'):
+                    self.audit()
+
+    def test_deferred_native_recall_rejects_wrong_source_identity(self):
+        command = self.command(self.hook('SessionStart', source='startup'))
+        page, source = self.capture('native'); self.defer(command, page, source)
+        actual = evalmod.run_local
+        def wrong_source(*args, **kwargs):
+            page = json.loads(actual(*args, **kwargs))
+            for item in page['page']['items']:
+                if item.get('evidence'):
+                    item['evidence']['source_id'] = 's-unrelated'
+            return json.dumps(page)
+        with patch.object(evalmod, 'run_local', side_effect=wrong_source):
+            with self.assertRaisesRegex(evalmod.HarnessError, 'deferred'):
+                self.audit()
+
+    def test_self_commands_and_exact_stop_continuation_are_preserved(self):
+        command = self.command(self.hook('SessionStart', source='startup'))
+        self.hook('UserPromptSubmit', turn_id='root', prompt='Do the synthetic build.')
+        status = json.loads(self.call(self.base + ['status']))
+        self.hook('PostToolUse', turn_id='root', tool_use_id='self', tool_name='Bash',
+                  tool_input={'command': command + ' prime'}, tool_response=self.call(command + ' prime', shell=True).decode())
+        self.assertEqual(json.loads(self.call(self.base + ['status']))['source_count'], status['source_count'])
+        self.hook('PostToolUse', turn_id='root', tool_use_id='large', tool_name='Bash',
+                  tool_input={'command': 'cat evidence/build.log'}, tool_response=self.log)
+        stop = self.hook('Stop', turn_id='root', last_assistant_message='Initial final.')
+        self.assertEqual(stop['decision'], 'block')
+        command = self.command(stop)
+        before = json.loads(self.call(self.base + ['status']))
+        self.hook('UserPromptSubmit', turn_id='continuation', prompt=stop['reason'])
+        self.assertEqual(json.loads(self.call(self.base + ['status']))['source_count'], before['source_count'])
+        self.call(command + ' pending', shell=True)
+        after = self.hook('Stop', turn_id='continuation', last_assistant_message='Continuation final.')
+        self.assertNotIn('decision', after)
+        self.assertEqual(json.loads(self.call(self.base + ['status']))['source_count'], before['source_count'] + 1)
+        # Similar user prose is ordinary evidence, not mapped to a synthetic turn.
+        normal = 'Discuss this:\n' + stop['reason']
+        self.hook('UserPromptSubmit', turn_id='real-next', prompt=normal)
+        self.assertFalse(self.calls()[-1]['owned_prompt_restored'])
+        self.assertEqual(json.loads(self.call(self.base + ['status']))['source_count'], before['source_count'] + 2)
+        self.assertEqual(json.loads(self.call(self.base + ['status']))['oldest_pending_age_turns'], before['oldest_pending_age_turns'])
+        cursor, captured = None, {}
+        while True:
+            args = self.base + ['pending'] + (['--cursor', cursor] if cursor else [])
+            page = json.loads(self.call(args))['page']
+            for unit in page['items']:
+                if unit['kind'] == 'user':
+                    captured.setdefault(unit['source_id'], []).append(unit['text'])
+            cursor = page.get('next_cursor')
+            if not cursor:
+                break
+        self.assertIn(normal, [''.join(parts) for parts in captured.values()])
+        # The same emitted reason in another session is not our owned continuation.
+        self.session = 'other-session'; self.base[-1] = self.session
+        self.hook('UserPromptSubmit', turn_id='other-root', prompt=stop['reason'])
+        self.assertFalse(self.calls()[-1]['owned_prompt_restored'])
+        pending = json.loads(self.call(self.base + ['pending']))['page']['items']
+        self.assertEqual(''.join(u['text'] for u in pending), stop['reason'])
 
 
 if __name__ == '__main__':
