@@ -68,8 +68,13 @@ establish what was exposed outside this runner.
 
 Before live execution, the operator must explicitly choose the model, reasoning,
 wall seconds, input-token ceiling and paths. Sign in normally in two dedicated
-Codex homes; do not copy another home's auth files. New homes must contain only
-normal authentication/installation files. The runner validates actual account
+Codex homes; do not copy another home's auth files. New homes may contain only
+normal authentication/installation files (`auth.json`, `.credentials.json`,
+`installation_id`) and the `log/` and `tmp/` directories created by normal login.
+Those existing login artifacts are preserved, not adopted for deletion. Existing
+sessions, configuration, plugins, caches and unrelated top-level state are refused;
+symlinks or unsupported file types anywhere in accepted home state are refused.
+The runner validates actual account
 sign-in and the model/reasoning advertised by that host.
 
 After those choices, use the following commands. The variables name the actual
@@ -100,14 +105,23 @@ pilot may additionally use `--force-compaction` for diagnosis; it never qualifie
 as release evidence. Release fixes both variants, 50 actual cycles, threshold
 200000 and scope `total`; conflicting flags fail before process startup.
 
-The same two dedicated homes can be reused for pilot then release. At shutdown,
-`.om-eval-ownership.json` records hashes of state created by the runner/Codex.
-Before reuse, the runner verifies that record and removes only its recorded
+The same two dedicated homes can be reused for pilot then release. Before setup
+or cleanup starts, `.om-eval-ownership.json` is atomically marked `in_progress`.
+After verified host shutdown, finalization records hashes of recognized state
+created by the runner/Codex, including its `cache/`, and marks ownership `complete`.
+Before reuse, the runner verifies that complete record and removes only its recorded
 synthetic state, including prior sessions, plugin configuration and stores. It
-preserves the original authentication files and their normal refreshes. Modified
-or unexpected state causes a refusal; it is never silently deleted. New threads
-and stores are created for the next run. A crash without a complete ownership
-record requires operator inspection; the runner does not guess ownership.
+preserves original login artifacts and credential refreshes. Modified or unknown
+state causes refusal; it is never silently deleted. New threads and stores are
+created for the next run. Missing, incomplete or older unrecognized ownership
+requires operator inspection or a fresh dedicated home; never remove the marker
+to bypass this check.
+
+Finalization attempts both homes and checks global configuration even when an
+earlier step fails. Results retain per-home status, global-check status and every
+finalization error, alongside the original run error and measured usage. A cleanup
+failure alone also fails the run. An unverified host shutdown or failed home
+finalizer leaves ownership incomplete and blocks automatic reuse.
 
 Candidate staging copies the plugin into the output directory, substitutes only
 the temporary runtime version pin, installs the explicitly supplied binary with

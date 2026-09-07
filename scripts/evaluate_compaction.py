@@ -22,6 +22,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Callable
 
@@ -909,68 +910,128 @@ def schema_preflight(codex, directory, budget, env):
 
 
 HOME_MARKER = '.om-eval-ownership.json'
+LOGIN_FILES = {'auth.json', 'installation_id', '.credentials.json'}
+LOGIN_DIRS = {'log', 'tmp'}
 # Created by Codex/app-server or this runner in an otherwise unused evaluation
 # home. Auth files are never included, hashed into results, copied or deleted.
-GENERATED_HOME = re.compile(r'^(?:config\.toml|plugins|sessions|skills|memories|shell_snapshots|log|tmp|\.tmp|'
+GENERATED_HOME = re.compile(r'^(?:config\.toml|plugins|sessions|skills|memories|shell_snapshots|cache|log|tmp|\.tmp|'
                             r'goals_\d+\.sqlite(?:-shm|-wal)?|logs_\d+\.sqlite(?:-shm|-wal)?|'
                             r'memories_\d+\.sqlite(?:-shm|-wal)?|queue_\d+\.sqlite(?:-shm|-wal)?|'
                             r'state_\d+\.sqlite(?:-shm|-wal)?|models_cache\.json|version\.json|'
                             r'installation_id|thread-writer-locks|thread_history_\d+\.sqlite(?:-shm|-wal)?|\.sandbox_migration|\.personality_migration)$')
 
 
+def check_home_path(path):
+    for entry in [path, *(path.rglob('*') if path.is_dir() and not path.is_symlink() else [])]:
+        if entry.is_symlink() or not (entry.is_file() or entry.is_dir()):
+            raise HarnessError('evaluation home state contains a symlink or unsupported file type')
+
+
 def path_hash(path):
-    if path.is_symlink():
-        raise HarnessError('evaluation home state contains a symlink')
-    return tree_hash(path) if path.is_dir() else digest(path.read_bytes())
+    check_home_path(path)
+    if path.is_file():
+        return digest(path.read_bytes())
+    return digest(canonical([[p.relative_to(path).as_posix(),
+                              digest(p.read_bytes()) if p.is_file() else None]
+                             for p in sorted(path.rglob('*'))]))
+
+
+def write_home_state(home, state):
+    # A failed/abandoned write leaves an unknown temporary file and prevents reuse.
+    # Publish the in-progress record before deleting any previously owned state.
+    fd, temporary = tempfile.mkstemp(prefix=HOME_MARKER + '.', dir=home)
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(json.dumps(state, sort_keys=True, indent=2) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, home / HOME_MARKER)
+
+
+def read_home_state(home):
+    marker = home / HOME_MARKER
+    if marker.is_symlink() or not marker.is_file():
+        raise HarnessError('invalid evaluation home ownership record')
+    try:
+        state = json.loads(marker.read_text())
+    except (ValueError, OSError) as exc:
+        raise HarnessError('invalid evaluation home ownership record') from exc
+    if (not isinstance(state, dict) or state.get('schema') != SCHEMA
+            or state.get('home') != str(home.resolve())
+            or not isinstance(state.get('baseline'), list)
+            or any(not isinstance(name, str) or name not in LOGIN_FILES | LOGIN_DIRS for name in state['baseline'])
+            or not isinstance(state.get('created'), dict)):
+        raise HarnessError('invalid evaluation home ownership record')
+    return state
+
+
+def check_login_path(path):
+    check_home_path(path)
+    if (path.name in LOGIN_FILES and not path.is_file()) or (path.name in LOGIN_DIRS and not path.is_dir()):
+        raise HarnessError('unexpected normal-login artifact type')
 
 
 def validate_home(home):
     if not home.is_dir() or not os.access(home, os.W_OK):
         raise HarnessError('dedicated evaluation home must exist and be writable after normal sign-in')
     marker = home / HOME_MARKER
-    if marker.is_file():
-        state = json.loads(marker.read_text())
-        if state.get('schema') != SCHEMA or state.get('home') != str(home.resolve()):
-            raise HarnessError('invalid evaluation home ownership record')
+    if marker.exists() or marker.is_symlink():
+        state = read_home_state(home)
+        if state.get('status') != 'complete':
+            raise HarnessError('incomplete evaluation home ownership; inspect the prior run before reuse')
         names = {p.name for p in home.iterdir()}
         if names != set(state['baseline']) | set(state['created']) | {HOME_MARKER}:
             raise HarnessError('evaluation home changed outside the prior run; refusing cleanup')
+        if set(state['created']) & set(state['baseline']):
+            raise HarnessError('invalid overlapping evaluation home ownership')
+        for name in state['baseline']:
+            check_login_path(home / name)
         for name, expected in state['created'].items():
-            if not GENERATED_HOME.fullmatch(name) or path_hash(home / name) != expected:
+            if name in LOGIN_FILES or not GENERATED_HOME.fullmatch(name) or path_hash(home / name) != expected:
                 raise HarnessError('runner-owned evaluation state changed; refusing cleanup')
         return state
     names = {p.name for p in home.iterdir()}
     # These are authentication/installation artifacts of normal Codex sign-in.
-    if names - {'auth.json', 'installation_id', '.credentials.json'}:
+    if names - LOGIN_FILES - LOGIN_DIRS:
         raise HarnessError('use unused signed-in evaluation homes, or homes with verified runner ownership')
-    if any(p.is_symlink() for p in home.iterdir()):
-        raise HarnessError('evaluation authentication files must not be symlinks')
+    for path in home.iterdir():
+        check_login_path(path)
     return {'baseline': sorted(names), 'created': {}}
 
 
-def prepare_home(home):
+def prepare_home(home, output=None):
     state = validate_home(home)
+    write_home_state(home, {**state, 'schema': SCHEMA, 'home': str(home.resolve()),
+                           'run': str(output) if output else None, 'status': 'in_progress'})
     for name in state['created']:
         target = home / name
         if target.is_dir():
             shutil.rmtree(target)
         else:
             target.unlink()
-    (home / HOME_MARKER).unlink(missing_ok=True)
     return state['baseline']
 
 
 def finish_home(home, baseline, output, release_exposures=None):
+    state = read_home_state(home)
+    if state.get('status') != 'in_progress' or state['baseline'] != baseline:
+        raise HarnessError('evaluation home has no matching active ownership record')
     created = {}
     for path in home.iterdir():
-        if path.name in baseline or path.name in ('auth.json', '.credentials.json'):
+        if path.name == HOME_MARKER:
+            continue
+        if path.name in baseline or path.name in LOGIN_FILES:
+            check_login_path(path)
             continue  # Normal authentication refresh remains private in this home.
         if not GENERATED_HOME.fullmatch(path.name):
             raise HarnessError('unexpected evaluation home state; cannot certify safe reuse')
+        if path.name in LOGIN_DIRS | {'cache'} and not path.is_dir():
+            raise HarnessError('unexpected host-created directory type')
         created[path.name] = path_hash(path)
-    baseline = sorted(set(baseline) | {p.name for p in home.iterdir() if p.name in ('auth.json', '.credentials.json')})
-    write_json(home / HOME_MARKER, {'schema': SCHEMA, 'home': str(home.resolve()), 'run': str(output),
-                                   'baseline': baseline, 'created': created, 'release_exposures': release_exposures or []})
+    if any(not (home / name).exists() for name in baseline):
+        raise HarnessError('normal-login baseline disappeared during evaluation')
+    baseline = sorted(set(baseline) | {p.name for p in home.iterdir() if p.name in LOGIN_FILES})
+    write_home_state(home, {'schema': SCHEMA, 'home': str(home.resolve()), 'run': str(output), 'status': 'complete',
+                           'baseline': baseline, 'created': created, 'release_exposures': release_exposures or []})
 
 
 def effective_comparison(config, variant, expected_market):
@@ -1500,9 +1561,25 @@ def live(config, fixture, variants, budget, metadata):
     release_exposures = sorted({item for state in states.values() for item in state.get('release_exposures', [])})
     if config.mode == 'release' and fixture.rubric_hash in release_exposures:
         raise HarnessError('these release cases were already exposed in these homes; not fresh held-out evidence')
-    baselines = {name: prepare_home(home) for name, home in homes.items()}
+    baselines = {}
     envs = {name: process_env(home) for name, home in homes.items()}
+    errors = metadata['finalization_errors'] = []
+    metadata['home_finalization'] = {}
+    unsafe_homes = set()
+    primary_error = None
+
+    def finalize(stage, operation):
+        try:
+            operation()
+            return {'status': 'complete'}
+        except Exception as exc:
+            error = {'stage': stage, 'error': str(redact(str(exc)))}
+            errors.append(error)
+            return {'status': 'failed', 'error': error['error']}
+
     try:
+        for name, home in homes.items():
+            baselines[name] = prepare_home(home, config.output)
         metadata['host'] = schema_preflight(args.codex, config.output / 'host-schema', budget, envs['native'])
         metadata['candidate'] = stage_plugin(config, budget)
         data = Path(metadata['candidate']['data'])
@@ -1532,29 +1609,51 @@ def live(config, fixture, variants, budget, metadata):
                 client.drive()
         finally:
             for client in clients:
-                client.close()
-            calls = [json.loads(line) for line in meter.read_text().splitlines()]
-            write_json(config.output / 'om-calls.json', calls)
-            metadata['om_measurements'] = {'calls': len(calls), 'input_bytes': sum(c['input_bytes'] for c in calls),
-                                          'output_bytes': sum(c['output_bytes'] for c in calls),
-                                          'hook_calls': sum(c['hook'] for c in calls),
-                                          'provenance': 'temporary candidate binary wrapper; includes hook maintenance'}
-            if not any(c['hook'] for c in calls):
-                metadata['om_plugin_verified'] = False
-            else:
-                metadata['om_plugin_verified'] = all(c['exit_code'] == 0 and not c.get('hook_unavailable') for c in calls if c['hook'])
+                if finalize(client.variant.name + ' shutdown', client.close)['status'] == 'failed':
+                    unsafe_homes.add(client.variant.name)
+
+            def measurements():
+                calls = [json.loads(line) for line in meter.read_text().splitlines()]
+                write_json(config.output / 'om-calls.json', calls)
+                metadata['om_measurements'] = {'calls': len(calls), 'input_bytes': sum(c['input_bytes'] for c in calls),
+                                              'output_bytes': sum(c['output_bytes'] for c in calls),
+                                              'hook_calls': sum(c['hook'] for c in calls),
+                                              'provenance': 'temporary candidate binary wrapper; includes hook maintenance'}
+                metadata['om_plugin_verified'] = (any(c['hook'] for c in calls)
+                    and all(c['exit_code'] == 0 and not c.get('hook_unavailable') for c in calls if c['hook']))
+
+            finalize('OM measurements', measurements)
             # Detect candidate tampering or accidental drift during a long run.
-            if digest(args.om_binary.read_bytes()) != metadata['om_binary_sha256']:
-                raise HarnessError('candidate binary changed during run')
-            if tree_hash(args.plugin_root) != metadata['plugin_sha256']:
-                raise HarnessError('candidate plugin changed during run')
+            def candidate_check():
+                if digest(args.om_binary.read_bytes()) != metadata['om_binary_sha256']:
+                    raise HarnessError('candidate binary changed during run')
+                if tree_hash(args.plugin_root) != metadata['plugin_sha256']:
+                    raise HarnessError('candidate plugin changed during run')
+
+            finalize('candidate integrity', candidate_check)
+    except BaseException as exc:
+        primary_error = exc
+        raise  # Preserve the original failure, including operator interruption.
     finally:
         for name, home in homes.items():
-            finish_home(home, baselines[name], config.output, release_exposures)
-        global_after = {str(p): digest(p.read_bytes()) if p.is_file() else None for p in protected}
-        metadata['global_config_unchanged'] = global_before == global_after
-        if global_before != global_after:
-            raise HarnessError('global Codex configuration changed during evaluation')
+            if name in unsafe_homes:
+                metadata['home_finalization'][name] = {'status': 'failed', 'error': 'host shutdown was not verified; ownership remains incomplete'}
+            elif name in baselines:
+                metadata['home_finalization'][name] = finalize(name + ' home',
+                    lambda: finish_home(home, baselines[name], config.output, release_exposures))
+            else:
+                metadata['home_finalization'][name] = {'status': 'not_prepared'}
+
+        def global_check():
+            global_after = {str(p): digest(p.read_bytes()) if p.is_file() else None for p in protected}
+            metadata['global_config_unchanged'] = global_before == global_after
+            if global_before != global_after:
+                raise HarnessError('global Codex configuration changed during evaluation')
+
+        metadata['global_config_unchanged'] = None
+        metadata['global_config_finalization'] = finalize('global configuration', global_check)
+        if errors and primary_error is None:
+            raise HarnessError('evaluation finalization failed: ' + '; '.join(e['stage'] + ': ' + e['error'] for e in errors))
 
 
 def output_results(config, fixture, variants, budget, metadata, error):

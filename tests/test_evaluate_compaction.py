@@ -435,6 +435,147 @@ class DriverTests(unittest.TestCase):
             evalmod.verify_effective({'config': {'model_auto_compact_token_limit': 200000,
                 'model_auto_compact_token_limit_scope': 'total', 'memories': {'use_memories': True, 'generate_memories': False}}}, self.config())
 
+class HomeLifecycleTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+
+    def home(self, name='home', login=False):
+        home = self.path / name; home.mkdir()
+        (home / 'auth.json').write_text('private-normal-login')
+        if login:
+            for name in ('log', 'tmp'):
+                (home / name).mkdir()
+                (home / name / 'login-artifact').write_text('preserve unowned login state')
+        return home
+
+    def test_normal_login_artifacts_survive_cache_cleanup_and_reuse(self):
+        home = self.home(login=True)
+        baseline = evalmod.prepare_home(home)
+        (home / 'cache').mkdir(); (home / 'cache/owned').write_text('host cache')
+        evalmod.finish_home(home, baseline, self.path / 'run')
+        state = evalmod.validate_home(home)
+        self.assertEqual(set(state['created']), {'cache'})
+        self.assertNotIn('auth.json', state['created'])
+        evalmod.prepare_home(home)
+        self.assertFalse((home / 'cache').exists())
+        for name in ('log', 'tmp'):
+            self.assertEqual((home / name / 'login-artifact').read_text(), 'preserve unowned login state')
+        self.assertEqual((home / 'auth.json').read_text(), 'private-normal-login')
+
+    def test_incomplete_run_refuses_reuse_even_before_host_creates_state(self):
+        home = self.home()
+        evalmod.prepare_home(home)
+        self.assertTrue((home / evalmod.HOME_MARKER).is_file())
+        with self.assertRaisesRegex(evalmod.HarnessError, 'incomplete'):
+            evalmod.prepare_home(home)
+        self.assertEqual((home / 'auth.json').read_text(), 'private-normal-login')
+
+    def test_unknown_state_and_symlinks_are_never_adopted(self):
+        for name in ('sessions', 'config.toml', 'cache', 'unrelated'):
+            home = self.home(name)
+            (home / name).write_text('unowned')
+            with self.subTest(name=name), self.assertRaises(evalmod.HarnessError):
+                evalmod.prepare_home(home)
+            self.assertEqual((home / name).read_text(), 'unowned')
+        for name in ('auth.json', 'log', 'tmp', evalmod.HOME_MARKER):
+            home = self.home('link-' + name)
+            target = self.path / ('target-' + name); target.write_text('unowned')
+            (home / name).unlink(missing_ok=True); (home / name).symlink_to(target)
+            with self.subTest(link=name), self.assertRaises(evalmod.HarnessError):
+                evalmod.prepare_home(home)
+            self.assertEqual(target.read_text(), 'unowned')
+        home = self.home('nested', login=True)
+        (home / 'log/link').symlink_to(self.path / 'missing')
+        with self.assertRaises(evalmod.HarnessError):
+            evalmod.prepare_home(home)
+
+    def test_failed_finalizer_leaves_incomplete_ownership(self):
+        home = self.home()
+        baseline = evalmod.prepare_home(home)
+        (home / 'unrelated').write_text('do not remove')
+        with self.assertRaises(evalmod.HarnessError):
+            evalmod.finish_home(home, baseline, self.path / 'run')
+        self.assertTrue((home / evalmod.HOME_MARKER).is_file())
+        with self.assertRaisesRegex(evalmod.HarnessError, 'incomplete'):
+            evalmod.prepare_home(home)
+        self.assertEqual((home / 'unrelated').read_text(), 'do not remove')
+
+    def test_baseline_and_owned_symlinks_are_refused_after_run(self):
+        for name in ('auth.json', 'log', 'cache'):
+            home = self.home('changed-' + name, login=True)
+            baseline = evalmod.prepare_home(home)
+            if name == 'cache':
+                (home / name).mkdir()
+            evalmod.finish_home(home, baseline, self.path / 'run')
+            target = self.path / ('outside-' + name); target.write_text('private unowned state')
+            if (home / name).is_dir():
+                (home / name / 'foreign').symlink_to(target)
+            else:
+                (home / name).unlink(); (home / name).symlink_to(target)
+            with self.subTest(name=name), self.assertRaises(evalmod.HarnessError):
+                evalmod.prepare_home(home)
+            self.assertEqual(target.read_text(), 'private unowned state')
+
+    def test_primary_failure_survives_both_home_and_global_finalization(self):
+        import argparse
+        native, om = self.home('native'), self.home('om')
+        args = argparse.Namespace(native_home=native, om_home=om, codex='unused')
+        config = evalmod.RunConfig('pilot', self.path, 1, 200000, 'total', 'pilot', args)
+        fixture = evalmod.Fixture.load(ROOT / 'eval/fixtures/continuity.json', 'pilot')
+        budget = evalmod.RunBudget(30, 10000)
+        variants = {name: evalmod.VariantRun(name, fixture, budget) for name in evalmod.VARIANTS}
+        metadata = {}
+        def fail(*args):
+            (native / 'unrelated').write_text('retain')
+            (om / 'cache').mkdir(); (om / 'cache/owned').write_text('host state')
+            raise evalmod.HarnessError('original preflight failure')
+        with patch.object(evalmod, 'schema_preflight', side_effect=fail), \
+             patch.object(evalmod.subprocess, 'Popen', side_effect=AssertionError('model spawn')):
+            with self.assertRaisesRegex(evalmod.HarnessError, '^original preflight failure$'):
+                evalmod.live(config, fixture, variants, budget, metadata)
+        self.assertTrue(metadata['global_config_unchanged'])
+        self.assertEqual(set(metadata['home_finalization']), {'native', 'om'})
+        self.assertEqual(metadata['home_finalization']['native']['status'], 'failed')
+        self.assertEqual(metadata['home_finalization']['om']['status'], 'complete')
+        self.assertTrue(metadata['finalization_errors'])
+        self.assertEqual(set(evalmod.validate_home(om)['created']), {'cache'})
+        with self.assertRaisesRegex(evalmod.HarnessError, 'incomplete'):
+            evalmod.validate_home(native)
+        self.assertIsNone(variants['native'].usage.totals()['inputTokens'])
+        for home in (native, om):
+            self.assertEqual((home / 'auth.json').read_text(), 'private-normal-login')
+
+    def test_both_home_errors_and_global_drift_remain_visible_with_primary_error(self):
+        import argparse, os
+        native, om = self.home('native'), self.home('om')
+        protected = self.path / 'synthetic-user/.codex'; protected.mkdir(parents=True)
+        global_config = protected / 'config.toml'; global_config.write_text('before')
+        args = argparse.Namespace(native_home=native, om_home=om, codex='unused')
+        config = evalmod.RunConfig('pilot', self.path, 1, 200000, 'total', 'pilot', args)
+        fixture = evalmod.Fixture.load(ROOT / 'eval/fixtures/continuity.json', 'pilot')
+        budget = evalmod.RunBudget(30, 10000)
+        variants = {name: evalmod.VariantRun(name, fixture, budget) for name in evalmod.VARIANTS}
+        metadata = {}
+        def fail(*args):
+            for home in (native, om):
+                (home / 'unrelated').write_text('retain')
+            global_config.write_text('simulated external drift')
+            raise evalmod.HarnessError('original failure')
+        with patch.object(evalmod, 'schema_preflight', side_effect=fail), \
+             patch.object(Path, 'home', return_value=protected.parent), \
+             patch.dict(os.environ, {'CODEX_HOME': str(protected)}), \
+             patch.object(evalmod.subprocess, 'Popen', side_effect=AssertionError('model spawn')):
+            with self.assertRaisesRegex(evalmod.HarnessError, '^original failure$'):
+                evalmod.live(config, fixture, variants, budget, metadata)
+        self.assertFalse(metadata['global_config_unchanged'])
+        self.assertEqual(metadata['global_config_finalization']['status'], 'failed')
+        self.assertEqual({e['stage'] for e in metadata['finalization_errors']},
+                         {'native home', 'om home', 'global configuration'})
+        for home in (native, om):
+            with self.assertRaisesRegex(evalmod.HarnessError, 'incomplete'):
+                evalmod.validate_home(home)
+            self.assertEqual((home / 'unrelated').read_text(), 'retain')
+
+
 class OMAndShutdownTests(unittest.TestCase):
     setUp = HarnessTests.setUp
 
@@ -594,7 +735,7 @@ class EffectiveComparisonTests(unittest.TestCase):
 class MatchedRunTests(unittest.TestCase):
     setUp = HarnessTests.setUp
 
-    def run_matched(self, mutate=None, error=None):
+    def run_matched(self, mutate=None, error=None, finalization=False):
         import argparse
         fixture = evalmod.Fixture.load(ROOT / 'eval/fixtures/continuity.json', 'pilot')
         native_home, om_home = self.path / 'native-home', self.path / 'om-home'
@@ -657,16 +798,23 @@ class MatchedRunTests(unittest.TestCase):
                         evalmod.live(config, fixture, variants, budget, meta)
                     result = evalmod.output_results(config, fixture, variants, budget, meta, str(caught.exception))
                     self.assertEqual(result['status'], 'failed')
-                    self.assertIsNone(result['budget']['observed_input_tokens'])
-                    self.assertFalse(result['metadata']['om_plugin_verified'])
-                    self.assertEqual(json.loads((output / 'om-calls.json').read_text()), [])
                     self.assertEqual(len(clients), 2)
-                    for v in result['variants'].values():
-                        self.assertIsNone(v['usage']['inputTokens'])
-                        self.assertEqual(v['compactions'], [])
-                    for client in clients:
-                        self.assertFalse({'thread/start', 'turn/start', 'thread/compact/start'} &
-                                         {r.get('method') for r in client.transport.sent})
+                    if finalization:
+                        self.assertEqual(result['budget']['observed_input_tokens'], 1080)
+                        self.assertEqual([len(v.probes) for v in variants.values()], [2, 2])
+                        self.assertTrue(meta['finalization_errors'])
+                        self.assertEqual(meta['home_finalization']['native']['status'], 'failed')
+                        self.assertEqual(meta['home_finalization']['om']['status'], 'complete')
+                    else:
+                        self.assertIsNone(result['budget']['observed_input_tokens'])
+                        self.assertFalse(result['metadata']['om_plugin_verified'])
+                        self.assertEqual(json.loads((output / 'om-calls.json').read_text()), [])
+                        for v in result['variants'].values():
+                            self.assertIsNone(v['usage']['inputTokens'])
+                            self.assertEqual(v['compactions'], [])
+                        for client in clients:
+                            self.assertFalse({'thread/start', 'turn/start', 'thread/compact/start'} &
+                                             {r.get('method') for r in client.transport.sent})
                 else:
                     evalmod.live(config, fixture, variants, budget, meta)
                     self.assertEqual(budget.input_tokens, 1080)
@@ -677,10 +825,34 @@ class MatchedRunTests(unittest.TestCase):
             self.assertTrue(meta['global_config_unchanged'])
             for home in (native_home, om_home):
                 self.assertEqual((home / 'auth.json').read_text(), 'private-fake-auth')
-                evalmod.validate_home(home)
+                if finalization and home == native_home:
+                    with self.assertRaisesRegex(evalmod.HarnessError, 'incomplete'):
+                        evalmod.validate_home(home)
+                else:
+                    evalmod.validate_home(home)
+            if finalization:
+                break  # Incomplete ownership must prevent another run.
 
     def test_both_live_variants_share_budget_and_can_reuse_homes(self):
         self.run_matched()
+
+    def test_finalization_failure_cannot_turn_completed_work_into_success(self):
+        def mutate(name, host):
+            if name == 'native':
+                (self.path / 'native-home/unrelated').write_text('preserve unowned state')
+            else:
+                (self.path / 'om-home/cache').mkdir()
+        self.run_matched(mutate, 'evaluation finalization failed: native home', finalization=True)
+
+    def test_shutdown_failure_keeps_home_incomplete_and_preserves_measurements(self):
+        def mutate(name, host):
+            if name == 'native':
+                close = host.close
+                def fail_close(*args, **kwargs):
+                    close(*args, **kwargs)
+                    raise OSError('shutdown verification failed')
+                host.close = fail_close
+        self.run_matched(mutate, 'evaluation finalization failed: native shutdown', finalization=True)
 
     def test_configuration_drift_never_launches_a_model(self):
         controls = {
