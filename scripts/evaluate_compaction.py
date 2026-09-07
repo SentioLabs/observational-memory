@@ -882,18 +882,25 @@ class ProcessTransport:
         # All phases have independent short bounds, including interrupt writes.
         # terminate/kill affect only this owned App Server child.
         try:
-            if self.process.poll() is None:
-                if thread_id and turn_id:
+            try:
+                if self.process.poll() is None and thread_id and turn_id:
                     try:
                         self.send({'method': 'turn/interrupt', 'id': 2_000_000_000,
                                    'params': {'threadId': thread_id, 'turnId': turn_id}}, timeout=0.25)
                     except (OSError, HarnessError):
                         pass
+                # An exited child may still have final usage in its pipe. Cleanup
+                # drains independently of the expired run budget and child state.
                 if notify:
                     try:
                         deadline = continuous_time() + 0.5
-                        while continuous_time() < deadline:
-                            event = self.receive(min(0.05, deadline - continuous_time()))
+                        for _ in range(256):
+                            remaining = deadline - continuous_time()
+                            if remaining <= 0:
+                                break
+                            event = self.receive(min(0.05, remaining))
+                            if event is None and self.process.poll() is not None:
+                                break
                             if event and 'method' in event and 'id' not in event:
                                 try:
                                     notify(event)
@@ -901,16 +908,20 @@ class ProcessTransport:
                                     pass  # Retain final usage/overshoot even after the limit.
                     except (OSError, HarnessError):
                         pass
-                self.process.stdin.close()
+            finally:
+                # Clock/drain failures must not bypass termination and reaping.
                 try:
-                    self.process.wait(timeout=0.25)
-                except subprocess.TimeoutExpired:
-                    self.process.terminate()
+                    self.process.stdin.close()
+                finally:
                     try:
-                        self.process.wait(timeout=1)
+                        self.process.wait(timeout=0.25)
                     except subprocess.TimeoutExpired:
-                        self.process.kill()
-                        self.process.wait(timeout=1)
+                        self.process.terminate()
+                        try:
+                            self.process.wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            self.process.kill()
+                            self.process.wait(timeout=1)
         finally:
             self.selector.close()
             for stream in (self.process.stdin, self.process.stdout, self.process.stderr):

@@ -1493,6 +1493,45 @@ class ClockSafetyTests(unittest.TestCase):
         live.assert_not_called()
         self.assertFalse(output.exists())
 
+    def test_expired_budget_cleanup_drains_already_exited_real_host(self):
+        import os
+        values, budget = self.clocks(seconds=1)
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = evalmod.VariantRun('native', self.fixture, budget); v.start_thread('owned')
+        emitted = json.dumps(usage('owned', 456)) + '\n'
+        def factory(argv, env, cwd):
+            return evalmod.ProcessTransport([sys.executable, '-c', 'import sys; sys.stdout.write(' + repr(emitted) + ')'],
+                                            os.environ.copy(), cwd)
+        client = evalmod.LiveVariant(DriverTests.config(self), v, workspace, {}, [workspace], factory)
+        client.transport.process.wait(timeout=5)
+        values['elapsed'] = 2
+        with self.assertRaisesRegex(evalmod.HarnessError, 'wall deadline'):
+            try:
+                client.rpc.pump()
+            finally:
+                client.close()
+        self.assertEqual(v.usage.totals()['inputTokens'], 456)
+        self.assertEqual(budget.input_tokens, 456)
+        self.assertIn('tokenUsage', (self.path / 'native-events.jsonl').read_text())
+        self.assertIsNotNone(client.transport.process.poll())
+        self.assertTrue(client.log.closed)
+
+    def test_clock_failure_during_real_cleanup_still_reaps_owned_host(self):
+        import os, threading, time
+        transport = evalmod.ProcessTransport([sys.executable, '-c', 'import time; time.sleep(30)'],
+                                            os.environ.copy(), self.path)
+        watchdog = threading.Timer(5, transport.process.kill); watchdog.start()
+        started = time.monotonic()
+        try:
+            with patch.object(evalmod, 'continuous_time', side_effect=evalmod.HarnessError('clock failed')):
+                transport.close('owned', 'active', lambda e: None)
+            self.assertIsNotNone(transport.process.poll())
+            self.assertLess(time.monotonic() - started, 3)
+        finally:
+            watchdog.cancel()
+            if transport.process.poll() is None:
+                transport.process.kill(); transport.process.wait()
+
 
 class CompactionPolicyTests(unittest.TestCase):
     setUp = HarnessTests.setUp
