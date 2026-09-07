@@ -291,6 +291,7 @@ class FakeHost:
     """Independent scripted App Server transport; no model/subprocess or gold access."""
     def __init__(self, argv, env, cwd):
         self.queue, self.sent, self.closed = [], [], False
+        self.skills = []
         self.cwd, self.input, self.turn_count = Path(cwd).resolve(), 0, 0
         self.thread = 'test-thread'
         self.config = {}
@@ -303,7 +304,7 @@ class FakeHost:
                     self.config.setdefault(root, {})[key] = value
                 else:
                     self.config[key] = value
-        self.config.update({'compact_prompt': None, 'model_context_window': None})
+        self.config.update({'compact_prompt': None, 'model_context_window': None, 'plugins': {}, 'marketplaces': {}})
 
     def send(self, request):
         self.sent.append(request)
@@ -316,7 +317,7 @@ class FakeHost:
         elif method == 'config/read':
             result = {'config': self.config}
         elif method == 'skills/list':
-            result = {'data': [{'skills': [], 'errors': []}]}
+            result = {'data': [{'skills': self.skills, 'errors': []}]}
         elif method == 'model/list':
             result = {'data': [{'model': 'test-model', 'hidden': False,
                                'supportedReasoningEfforts': [{'reasoningEffort': 'high'}]}]}
@@ -505,22 +506,107 @@ class OMAndShutdownTests(unittest.TestCase):
         self.assertEqual(result['status'], 'failed')
         self.assertFalse(result['release_pass'])
 
+class EffectiveComparisonTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+
+    def configs(self):
+        market = self.path / 'candidate-market'; market.mkdir(exist_ok=True)
+        native = {'model': 'test-model', 'plugins': {}, 'marketplaces': {},
+                  'sandbox_workspace_write': {'writable_roots': ['/native'], 'network_access': False}}
+        om = copy.deepcopy(native)
+        om['sandbox_workspace_write']['writable_roots'] = ['/om', '/store']
+        om['plugins'] = {'observational-memory@om-evaluation': {'enabled': True}}
+        # Exact local registration shape observed in the Codex 0.153.4 pilot.
+        om['marketplaces'] = {'om-evaluation': {'source_type': 'local', 'source': str(market.resolve()),
+            'ref': None, 'last_revision': None, 'last_updated': None, 'sparse_paths': None}}
+        return native, om, market
+
+    def test_only_intended_entries_are_normalized_without_mutating_inputs(self):
+        native, om, market = self.configs()
+        # An identical unrelated marketplace remains part of strict comparison.
+        for config in (native, om):
+            config['marketplaces']['shared'] = {'source': '/shared', 'source_type': 'local'}
+        originals = copy.deepcopy((native, om))
+        compared = [evalmod.effective_comparison(c, name, market)
+                    for c, name in ((native, 'native'), (om, 'om'))]
+        self.assertEqual(compared[0], compared[1])
+        self.assertEqual(compared[1]['marketplaces'], native['marketplaces'])
+        self.assertEqual((native, om), originals)
+        om['marketplaces']['shared']['source'] = '/changed'
+        self.assertNotEqual(evalmod.effective_comparison(native, 'native', market),
+                            evalmod.effective_comparison(om, 'om', market))
+
+    def test_canonical_alias_and_omitted_null_metadata_are_allowed(self):
+        native, om, market = self.configs()
+        alias = self.path / 'market-alias'; alias.symlink_to(market, target_is_directory=True)
+        om['marketplaces']['om-evaluation'] = {'source_type': 'local', 'source': str(alias)}
+        self.assertEqual(evalmod.effective_comparison(native, 'native', market),
+                         evalmod.effective_comparison(om, 'om', market))
+
+    def test_invalid_marketplace_registrations_are_refused(self):
+        native, om, market = self.configs()
+        entry = om['marketplaces']['om-evaluation']
+        invalid = [None, [], '', {}, {'source_type': 'local'}, {'source': str(market)},
+                   *[{**entry, 'source': source} for source in (None, [], '', 'candidate-market',
+                       '/other/candidate-market', str(self.path / 'prior-run/candidate-market'),
+                       str(market) + '\x00', 'https://example.test/candidate-market')],
+                   {**entry, 'source_type': 'git'}, {**entry, 'unknown': None},
+                   *[{**entry, key: value} for key, value in (('ref', 'main'), ('last_revision', 'abc'),
+                       ('last_updated', 1), ('sparse_paths', []))]]
+        for bad in invalid:
+            with self.subTest(entry=bad):
+                config = copy.deepcopy(om); config['marketplaces']['om-evaluation'] = bad
+                with self.assertRaises(evalmod.HarnessError):
+                    evalmod.effective_comparison(config, 'om', market)
+        for markets in (None, [], {}, {'wrong-identity': entry}):
+            with self.subTest(markets=markets):
+                config = copy.deepcopy(om); config['marketplaces'] = markets
+                with self.assertRaises(evalmod.HarnessError):
+                    evalmod.effective_comparison(config, 'om', market)
+        native['marketplaces']['om-evaluation'] = entry
+        with self.assertRaises(evalmod.HarnessError):
+            evalmod.effective_comparison(native, 'native', market)
+
+    def test_invalid_plugin_registrations_are_refused(self):
+        native, om, market = self.configs()
+        plugin_id = 'observational-memory@om-evaluation'
+        invalid = [None, [], {}, {'wrong@om-evaluation': {'enabled': True}},
+                   {plugin_id: {'enabled': True}, 'extra@market': {'enabled': False}},
+                   *[{plugin_id: value} for value in (None, [], {}, {'enabled': False}, {'enabled': 1},
+                       {'enabled': 'true'}, {'enabled': True, 'extra': None})]]
+        for plugins in invalid:
+            with self.subTest(plugins=plugins):
+                config = copy.deepcopy(om); config['plugins'] = plugins
+                with self.assertRaises(evalmod.HarnessError):
+                    evalmod.effective_comparison(config, 'om', market)
+        for plugins in (None, [], {plugin_id: {'enabled': True}}, {'unrelated@market': {'enabled': False}}):
+            with self.subTest(native_plugins=plugins):
+                config = copy.deepcopy(native); config['plugins'] = plugins
+                with self.assertRaises(evalmod.HarnessError):
+                    evalmod.effective_comparison(config, 'native', market)
+        for name, original in (('native', native), ('om', om)):
+            for key in ('plugins', 'marketplaces'):
+                config = copy.deepcopy(original); del config[key]
+                with self.subTest(variant=name, missing=key), self.assertRaises(evalmod.HarnessError):
+                    evalmod.effective_comparison(config, name, market)
+
+
 class MatchedRunTests(unittest.TestCase):
     setUp = HarnessTests.setUp
 
-    def test_both_live_variants_share_budget_and_can_reuse_homes(self):
+    def run_matched(self, mutate=None, error=None):
         import argparse
         fixture = evalmod.Fixture.load(ROOT / 'eval/fixtures/continuity.json', 'pilot')
         native_home, om_home = self.path / 'native-home', self.path / 'om-home'
-        native_home.mkdir(); om_home.mkdir()
+        native_home.mkdir(exist_ok=True); om_home.mkdir(exist_ok=True)
         for home in (native_home, om_home):
             (home / 'auth.json').write_text('private-fake-auth')
         candidate = self.path / 'candidate'; candidate.write_text('candidate bytes')
-        plugin = self.path / 'plugin'; plugin.mkdir(); (plugin / 'identity').write_text('plugin bytes')
+        plugin = self.path / 'plugin'; plugin.mkdir(exist_ok=True); (plugin / 'identity').write_text('plugin bytes')
         args = argparse.Namespace(native_home=native_home, om_home=om_home, codex='unused', om_binary=candidate,
                                   plugin_root=plugin, model='test-model', reasoning='high', force_compaction=False)
         for run_name in ('pilot-one', 'pilot-two'):
-            output = self.path / run_name; output.mkdir()
+            output = Path(tempfile.mkdtemp(prefix=run_name, dir=self.path))
             config = evalmod.RunConfig('pilot', output, 2, 200000, 'total', 'pilot', args)
             for name in evalmod.VARIANTS:
                 fixture.prepare(output / name / 'workspace')
@@ -530,18 +616,26 @@ class MatchedRunTests(unittest.TestCase):
             real_client = evalmod.LiveVariant
 
             class OMHost(FakeHost):
-                def send(self, request):
-                    if request.get('method') == 'skills/list':
-                        self.sent.append(request)
-                        self.queue.append({'id': request['id'], 'result': {'data': [{'errors': [], 'skills': [{
-                            'name': 'observational-memory:observational-memory', 'pluginId': 'observational-memory@om-evaluation',
-                            'scope': 'user', 'enabled': True}]}]}})
-                    else:
-                        super().send(request)
+                def __init__(self, argv, env, cwd):
+                    super().__init__(argv, env, cwd)
+                    # config/read shape from the actual Codex 0.153.4 pilot.
+                    self.config['plugins'] = {'observational-memory@om-evaluation': {'enabled': True}}
+                    self.config['marketplaces'] = {'om-evaluation': {
+                        'source_type': 'local', 'source': str((output / 'candidate-market').resolve()),
+                        'ref': None, 'last_revision': None, 'last_updated': None, 'sparse_paths': None}}
+
+                    self.skills = [{'name': 'observational-memory:observational-memory',
+                                    'pluginId': 'observational-memory@om-evaluation', 'scope': 'user', 'enabled': True}]
+
+            clients = []
 
             def make_client(cfg, variant, workspace, env, writable):
-                return real_client(cfg, variant, workspace, env, writable,
-                                   FakeHost if variant.name == 'native' else OMHost)
+                client = real_client(cfg, variant, workspace, env, writable,
+                                     FakeHost if variant.name == 'native' else OMHost)
+                clients.append(client)
+                if mutate:
+                    mutate(variant.name, client.transport)
+                return client
 
             def stage(cfg, run_budget):
                 data = om_home / 'plugins/data/store'; (data / 'bin').mkdir(parents=True)
@@ -550,7 +644,7 @@ class MatchedRunTests(unittest.TestCase):
 
             def meter(data):
                 path = data / 'calls.jsonl'
-                path.write_text(json.dumps({'input_bytes': 5, 'output_bytes': 7, 'hook': True, 'exit_code': 0}) + '\n')
+                path.write_text('' if error else json.dumps({'input_bytes': 5, 'output_bytes': 7, 'hook': True, 'exit_code': 0}) + '\n')
                 return path
 
             with patch.object(evalmod, 'schema_preflight', return_value={'version': 'fake'}), \
@@ -558,13 +652,57 @@ class MatchedRunTests(unittest.TestCase):
                  patch.object(evalmod, 'install_meter', side_effect=meter), \
                  patch.object(evalmod, 'LiveVariant', side_effect=make_client), \
                  patch.object(evalmod.subprocess, 'Popen', side_effect=AssertionError('subprocess')):
-                evalmod.live(config, fixture, variants, budget, meta)
-            self.assertEqual(budget.input_tokens, 1080)
+                if error:
+                    with self.assertRaisesRegex(evalmod.HarnessError, error) as caught:
+                        evalmod.live(config, fixture, variants, budget, meta)
+                    result = evalmod.output_results(config, fixture, variants, budget, meta, str(caught.exception))
+                    self.assertEqual(result['status'], 'failed')
+                    self.assertIsNone(result['budget']['observed_input_tokens'])
+                    self.assertFalse(result['metadata']['om_plugin_verified'])
+                    self.assertEqual(json.loads((output / 'om-calls.json').read_text()), [])
+                    self.assertEqual(len(clients), 2)
+                    for v in result['variants'].values():
+                        self.assertIsNone(v['usage']['inputTokens'])
+                        self.assertEqual(v['compactions'], [])
+                    for client in clients:
+                        self.assertFalse({'thread/start', 'turn/start', 'thread/compact/start'} &
+                                         {r.get('method') for r in client.transport.sent})
+                else:
+                    evalmod.live(config, fixture, variants, budget, meta)
+                    self.assertEqual(budget.input_tokens, 1080)
+                    self.assertEqual([len(v.probes) for v in variants.values()], [2, 2])
+                    for client in clients:
+                        self.assertIn('thread/start', [r.get('method') for r in client.transport.sent])
+                self.assertTrue(all(c.transport.closed for c in clients))
             self.assertTrue(meta['global_config_unchanged'])
-            self.assertEqual([len(v.probes) for v in variants.values()], [2, 2])
             for home in (native_home, om_home):
                 self.assertEqual((home / 'auth.json').read_text(), 'private-fake-auth')
                 evalmod.validate_home(home)
+
+    def test_both_live_variants_share_budget_and_can_reuse_homes(self):
+        self.run_matched()
+
+    def test_configuration_drift_never_launches_a_model(self):
+        controls = {
+            'unrelated marketplace': lambda c: c['marketplaces'].update({'unrelated': {'source_type': 'local', 'source': '/other'}}),
+            'extra plugin': lambda c: c['plugins'].update({'hook-only@other': {'enabled': True}}),
+            'wrong source': lambda c: c['marketplaces']['om-evaluation'].update({'source': '/other/candidate-market'}),
+            'missing marketplace': lambda c: c['marketplaces'].clear(),
+            'model': lambda c: c.update({'model': 'other-model'}),
+            'effort': lambda c: c.update({'model_reasoning_effort': 'low'}),
+            'setting': lambda c: c.update({'allow_login_shell': False}),
+            'writable roots': lambda c: c['sandbox_workspace_write']['writable_roots'].append('/other'),
+        }
+        for label, mutate in controls.items():
+            with self.subTest(label=label):
+                self.run_matched(lambda name, host: mutate(host.config) if name == 'om' else None,
+                                 'registration|marketplace source|not equivalent|workspace/store permissions')
+
+    def test_base_skill_content_drift_never_launches_a_model(self):
+        def mutate(name, host):
+            skill = self.path / (name + '-SKILL.md'); skill.write_text('different ' + name)
+            host.skills.append({'name': 'system-skill', 'scope': 'system', 'enabled': True, 'path': str(skill)})
+        self.run_matched(mutate, 'base skill/tool opportunities differ')
 
 
 class InterruptDriverTests(unittest.TestCase):

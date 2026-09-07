@@ -973,14 +973,45 @@ def finish_home(home, baseline, output, release_exposures=None):
                                    'baseline': baseline, 'created': created, 'release_exposures': release_exposures or []})
 
 
-def effective_comparison(config):
+def effective_comparison(config, variant, expected_market):
     value = copy.deepcopy(config)
+    # Normalize only the integration this run staged, never a path supplied by
+    # the received config. Preserve all residual marketplace/settings drift.
+    plugins, markets = value.get('plugins'), value.get('marketplaces')
+    if not isinstance(plugins, dict) or not isinstance(markets, dict):
+        raise HarnessError('malformed evaluation plugin/marketplace registrations')
+    if variant == 'native':
+        if plugins or 'om-evaluation' in markets:
+            raise HarnessError('native evaluation has unexpected plugin/marketplace registration')
+    elif variant == 'om':
+        plugin = plugins.get('observational-memory@om-evaluation')
+        if (set(plugins) != {'observational-memory@om-evaluation'} or not isinstance(plugin, dict)
+                or set(plugin) != {'enabled'} or plugin['enabled'] is not True):
+            raise HarnessError('OM evaluation plugin registration differs from staged candidate')
+        market = markets.get('om-evaluation')
+        optional = {'ref', 'last_revision', 'last_updated', 'sparse_paths'}
+        if (not isinstance(market, dict) or not {'source', 'source_type'} <= set(market)
+                or set(market) - {'source', 'source_type'} - optional
+                or market['source_type'] != 'local'
+                or any(market.get(key) is not None for key in optional)):
+            raise HarnessError('OM evaluation marketplace registration differs from staged candidate')
+        source = market['source']
+        try:
+            matches = (isinstance(source, str) and Path(source).is_absolute()
+                       and Path(source).resolve() == expected_market.resolve())
+        except (OSError, ValueError, RuntimeError):
+            matches = False
+        if not matches:
+            raise HarnessError('OM evaluation marketplace source differs from staged candidate')
+        del plugins['observational-memory@om-evaluation']
+        del markets['om-evaluation']
+    else:
+        raise HarnessError('unknown evaluation variant')
     # Writable roots are independently checked against each variant's exact
     # synthetic workspace/store; all other sandbox settings remain comparable.
     sandbox = value.get('sandbox_workspace_write')
     if isinstance(sandbox, dict):
         sandbox.pop('writable_roots', None)
-    value.pop('plugins', None)
     return value
 
 
@@ -1488,9 +1519,10 @@ def live(config, fixture, variants, budget, metadata):
                 client = LiveVariant(config, variants[name], workspace, envs[name], writable)
                 clients.append(client)
                 client.preflight()
-            # Match all effective configuration except the intentionally installed plugin,
-            # dedicated paths, and its necessary writable store.
-            if effective_comparison(variants['native'].effective['config']) != effective_comparison(variants['om'].effective['config']):
+            # Validate the exact staged integration before excluding its entries.
+            compared = {name: effective_comparison(variants[name].effective['config'], name,
+                                                  config.output / 'candidate-market') for name in VARIANTS}
+            if compared['native'] != compared['om']:
                 raise HarnessError('native and OM effective configurations are not equivalent')
             if variants['native'].effective['base_skills'] != variants['om'].effective['base_skills']:
                 raise HarnessError('native and OM base skill/tool opportunities differ')

@@ -135,7 +135,15 @@ advisory or failure response, not the word “unavailable” inside healthy guid
 in both processes. Actual schemas, model/reasoning, skills and effective settings
 are checked afresh; unsupported contracts, rerouting, mismatched tools, unknown
 approval requests or missing usage stop the run. Global configuration is never
-written and its before/after hashes are compared.
+written and its before/after hashes are compared. Configuration comparison allows
+only the staged `observational-memory@om-evaluation` plugin with `enabled = true`
+and its `om-evaluation` local marketplace. The marketplace source must be an
+absolute path resolving to this run's `candidate-market` directory; `ref`,
+`last_revision`, `last_updated`, and `sparse_paths` must be absent or null, and
+unknown registration options are refused. Native must have no plugin entries or
+OM marketplace registration. Other marketplace entries and all remaining settings
+must match. Each variant's exact writable workspace/store roots and base skill
+contents are checked separately before either variant starts a thread.
 
 ## Scoring and measurements
 
