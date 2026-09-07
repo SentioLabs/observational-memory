@@ -1316,6 +1316,139 @@ class InterruptDriverTests(unittest.TestCase):
             c.close()
 
 
+class CompactionPolicyTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+
+    def run_boundary(self, mutate=None):
+        class BoundaryHost(FakeHost):
+            def send(self, request):
+                super().send(request)
+                if request.get('method') == 'turn/start':
+                    tid = 't1'
+                    before = usage(self.thread, 198041, turn=tid)
+                    before['params']['tokenUsage']['last'] = {'totalTokens': 198870, 'inputTokens': 198041, 'outputTokens': 829}
+                    after = usage(self.thread, 198041, turn=tid)
+                    after['params']['tokenUsage']['last'] = {'totalTokens': 85412, 'inputTokens': 0, 'outputTokens': 0}
+                    complete = compact(self.thread, 'actual'); complete['params']['turnId'] = tid
+                    events = [before, {**complete, 'method': 'item/started'}, after, complete]
+                    if mutate:
+                        mutate(events)
+                    # The RPC reply deliberately follows notifications, as with FakeHost.
+                    self.queue[1:1] = events
+                    for event in self.queue[1 + len(events):]:
+                        if event.get('method') == 'thread/tokenUsage/updated':
+                            event['params']['tokenUsage']['total']['inputTokens'] += 198041
+                    self.input += 198041
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = evalmod.VariantRun('native', self.fixture, evalmod.RunBudget(30, 1000000))
+        client = evalmod.LiveVariant(DriverTests.config(self), v, workspace, {}, [workspace], BoundaryHost)
+        self.addCleanup(client.close)
+        client.preflight(); client.start(); client.turn('ordinary fixture work')
+        return v, client
+
+    def test_below_threshold_request_has_separate_owned_policy_and_reduction_evidence(self):
+        v, client = self.run_boundary()
+        evidence = v.compaction_evidence(200000)[0]
+        self.assertTrue(evidence['configured_policy_compaction_verified'])
+        self.assertTrue(evidence['context_reduction_verified'])
+        self.assertFalse(evidence['observed_request_at_or_above_threshold'])
+        self.assertEqual(evidence['expected_policy'], {'threshold': 200000, 'scope': 'total'})
+        self.assertEqual(evidence['observed_effective_policy'], evidence['expected_policy'])
+        self.assertEqual(evidence['before_last_total_tokens'], 198870)
+        self.assertEqual(evidence['after_context_estimate_tokens'], 85412)
+        self.assertIsNone(evidence['trigger_context_tokens'])
+        self.assertIsNone(evidence['trigger_reason'])
+        self.assertEqual(v.usage.totals()['inputTokens'], 198141)
+        self.assertNotIn('thread/compact/start', [r.get('method') for r in client.transport.sent])
+
+    def test_higher_request_still_does_not_disclose_exact_trigger(self):
+        def change(events):
+            events[0]['params']['tokenUsage']['last'].update(totalTokens=221895, inputTokens=221000)
+        v, _ = self.run_boundary(change)
+        evidence = v.compaction_evidence(200000)[0]
+        self.assertTrue(evidence['observed_request_at_or_above_threshold'])
+        self.assertTrue(evidence['configured_policy_compaction_verified'])
+        self.assertIsNone(evidence['trigger_context_tokens'])
+        self.assertIsNone(evidence['trigger_reason'])
+
+    def test_manual_forced_replay_and_unowned_cannot_claim_configured_policy(self):
+        v, client = self.run_boundary()
+        client.rpc.request('thread/compact/start', {'threadId': v.thread_id})
+        self.assertFalse(v.compaction_evidence(200000)[0]['configured_policy_compaction_verified'])
+        v.manual_compaction_requested = False
+        for change in (lambda: setattr(v, 'live_thread_id', None),
+                       lambda: v.requested_turn_ids.clear(),
+                       lambda: v.effective['config'].update(model_auto_compact_token_limit=199999),
+                       lambda: v.effective['config'].update(model_auto_compact_token_limit_scope='body_after_prefix'),
+                       lambda: v.reroutes.append({'toModel': 'other'})):
+            with self.subTest(change=change):
+                saved = copy.deepcopy((v.live_thread_id, v.requested_turn_ids, v.effective, v.reroutes))
+                change()
+                self.assertFalse(v.compaction_evidence(200000)[0]['configured_policy_compaction_verified'])
+                v.live_thread_id, v.requested_turn_ids, v.effective, v.reroutes = saved
+        client.config.args.force_compaction = True
+        # Forced mode is an exclusion even when no manual request was yet needed.
+        other = evalmod.VariantRun('native', self.fixture, v.budget)
+        forced = evalmod.LiveVariant(client.config, other, client.workspace, {}, [client.workspace], FakeHost)
+        self.addCleanup(forced.close)
+        self.assertTrue(other.manual_compaction_requested)
+        replay = evalmod.VariantRun('native', self.fixture, v.budget)
+        replay.start_thread(v.thread_id); replay.compactions = copy.deepcopy(v.compactions)
+        replay.effective = copy.deepcopy(v.effective)
+        replay_evidence = replay.compaction_evidence(200000)[0]
+        self.assertFalse(replay_evidence['configured_policy_compaction_verified'])
+        self.assertIn('unverified', replay_evidence['provenance'])
+        replay.effective = {}
+        self.assertEqual(replay.compaction_evidence(200000)[0]['observed_effective_policy'], {'threshold': None, 'scope': None})
+
+    def test_result_gate_uses_policy_grade_not_prior_request_threshold(self):
+        v, _ = self.run_boundary()
+        variants = {name: copy.deepcopy(v) for name in evalmod.VARIANTS}
+        for name, variant in variants.items():
+            variant.name = name
+            variant.begin_probe(1, 'recovery')
+            variant.finish_probe(1, 'recovery', HarnessTests.correct_answers(self),
+                                 {'completed-step': {'performed': True, 'unchanged': True}})
+            variant.interruptions = [{'status': 'interrupted'}]
+            variant.deferral_evidence = {'verified': True}
+        config = DriverTests.config(self); config.mode = 'release'; config.cycles = 1
+        metadata = {'om_plugin_verified': True, 'om_activation': {'verified': True}}
+        result = evalmod.output_results(config, self.fixture, variants, v.budget, metadata, None)
+        self.assertTrue(result['release_pass'])  # CLI separately fixes release at 50 cycles.
+        for variant in result['variants'].values():
+            evidence = variant['compaction_evidence'][0]
+            self.assertFalse(evidence['observed_request_at_or_above_threshold'])
+            self.assertIsNone(evidence['trigger_threshold_verified'])
+        variants['native'].requested_turn_ids.clear()
+        result = evalmod.output_results(config, self.fixture, variants, v.budget, metadata, None)
+        self.assertFalse(result['release_pass'])
+        self.assertTrue(any('configured-policy' in reason for reason in result['eligibility_reasons']))
+
+    def test_missing_wrong_or_ambiguous_lifecycle_cannot_certify_reduction(self):
+        mutations = {
+            'no-start': lambda e: e.pop(1),
+            'wrong-completion-turn': lambda e: e[3].update(params={**e[3]['params'], 'turnId': 'other'}),
+            'wrong-completion-item': lambda e: e[3].update(params={**e[3]['params'], 'item': {'id': 'other', 'type': 'contextCompaction'}}),
+            'wrong-after-turn': lambda e: e[2]['params'].update(turnId='other'),
+            'no-after': lambda e: e.pop(2),
+            'nonreducing': lambda e: e[2]['params']['tokenUsage']['last'].update(totalTokens=198870),
+            'request-after': lambda e: e[2]['params']['tokenUsage']['last'].update(inputTokens=85412),
+            'two-estimates': lambda e: e.insert(3, {**copy.deepcopy(e[2]), 'params': {**copy.deepcopy(e[2]['params']), 'tokenUsage': {**e[2]['params']['tokenUsage'], 'last': {'totalTokens': 80000, 'inputTokens': 0, 'outputTokens': 0}}}}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                # Give each independent transport its own fresh fixture/output path.
+                prior = self.path; self.path = prior / name; self.path.mkdir()
+                try:
+                    v, _ = self.run_boundary(mutate)
+                    evidence = v.compaction_evidence(200000)[0]
+                    self.assertFalse(evidence['configured_policy_compaction_verified'])
+                    self.assertFalse(evidence['context_reduction_verified'])
+                    self.assertEqual(v.usage.totals()['inputTokens'], 198141)
+                finally:
+                    self.path = prior
+
+
 class CorrectiveRegressionTests(unittest.TestCase):
     setUp = HarnessTests.setUp
     variant = HarnessTests.variant
@@ -1345,7 +1478,7 @@ class CorrectiveRegressionTests(unittest.TestCase):
                 self.assertEqual(cycle['before_usage']['total']['inputTokens'], 210000)
                 self.assertEqual(cycle['after_usage']['active_context']['totalTokens'], 5570)
                 self.assertNotEqual(cycle['before_usage']['observation_index'], cycle['after_usage']['observation_index'])
-                self.assertTrue(v.compaction_evidence(200000)[0]['verified'])
+                self.assertTrue(v.compaction_evidence(200000)[0]['context_reduction_verified'])
 
     def test_context_not_invented_from_request_or_lifetime_totals(self):
         v = self.variant(budget=self.budget(limit=1_000_000))
@@ -1355,10 +1488,13 @@ class CorrectiveRegressionTests(unittest.TestCase):
         request['params']['tokenUsage']['last'] = {'totalTokens': 110, 'inputTokens': 100, 'outputTokens': 10}
         v.event(request); v.event(event)
         self.assertIsNone(v.compactions[0]['after_usage'])
-        self.assertFalse(v.compaction_evidence(200000)[0]['verified'])
-        # Even real context reduction cannot prove the 200K threshold from 900K lifetime usage.
+        self.assertFalse(v.compaction_evidence(200000)[0]['configured_policy_compaction_verified'])
+        # Even real context reduction cannot prove configured-policy ownership or a trigger from lifetime usage.
         v.event(self.context_usage(v, 900100, 2000))
-        self.assertFalse(v.compaction_evidence(200000)[0]['verified'])
+        self.assertTrue(v.compaction_evidence(200000)[0]['context_reduction_verified'])
+        self.assertIsNone(v.compaction_evidence(200000)[0]['observed_request_at_or_above_threshold'])
+        self.assertIsNone(v.compaction_evidence(200000)[0]['trigger_context_tokens'])
+        self.assertFalse(v.compaction_evidence(200000)[0]['configured_policy_compaction_verified'])
 
     def test_post_compaction_sample_cannot_cross_work_or_turn_boundaries(self):
         for boundary in ('agentMessage', 'new-compaction', 'wrong-turn'):
@@ -1481,7 +1617,7 @@ class CorrectiveRegressionTests(unittest.TestCase):
         self.assertEqual(v.compactions[0]['after_usage']['active_context']['totalTokens'], 5570)
         self.assertEqual(v.usage.totals()['inputTokens'], 210200)
         self.assertEqual(v.usage.totals()['outputTokens'], 30)
-        self.assertTrue(v.compaction_evidence(200000)[0]['verified'])
+        self.assertTrue(v.compaction_evidence(200000)[0]['context_reduction_verified'])
 
     def test_duplicate_final_usage_stops_driver_before_next_turn(self):
         class DuplicateHost(FakeHost):
@@ -1511,7 +1647,7 @@ class CorrectiveRegressionTests(unittest.TestCase):
         event = compact(v.thread_id, 'c'); v.event({**event, 'method': 'item/started'})
         v.event(sample); v.event(event)
         self.assertIsNone(v.compactions[0]['after_usage'])
-        self.assertFalse(v.compaction_evidence(200000)[0]['verified'])
+        self.assertFalse(v.compaction_evidence(200000)[0]['configured_policy_compaction_verified'])
 
     def test_ordinary_python_script_selection_and_paths(self):
         for command in ('python3 -m py_compile actions/migrate.py', 'python3 -c "print(1)" actions/migrate.py',
@@ -1541,7 +1677,7 @@ class CorrectiveRegressionTests(unittest.TestCase):
         self.assertTrue(result['quality']['quality_pass'])
         self.assertFalse(result['release_pass'])
         self.assertEqual(len(result['eligibility_reasons']), 2)
-        self.assertTrue(all('context/threshold' in reason for reason in result['eligibility_reasons']))
+        self.assertTrue(all('configured-policy compaction/context-reduction' in reason for reason in result['eligibility_reasons']))
 
     def test_script_execution_in_explicit_subdirectory(self):
         workspace = self.path / 'workspace'; self.fixture.prepare(workspace)

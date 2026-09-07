@@ -411,6 +411,9 @@ class VariantRun:
         self.agent_usage_boundaries = {}
         self.pending_compaction = None
         self.started_commands = {}
+        self.live_thread_id = None
+        self.requested_turn_ids = set()
+        self.manual_compaction_requested = False
 
     def start_thread(self, ident):
         if self.thread_id or not ident:
@@ -449,7 +452,7 @@ class VariantRun:
                 boundary = {'thread_id': self.thread_id, 'item_id': item.get('id'),
                             'turn_id': p.get('turnId'), 'completed_at_ms': None,
                             'before_usage': copy.deepcopy(self.usage.observations[-1]) if self.usage.observations else None,
-                            'after_usage': None}
+                            'after_usage': None, 'lifecycle_matched': False, 'context_ambiguous': False}
                 self.compaction_starts[item.get('id')] = boundary
                 self.pending_compaction = boundary
         if method == 'thread/tokenUsage/updated':
@@ -464,7 +467,11 @@ class VariantRun:
                     and type(context.get('totalTokens')) is int and context['totalTokens'] > 0
                     and context.get('inputTokens') == 0 and context.get('outputTokens') == 0
                     and context != (boundary['before_usage'] or {}).get('active_context')):
-                boundary['after_usage'] = copy.deepcopy(sample)
+                prior = boundary['after_usage']
+                if prior and prior['active_context'] != context:
+                    boundary['context_ambiguous'] = True
+                elif prior is None:
+                    boundary['after_usage'] = copy.deepcopy(sample)
         if method == 'item/completed':
             item = p.get('item', {})
             if item.get('type') == 'contextCompaction':
@@ -477,6 +484,9 @@ class VariantRun:
                     if boundary is None:
                         boundary = {'thread_id': self.thread_id, 'item_id': item['id'],
                                     'turn_id': p.get('turnId'), 'before_usage': None, 'after_usage': None}
+                    boundary['lifecycle_matched'] = (boundary is self.compaction_starts.get(item['id'])
+                                                       and boundary['turn_id'] == p.get('turnId')
+                                                       and isinstance(boundary['turn_id'], str) and bool(boundary['turn_id']))
                     boundary['completed_at_ms'] = p.get('completedAtMs')
                     self.compactions.append(boundary)
             elif item.get('type') == 'agentMessage':
@@ -505,20 +515,49 @@ class VariantRun:
 
     def compaction_evidence(self, limit):
         evidence = []
+        config = self.effective.get('config', {})
+        policy_verified = (self.live_thread_id == self.thread_id and self.live_thread_id is not None
+                           and type(config.get('model_auto_compact_token_limit')) is int
+                           and config['model_auto_compact_token_limit'] == limit
+                           and config.get('model_auto_compact_token_limit_scope') == 'total'
+                           and not self.manual_compaction_requested and not self.reroutes)
         for cycle in self.compactions:
             before, after = cycle['before_usage'], cycle['after_usage']
             pre = (before or {}).get('active_context') or {}
             post = (after or {}).get('active_context') or {}
             pre_total, post_total = pre.get('totalTokens'), post.get('totalTokens')
-            verified = (type(pre_total) is int and pre_total >= limit
-                        and type(post_total) is int and 0 < post_total < pre_total
-                        and after['observation_index'] > before['observation_index']
-                        and after['turn_id'] == cycle['turn_id'])
-            evidence.append({'item_id': cycle['item_id'], 'verified': bool(verified),
-                             'threshold': limit, 'before_context_tokens': pre_total,
-                             'after_context_tokens': post_total,
-                             'provenance': 'tokenUsage.last.totalTokens across a contextCompaction; '
-                                           'post-context-only shape observed on Codex 0.153.4'})
+            reduction = (cycle.get('lifecycle_matched') and not cycle.get('context_ambiguous')
+                         and type(pre_total) is int and type(post_total) is int and 0 < post_total < pre_total
+                         and after['observation_index'] > before['observation_index']
+                         and after['turn_id'] == cycle['turn_id'])
+            request_usage = type(pre.get('inputTokens')) is int and pre['inputTokens'] > 0
+            evidence.append({
+                'item_id': cycle['item_id'],
+                'configured_policy_compaction_verified': bool(policy_verified and reduction
+                                                              and cycle['turn_id'] in self.requested_turn_ids),
+                'context_reduction_verified': bool(reduction),
+                'expected_policy': {'threshold': limit, 'scope': 'total'},
+                'observed_effective_policy': {'threshold': config.get('model_auto_compact_token_limit'),
+                                              'scope': config.get('model_auto_compact_token_limit_scope')},
+                'owned_normal_turn_verified': (self.live_thread_id == self.thread_id and self.live_thread_id is not None
+                                               and cycle['turn_id'] in self.requested_turn_ids),
+                'manual_or_forced_compaction_requested': self.manual_compaction_requested,
+                'before_last_total_tokens': pre_total,
+                'before_last_kind': ('request_usage' if request_usage else
+                                     'context_estimate' if pre.get('inputTokens') == 0 and pre.get('outputTokens') == 0
+                                     else 'unavailable'),
+                'after_context_estimate_tokens': post_total,
+                'observed_request_at_or_above_threshold': (pre_total >= limit if request_usage and type(pre_total) is int else None),
+                'trigger_context_tokens': None, 'trigger_reason': None, 'trigger_threshold_verified': None,
+                'trigger_unavailable_reason': 'Public App Server events omit the internal trigger estimate and cause; '
+                    'last request usage excludes local additions. Model-requested windows, comp_hash changes, '
+                    'and model-window changes cannot be distinguished as causes from this lifecycle alone.',
+                'provenance': ('live driver-owned thread; preflight config/read evidence retained'
+                               if self.live_thread_id == self.thread_id and self.live_thread_id is not None
+                               else 'unverified live provenance; event/replay observations only'),
+                'grade_definition': 'Configured-policy compaction requires matching effective policy, an owned normal turn, '
+                    'no manual/forced request or reroute, and matched lifecycle/context reduction. '
+                    'It does not verify numerical threshold crossing or its causality.'})
         return evidence
 
     def begin_probe(self, cycle, turn_id):
@@ -1781,7 +1820,13 @@ class LiveVariant:
         self.activation = getattr(config, 'activation', None) if variant.name == 'om' else None
         self.activation_events, self.activation_evidence = [], None
         self.log = (config.output / (variant.name + '-events.jsonl')).open('w')
-        self.rpc = RpcClient(self.transport.receive, self.transport.send, variant.budget, self.notify)
+        self.variant.manual_compaction_requested = bool(config.args.force_compaction)
+        self.rpc = RpcClient(self.transport.receive, self.send, variant.budget, self.notify)
+
+    def send(self, event):
+        if event.get('method') == 'thread/compact/start':
+            self.variant.manual_compaction_requested = True
+        self.transport.send(event)
 
     def notify(self, event):
         p = event.get('params', {})
@@ -1868,6 +1913,7 @@ class LiveVariant:
             p = Path(source).resolve()
             if p != self.workspace / 'AGENTS.md':
                 raise HarnessError('unmatched external instruction source: evaluation isolation failed')
+        self.variant.live_thread_id = self.variant.thread_id
 
     def turn(self, prompt, cycle=None, interrupt=False):
         event_offset = len(self.activation_events)
@@ -1885,6 +1931,7 @@ class LiveVariant:
         if not turn_id:
             raise HarnessError('turn/start omitted turn identity')
         self.active_turn = turn_id
+        self.variant.requested_turn_ids.add(turn_id)
         if cycle is not None:
             self.variant.begin_probe(cycle, turn_id)
         if interrupt:
@@ -2202,13 +2249,14 @@ def output_results(config, fixture, variants, budget, metadata, error):
         for name, variant in variants.items():
             if not any(i['status'] == 'interrupted' for i in variant.interruptions):
                 reasons.append(name + ': interruption scenario was not observed')
-            if any(not c['verified'] for c in variant.compaction_evidence(config.compact_limit)):
-                reasons.append(name + ': compaction context/threshold evidence incomplete or ambiguous')
+            if any(not c['configured_policy_compaction_verified'] for c in variant.compaction_evidence(config.compact_limit)):
+                reasons.append(name + ': configured-policy compaction/context-reduction evidence incomplete or ambiguous')
     native_tokens = variants['native'].usage.totals()['inputTokens']
     om_tokens = variants['om'].usage.totals()['inputTokens']
     overhead = om_tokens - native_tokens if native_tokens is not None and om_tokens is not None else None
     result = {'schema': SCHEMA, 'mode': config.mode, 'status': status,
               'release_pass': config.mode == 'release' and counts_complete and not reasons,
+              'compaction_measurement_contract': 'configured-policy-and-observed-reduction-v2',
               'quality': comparison, 'eligibility_reasons': reasons, 'metadata': metadata,
               'variants': {name: v.result(config.compact_limit) for name, v in variants.items()},
               'budget': {'max_seconds': budget.max_seconds, 'max_input_tokens': budget.max_input_tokens,
@@ -2221,13 +2269,15 @@ def output_results(config, fixture, variants, budget, metadata, error):
                                            'model_visible_bytes': sum(b['model_visible_bytes'] for b in v.workload_batches)}
                                     for name, v in variants.items()},
               'measurement_notes': ['Cumulative total input counts cached input already; reasoning output is not added to output.',
-                                    'last contains request usage or a context-only estimate; compaction evidence distinguishes their shapes and boundaries.',
+                                    'last contains request usage or a context-only estimate; neither exposes the exact automatic compaction trigger. Configured-policy lifecycle and context reduction are graded separately from the literal prior-request threshold comparison.',
                                     'Absent measurements are null. Overshoot between observations is possible.',
                                     'No subscription allowance, dollar conversion, or universal savings claim.',
                                     'Usage compares reaching the same compaction target; automatic thresholds may consume different lengths of the same generated workload sequence. See workload_exposure.']}
     write_json(config.output / 'results.json', result)
     lines = ['# Native compaction / OM evaluation', '', f'Status: **{status}**. Release PASS: **{result["release_pass"]}**.',
              '', f'Mode: {config.mode}; split: {fixture.split}; seed: {fixture.seed}; threshold: {config.compact_limit}/{config.scope}.',
+             '', 'Compaction evidence grades configured-policy host compaction and observed context reduction. '
+             'Exact trigger tokens and cause are unavailable; the prior request total is a separate observation.',
              '', '| Variant | Actual compactions | Scored recoveries | Critical failures | Noncritical accuracy | Input tokens |',
              '| --- | ---: | ---: | ---: | ---: | ---: |']
     for name, variant in variants.items():

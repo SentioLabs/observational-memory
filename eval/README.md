@@ -254,9 +254,36 @@ the completion event. The supported Codex 0.153.4 unpaid host trace supplies thi
 estimate with positive `last.totalTokens` and zero `last.inputTokens` and
 `last.outputTokens`; a compaction request's usage snapshot is not that estimate.
 Missing, duplicate, or ambiguously associated context evidence remains null and
-ineligible. Threshold evidence requires pre-compaction `last.totalTokens` at least
-200000 and a subsequent smaller context estimate; lifetime totals never prove
-active-context pressure. Effective 200000/total configuration is also checked.
+ineligible. Results grade `configured_policy_compaction_verified`: the effective
+200000/total policy, a fresh live driver-owned thread and normal requested turn,
+no manual/forced compaction or model reroute, matching compaction start/completion,
+and an associated smaller context-only estimate. Replay lacks live ownership and
+cannot earn this grade. This is evidence of host compaction under the configured
+policy, not proof of the numerical trigger or its cause.
+
+The prior request's `last.totalTokens` is preserved as `before_last_total_tokens`,
+with `before_last_kind`; it is not labeled the active-context size. The separate
+`observed_request_at_or_above_threshold` comparison can be false while the
+configured-policy grade passes. `trigger_context_tokens` and `trigger_reason`
+remain null, including when that request comparison is true. Codex's internal
+trigger calculation adds locally estimated history after the last model output
+(and sometimes prior reasoning) to the last request total. Public lifecycle items
+do not expose those estimates or distinguish context-limit, model-requested new
+window, comp_hash-change, and model-window-change causes. No tolerance or private
+transcript reconstruction is used; lifetime/cached cumulative tokens never become
+trigger measurements. `context_reduction_verified` independently reports whether
+the observed post-context estimate is smaller than the preceding last sample.
+
+These semantics are grounded in the official Codex 0.153.4 source, commit
+[`3d2ee51`](https://github.com/openai/codex/tree/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a):
+[active-context calculation](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/context_manager/history.rs#L525),
+[scope/limit evaluation](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/session/context_window.rs#L57),
+and [post-compaction estimate](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/session/mod.rs#L4412).
+The [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+and [App Server contract](https://learn.chatgpt.com/docs/app-server) supply the
+public policy and lifecycle. This correction does not rescore or promote prior
+failed pilot artifacts. The full 50-cycle recovery and release gates remain.
+
 Optional absent fields remain null. Cached input is already part of input; reasoning output is reported
 separately without adding it to output twice. Counter resets require an explicit
 new segment in replay; an unexplained live reset stops execution. Stale start-of-turn
