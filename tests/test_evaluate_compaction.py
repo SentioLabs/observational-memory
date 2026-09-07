@@ -499,6 +499,21 @@ class HomeLifecycleTests(unittest.TestCase):
             evalmod.prepare_home(home)
         self.assertEqual((home / 'unrelated').read_text(), 'do not remove')
 
+    def test_finalizer_requires_the_prepared_run_identity(self):
+        home = self.home()
+        output = self.path / 'prepared-run'; output.mkdir()
+        baseline = evalmod.prepare_home(home, output)
+        marker = home / evalmod.HOME_MARKER
+        before = marker.read_bytes()
+        with self.assertRaisesRegex(evalmod.HarnessError, 'run identity'):
+            evalmod.finish_home(home, baseline, self.path / 'other-run')
+        self.assertEqual(marker.read_bytes(), before)
+        with self.assertRaisesRegex(evalmod.HarnessError, 'incomplete'):
+            evalmod.validate_home(home)
+        alias = self.path / 'same-run'; alias.symlink_to(output, target_is_directory=True)
+        evalmod.finish_home(home, baseline, alias)
+        self.assertEqual(evalmod.validate_home(home)['run'], str(output.resolve()))
+
     def test_baseline_and_owned_symlinks_are_refused_after_run(self):
         for name in ('auth.json', 'log', 'cache'):
             home = self.home('changed-' + name, login=True)
@@ -735,7 +750,8 @@ class EffectiveComparisonTests(unittest.TestCase):
 class MatchedRunTests(unittest.TestCase):
     setUp = HarnessTests.setUp
 
-    def run_matched(self, mutate=None, error=None, finalization=False):
+    def run_matched(self, mutate=None, error=None, finalization=False,
+                    exception_type=evalmod.HarnessError, interrupted_cleanup=False):
         import argparse
         fixture = evalmod.Fixture.load(ROOT / 'eval/fixtures/continuity.json', 'pilot')
         native_home, om_home = self.path / 'native-home', self.path / 'om-home'
@@ -794,7 +810,7 @@ class MatchedRunTests(unittest.TestCase):
                  patch.object(evalmod, 'LiveVariant', side_effect=make_client), \
                  patch.object(evalmod.subprocess, 'Popen', side_effect=AssertionError('subprocess')):
                 if error:
-                    with self.assertRaisesRegex(evalmod.HarnessError, error) as caught:
+                    with self.assertRaisesRegex(exception_type, error) as caught:
                         evalmod.live(config, fixture, variants, budget, meta)
                     result = evalmod.output_results(config, fixture, variants, budget, meta, str(caught.exception))
                     self.assertEqual(result['status'], 'failed')
@@ -821,17 +837,22 @@ class MatchedRunTests(unittest.TestCase):
                     self.assertEqual([len(v.probes) for v in variants.values()], [2, 2])
                     for client in clients:
                         self.assertIn('thread/start', [r.get('method') for r in client.transport.sent])
-                self.assertTrue(all(c.transport.closed for c in clients))
+                if interrupted_cleanup:
+                    self.assertTrue(clients[1].transport.closed)
+                    self.assertTrue(meta['finalization_errors'])
+                else:
+                    self.assertTrue(all(c.transport.closed for c in clients))
             self.assertTrue(meta['global_config_unchanged'])
             for home in (native_home, om_home):
                 self.assertEqual((home / 'auth.json').read_text(), 'private-fake-auth')
-                if finalization and home == native_home:
+                if (finalization or interrupted_cleanup) and home == native_home:
                     with self.assertRaisesRegex(evalmod.HarnessError, 'incomplete'):
                         evalmod.validate_home(home)
                 else:
                     evalmod.validate_home(home)
-            if finalization:
+            if finalization or interrupted_cleanup:
                 break  # Incomplete ownership must prevent another run.
+        return meta
 
     def test_both_live_variants_share_budget_and_can_reuse_homes(self):
         self.run_matched()
@@ -853,6 +874,50 @@ class MatchedRunTests(unittest.TestCase):
                     raise OSError('shutdown verification failed')
                 host.close = fail_close
         self.run_matched(mutate, 'evaluation finalization failed: native shutdown', finalization=True)
+
+    def interrupted_shutdown(self, exception, primary=False):
+        attempts = []
+        def mutate(name, host):
+            close = host.close
+            def interrupt_close(*args, **kwargs):
+                attempts.append(name)
+                if name == 'native':
+                    raise exception
+                close(*args, **kwargs)
+            host.close = interrupt_close
+            if primary and name == 'om':
+                host.config['marketplaces'].clear()
+        meta = self.run_matched(mutate, 'marketplace registration' if primary else str(exception),
+            finalization=not primary, exception_type=evalmod.HarnessError if primary else type(exception),
+            interrupted_cleanup=True)
+        self.assertEqual(attempts, ['native', 'om'])
+        self.assertEqual(meta['home_finalization']['native']['status'], 'failed')
+        self.assertEqual(meta['home_finalization']['om']['status'], 'complete')
+        self.assertEqual(meta['global_config_finalization']['status'], 'complete')
+        self.assertIn('native shutdown', [e['stage'] for e in meta['finalization_errors']])
+
+    def test_keyboard_interrupt_during_shutdown_is_deferred_until_finalization(self):
+        self.interrupted_shutdown(KeyboardInterrupt('cleanup interrupted'))
+
+    def test_system_exit_during_shutdown_is_deferred_until_finalization(self):
+        self.interrupted_shutdown(SystemExit(23))
+
+    def test_primary_failure_survives_shutdown_control_flow_exception(self):
+        self.interrupted_shutdown(KeyboardInterrupt('cleanup interrupted'), primary=True)
+
+    def test_home_finalizer_interrupt_still_attempts_other_home_and_global(self):
+        finish = evalmod.finish_home
+        attempts = []
+        def interrupt_finish(home, *args, **kwargs):
+            attempts.append(home.name)
+            if home.name == 'native-home':
+                raise KeyboardInterrupt('home finalizer interrupted')
+            return finish(home, *args, **kwargs)
+        with patch.object(evalmod, 'finish_home', side_effect=interrupt_finish):
+            meta = self.run_matched(error='home finalizer interrupted', finalization=True,
+                                    exception_type=KeyboardInterrupt, interrupted_cleanup=True)
+        self.assertEqual(attempts, ['native-home', 'om-home'])
+        self.assertEqual(meta['global_config_finalization']['status'], 'complete')
 
     def test_configuration_drift_never_launches_a_model(self):
         controls = {

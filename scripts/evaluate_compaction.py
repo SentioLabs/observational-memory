@@ -1001,7 +1001,7 @@ def validate_home(home):
 def prepare_home(home, output=None):
     state = validate_home(home)
     write_home_state(home, {**state, 'schema': SCHEMA, 'home': str(home.resolve()),
-                           'run': str(output) if output else None, 'status': 'in_progress'})
+                           'run': str(output.resolve()) if output is not None else None, 'status': 'in_progress'})
     for name in state['created']:
         target = home / name
         if target.is_dir():
@@ -1015,6 +1015,8 @@ def finish_home(home, baseline, output, release_exposures=None):
     state = read_home_state(home)
     if state.get('status') != 'in_progress' or state['baseline'] != baseline:
         raise HarnessError('evaluation home has no matching active ownership record')
+    if state.get('run') is not None and state['run'] != str(output.resolve()):
+        raise HarnessError('evaluation home run identity differs from prepared ownership')
     created = {}
     for path in home.iterdir():
         if path.name == HOME_MARKER:
@@ -1030,7 +1032,7 @@ def finish_home(home, baseline, output, release_exposures=None):
     if any(not (home / name).exists() for name in baseline):
         raise HarnessError('normal-login baseline disappeared during evaluation')
     baseline = sorted(set(baseline) | {p.name for p in home.iterdir() if p.name in LOGIN_FILES})
-    write_home_state(home, {'schema': SCHEMA, 'home': str(home.resolve()), 'run': str(output), 'status': 'complete',
+    write_home_state(home, {'schema': SCHEMA, 'home': str(home.resolve()), 'run': str(output.resolve()), 'status': 'complete',
                            'baseline': baseline, 'created': created, 'release_exposures': release_exposures or []})
 
 
@@ -1567,13 +1569,18 @@ def live(config, fixture, variants, budget, metadata):
     metadata['home_finalization'] = {}
     unsafe_homes = set()
     primary_error = None
+    deferred_control_flow = []
 
     def finalize(stage, operation):
         try:
             operation()
             return {'status': 'complete'}
-        except Exception as exc:
-            error = {'stage': stage, 'error': str(redact(str(exc)))}
+        except BaseException as exc:
+            # Mandatory cleanup continues on interruption; re-raise its original
+            # control-flow exception after all attempts unless a run error is active.
+            if not isinstance(exc, Exception):
+                deferred_control_flow.append(exc)
+            error = {'stage': stage, 'error': str(redact(str(exc))) or type(exc).__name__}
             errors.append(error)
             return {'status': 'failed', 'error': error['error']}
 
@@ -1593,6 +1600,7 @@ def live(config, fixture, variants, budget, metadata):
             for name in VARIANTS:
                 workspace = (config.output / name / 'workspace').resolve()
                 writable = [workspace] + ([data] if name == 'om' else [])
+                unsafe_homes.add(name)  # Remains unsafe until shutdown returns successfully.
                 client = LiveVariant(config, variants[name], workspace, envs[name], writable)
                 clients.append(client)
                 client.preflight()
@@ -1609,8 +1617,8 @@ def live(config, fixture, variants, budget, metadata):
                 client.drive()
         finally:
             for client in clients:
-                if finalize(client.variant.name + ' shutdown', client.close)['status'] == 'failed':
-                    unsafe_homes.add(client.variant.name)
+                if finalize(client.variant.name + ' shutdown', client.close)['status'] == 'complete':
+                    unsafe_homes.discard(client.variant.name)
 
             def measurements():
                 calls = [json.loads(line) for line in meter.read_text().splitlines()]
@@ -1652,6 +1660,8 @@ def live(config, fixture, variants, budget, metadata):
 
         metadata['global_config_unchanged'] = None
         metadata['global_config_finalization'] = finalize('global configuration', global_check)
+        if deferred_control_flow and primary_error is None:
+            raise deferred_control_flow[0]
         if errors and primary_error is None:
             raise HarnessError('evaluation finalization failed: ' + '; '.join(e['stage'] + ': ' + e['error'] for e in errors))
 

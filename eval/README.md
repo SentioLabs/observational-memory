@@ -121,7 +121,10 @@ Finalization attempts both homes and checks global configuration even when an
 earlier step fails. Results retain per-home status, global-check status and every
 finalization error, alongside the original run error and measured usage. A cleanup
 failure alone also fails the run. An unverified host shutdown or failed home
-finalizer leaves ownership incomplete and blocks automatic reuse.
+finalizer leaves ownership incomplete and blocks automatic reuse. Interruptions
+during cleanup are deferred until the remaining attempts finish, then re-raised
+unless an earlier run error is already being preserved. A recorded run path must
+match at finalization; a different run cannot claim its ownership record.
 
 Candidate staging copies the plugin into the output directory, substitutes only
 the temporary runtime version pin, installs the explicitly supplied binary with
