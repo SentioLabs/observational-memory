@@ -9,6 +9,9 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import ctypes
+import functools
+import math
 from dataclasses import dataclass, field
 import hashlib
 import inspect
@@ -36,6 +39,41 @@ FIXTURE = ROOT / 'eval/fixtures/continuity.json'
 
 class HarnessError(Exception):
     """Fail closed without claiming release evidence."""
+
+
+@functools.lru_cache(maxsize=1)
+def clock_source():
+    """Public elapsed clocks that include suspend; never fall back to epoch time."""
+    try:
+        if sys.platform == 'darwin':
+            class Timebase(ctypes.Structure):
+                _fields_ = [('numer', ctypes.c_uint32), ('denom', ctypes.c_uint32)]
+            lib = ctypes.CDLL(None)
+            lib.mach_timebase_info.argtypes = [ctypes.POINTER(Timebase)]
+            lib.mach_timebase_info.restype = ctypes.c_int
+            lib.mach_continuous_time.argtypes = []
+            lib.mach_continuous_time.restype = ctypes.c_uint64
+            info = Timebase()
+            if lib.mach_timebase_info(ctypes.byref(info)) != 0 or not info.numer or not info.denom:
+                raise ValueError('invalid mach timebase')
+            scale = info.numer / info.denom / 1_000_000_000
+            return 'mach_continuous_time', lambda: lib.mach_continuous_time() * scale
+        if sys.platform.startswith('linux') and hasattr(time, 'CLOCK_BOOTTIME'):
+            time.clock_gettime(time.CLOCK_BOOTTIME)  # Check availability before paid work.
+            return 'CLOCK_BOOTTIME', lambda: time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError, ValueError) as exc:
+        raise HarnessError('suspend-aware elapsed clock unavailable') from exc
+    raise HarnessError('suspend-aware elapsed clock unavailable on this platform')
+
+
+def continuous_time():
+    try:
+        value = clock_source()[1]()
+        if not math.isfinite(value):
+            raise ValueError('nonfinite elapsed clock')
+        return value
+    except Exception as exc:
+        raise HarnessError('suspend-aware elapsed clock unavailable or invalid') from exc
 
 
 def canonical(value):
@@ -303,18 +341,60 @@ class Fixture:
 class RunBudget:
     max_seconds: int | None
     max_input_tokens: int | None
-    clock: Callable = time.monotonic
+    clock: Callable = continuous_time
     input_tokens: int = 0
     overshoot: int = 0
     started: float = field(init=False)
+    epoch_clock: Callable = time.time
+    active_clock: Callable = time.monotonic
 
     def __post_init__(self):
-        self.started = self.clock()
+        try:
+            self.started = self.clock()
+        except Exception as exc:
+            raise HarnessError('elapsed clock unavailable') from exc
+        if not isinstance(self.started, (int, float)) or not math.isfinite(self.started):
+            raise HarnessError('invalid elapsed clock')
+        self.last_clock = self.started
+        self.started_epoch, self.started_active = self.epoch_clock(), self.active_clock()
+        self.clock_name = clock_source()[0] if self.clock is continuous_time else 'injected-clock'
+        self.max_epoch_discrepancy = self.max_active_discrepancy = 0.
+
+    def elapsed(self):
+        try:
+            now = self.clock()
+        except Exception as exc:
+            raise HarnessError('elapsed clock unavailable') from exc
+        if not isinstance(now, (int, float)) or not math.isfinite(now) or now < self.last_clock:
+            raise HarnessError('elapsed clock invalid or moved backwards')
+        self.last_clock = now
+        return now - self.started
+
+    def timing(self):
+        # Diagnostics must not replace a primary failure with a second clock error.
+        try:
+            elapsed = self.elapsed()
+            epoch_now = self.epoch_clock()
+            epoch = epoch_now - self.started_epoch
+            active = self.active_clock() - self.started_active
+            epoch_delta, active_delta = epoch - elapsed, elapsed - active
+            self.max_epoch_discrepancy = max(self.max_epoch_discrepancy, abs(epoch_delta))
+            self.max_active_discrepancy = max(self.max_active_discrepancy, abs(active_delta))
+            return {'source': self.clock_name, 'includes_suspend': self.clock is continuous_time,
+                    'elapsed_seconds': elapsed, 'snapshot_epoch_seconds': epoch_now, 'epoch_elapsed_seconds': epoch,
+                    'active_monotonic_elapsed_seconds': active,
+                    'epoch_minus_elapsed_seconds': epoch_delta, 'elapsed_minus_active_seconds': active_delta,
+                    'max_abs_epoch_discrepancy_seconds': self.max_epoch_discrepancy,
+                    'max_abs_active_discrepancy_seconds': self.max_active_discrepancy,
+                    'clock_discrepancy_warning': max(self.max_epoch_discrepancy, self.max_active_discrepancy) > 1}
+        except Exception as exc:
+            return {'source': self.clock_name, 'elapsed_seconds': None, 'clock_error': str(exc),
+                    'clock_discrepancy_warning': True}
 
     def remaining(self):
         if self.max_seconds is None:
             return 60.0
-        return max(0.0, self.max_seconds - (self.clock() - self.started))
+        return max(0.0, self.max_seconds - self.elapsed())
 
     def check(self):
         if self.max_seconds is not None and self.remaining() <= 0:
@@ -652,43 +732,62 @@ class RpcClient:
     def __init__(self, receive, send, budget, notify):
         self.receive, self.send, self.budget, self.notify = receive, send, budget, notify
         self.next_id, self.pending, self.replies = 1, set(), {}
+        self.request_methods, self.observer = {}, None
 
     def send_request(self, method, params):
         self.budget.check()
         ident = self.next_id
         self.next_id += 1
         self.pending.add(ident)
+        self.request_methods[ident] = method
         self.send({'method': method, 'id': ident, 'params': params})
         return ident
 
     def pump(self, timeout=30):
-        self.budget.check()
-        event = self.receive(min(timeout, self.budget.remaining()))
-        if event is None:
-            return
-        if not isinstance(event, dict):
-            raise HarnessError('invalid RPC message')
-        if 'method' in event:
-            if 'id' in event:
-                self.send({'id': event['id'], 'error': {'code': -32601, 'message': 'Evaluation client refuses server request'}})
-                raise HarnessError('unexpected server request; no approval granted')
-            self.notify(event)
-        elif 'id' in event:
-            ident = event['id']
-            if type(ident) is not int or ident not in self.pending or ident in self.replies:
-                raise HarnessError('unsolicited or duplicate RPC reply ID')
-            self.replies[ident] = event
-        else:
-            raise HarnessError('unclassified RPC message')
+        error = None
+        try:
+            self.budget.check()
+            if self.observer:
+                self.observer()
+            event = self.receive(min(1, timeout, self.budget.remaining()))
+            if event is None:
+                self.budget.check()
+                return
+            if not isinstance(event, dict):
+                raise HarnessError('invalid RPC message')
+            if 'method' in event:
+                if 'id' in event:
+                    self.send({'id': event['id'], 'error': {'code': -32601, 'message': 'Evaluation client refuses server request'}})
+                    raise HarnessError('unexpected server request; no approval granted')
+                # Preserve delivered usage even if suspend exhausted the wall budget.
+                self.notify(event)
+            elif 'id' in event:
+                ident = event['id']
+                if type(ident) is not int or ident not in self.pending or ident in self.replies:
+                    raise HarnessError('unsolicited or duplicate RPC reply ID')
+                self.replies[ident] = event
+            else:
+                raise HarnessError('unclassified RPC message')
+            self.budget.check()  # Recheck on resume before accepting a reply/starting work.
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            if self.observer:
+                try:
+                    self.observer(error=error, diagnostic_only=True)
+                except Exception:
+                    pass  # Best-effort diagnostics must not mask the primary failure.
 
-    def wait_response(self, ident, timeout=60):
-        deadline = time.monotonic() + timeout
+    def wait_response(self, ident):
+        # A silent pending reply is not a failure; the finite shared run budget
+        # bounds live requests. Explicit transport/cleanup bounds remain separate.
         while ident not in self.replies:
-            if time.monotonic() >= deadline:
-                raise HarnessError('RPC response deadline reached')
-            self.pump(min(1, deadline - time.monotonic()))
+            self.pump(1)
+        self.budget.check()
         event = self.replies.pop(ident)
         self.pending.remove(ident)
+        self.request_methods.pop(ident, None)
         if 'error' in event or 'result' not in event:
             raise HarnessError('RPC method failed')
         return event['result']
@@ -733,18 +832,18 @@ class ProcessTransport:
         budget = self.budget if timeout is None else None
         if budget:
             budget.check()
-        deadline = time.monotonic() + (min(30, budget.remaining()) if budget else (timeout if timeout is not None else 30))
+        deadline = continuous_time() + (min(30, budget.remaining()) if budget else (timeout if timeout is not None else 30))
         payload = memoryview(canonical(event) + b'\n')
         self.selector.register(self.process.stdin, selectors.EVENT_WRITE, 'stdin')
         try:
             while payload:
                 if budget:
                     budget.check()
-                remaining = deadline - time.monotonic()
+                remaining = deadline - continuous_time()
                 if remaining <= 0:
                     raise HarnessError('App Server write deadline reached')
-                for key, _ in self.selector.select(remaining):
-                    if time.monotonic() >= deadline:
+                for key, _ in self.selector.select(min(1, remaining)):
+                    if continuous_time() >= deadline:
                         raise HarnessError('App Server write deadline reached')
                     if key.data == 'stdin':
                         try:
@@ -761,16 +860,16 @@ class ProcessTransport:
             self.selector.unregister(self.process.stdin)
 
     def receive(self, timeout):
-        deadline = time.monotonic() + timeout
+        deadline = continuous_time() + timeout
         while b'\n' not in self.buffer:
-            remaining = deadline - time.monotonic()
+            remaining = deadline - continuous_time()
             if remaining <= 0:
                 return None
-            ready = self.selector.select(remaining)
+            ready = self.selector.select(min(1, remaining))
             if not ready:
                 return None
             for key, _ in ready:
-                if time.monotonic() >= deadline:
+                if continuous_time() >= deadline:
                     return None
                 self.read_ready(key)
         line, self.buffer = self.buffer.split(b'\n', 1)
@@ -791,10 +890,10 @@ class ProcessTransport:
                     except (OSError, HarnessError):
                         pass
                 if notify:
-                    deadline = time.monotonic() + 0.5
                     try:
-                        while time.monotonic() < deadline:
-                            event = self.receive(min(0.05, deadline - time.monotonic()))
+                        deadline = continuous_time() + 0.5
+                        while continuous_time() < deadline:
+                            event = self.receive(min(0.05, deadline - continuous_time()))
                             if event and 'method' in event and 'id' not in event:
                                 try:
                                     notify(event)
@@ -1823,6 +1922,81 @@ class LiveVariant:
         self.log = (config.output / (variant.name + '-events.jsonl')).open('w')
         self.variant.manual_compaction_requested = bool(config.args.force_compaction)
         self.rpc = RpcClient(self.transport.receive, self.send, variant.budget, self.notify)
+        self.last_receipt_elapsed = None
+        self.last_event_kind = None
+        self.pending_commands = set()
+        self.last_status_elapsed = None
+        self.silence_warning_seen = False
+        self.status_phase = 'preflight'
+        self.status_error = None
+        self.last_public_error = None
+        self.rpc.observer = self.report_status
+
+    def report_status(self, force=False, error=None, diagnostic_only=False):
+        process = getattr(self.transport, 'process', None)
+        exit_code = process.poll() if process is not None else None
+        if exit_code is not None and not diagnostic_only and self.status_phase != 'closed':
+            # Exit does not mean the pipe is empty. Retain final owned usage before
+            # classifying failure, bounded even if another process inherited a pipe.
+            deadline = continuous_time() + .25
+            for _ in range(256):
+                if continuous_time() >= deadline:
+                    break
+                try:
+                    event = self.transport.receive(min(.01, deadline - continuous_time()))
+                except (HarnessError, OSError):
+                    break
+                if event is None:
+                    break
+                if isinstance(event, dict) and 'method' in event and 'id' not in event:
+                    try:
+                        self.notify(event)
+                    except HarnessError:
+                        pass  # charge() updates delivered usage before raising.
+        if error:
+            self.status_error = error
+        timing = self.variant.budget.timing()
+        elapsed = timing.get('elapsed_seconds')
+        age = (max(0., elapsed - self.last_receipt_elapsed)
+               if elapsed is not None and self.last_receipt_elapsed is not None else None)
+        pending = bool(self.rpc.pending or self.active_turn)
+        silent = pending and age is not None and age >= 60
+        self.silence_warning_seen |= silent
+        due = (force or error or exit_code is not None or self.last_status_elapsed is None
+               or elapsed is None or elapsed - self.last_status_elapsed >= 2)
+        if due:
+            status = {'schema': 1, 'variant': self.variant.name, 'timing': timing,
+                      'thread_id': self.variant.thread_id, 'active_turn_id': self.active_turn,
+                      'phase': self.status_phase if self.status_phase in ('closing', 'closed') else
+                               ('failed' if self.status_error or exit_code is not None else self.status_phase),
+                      'pending_rpc_methods': sorted(set(self.rpc.request_methods.values()))[:16],
+                      'pending_command_count': len(self.pending_commands),
+                      'last_event_kind': self.last_event_kind, 'last_event_receipt_elapsed_seconds': self.last_receipt_elapsed,
+                      'last_event_age_seconds': age, 'silence_warning': silent,
+                      'silence_warning_seen': self.silence_warning_seen,
+                      'silence_policy': 'warning only; absent events do not establish model or host failure',
+                      'host_exit_code': exit_code, 'error_class': self.status_error,
+                      'last_public_error': self.last_public_error,
+                      'max_seconds': self.variant.budget.max_seconds,
+                      'remaining_seconds': max(0., self.variant.budget.max_seconds - elapsed)
+                          if self.variant.budget.max_seconds is not None and elapsed is not None else None,
+                      'max_input_tokens': self.variant.budget.max_input_tokens,
+                      'reported_input_tokens': self.variant.usage.totals()['inputTokens']}
+            path = self.config.output / (self.variant.name + '-status.json')
+            temporary = path.with_suffix('.json.tmp')
+            try:
+                if len(canonical(status)) > 8192:
+                    raise HarnessError('diagnostic status exceeded bound')
+                write_json(temporary, status)
+                os.replace(temporary, path)
+                self.last_status_elapsed = elapsed
+            except Exception:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass  # Diagnostic I/O never replaces a run/cleanup failure.
+        if exit_code is not None and not diagnostic_only and self.status_phase != 'closed':
+            raise HarnessError('owned App Server exited: ' + str(exit_code))
 
     def send(self, event):
         if event.get('method') == 'thread/compact/start':
@@ -1833,6 +2007,24 @@ class LiveVariant:
         p = event.get('params', {})
         # Store only newly owned synthetic thread events, never account/config payloads.
         if self.variant.thread_id and p.get('threadId') == self.variant.thread_id:
+            # A diagnostic timestamp failure must not discard delivered usage.
+            self.last_receipt_elapsed = self.variant.budget.timing().get('elapsed_seconds')
+            method = event.get('method')
+            self.last_event_kind = method if method in (
+                'thread/tokenUsage/updated', 'turn/started', 'turn/completed', 'item/started',
+                'item/completed', 'item/agentMessage/delta', 'item/reasoning/textDelta',
+                'item/reasoning/summaryTextDelta', 'item/commandExecution/outputDelta',
+                'hook/started', 'hook/completed', 'error') else 'other-public-event'
+            item = p.get('item', {})
+            if item.get('type') == 'commandExecution':
+                if event.get('method') == 'item/started':
+                    self.pending_commands.add(item.get('id'))
+                elif event.get('method') == 'item/completed':
+                    self.pending_commands.discard(item.get('id'))
+            if event.get('method') == 'error':
+                self.last_public_error = 'retryable' if p.get('willRetry', False) else 'terminal'
+                if not p.get('willRetry', False):
+                    self.status_error = 'public-terminal-error'
             self.log.write(json.dumps(redact(event), ensure_ascii=False) + '\n')
             self.log.flush()
             if event.get('method') == 'hook/completed':
@@ -1915,6 +2107,8 @@ class LiveVariant:
             if p != self.workspace / 'AGENTS.md':
                 raise HarnessError('unmatched external instruction source: evaluation isolation failed')
         self.variant.live_thread_id = self.variant.thread_id
+        self.status_phase = 'idle'
+        self.last_receipt_elapsed = self.variant.budget.elapsed()
 
     def turn(self, prompt, cycle=None, interrupt=False):
         event_offset = len(self.activation_events)
@@ -1926,12 +2120,14 @@ class LiveVariant:
             call_offset = len((Path(self.activation['data']) / 'calls.jsonl').read_text().splitlines())
         before = len(self.variant.usage.observations)
         effects_before = action_evidence(self.variant.fixture, self.workspace, cycle, before=True) if cycle else None
+        self.status_phase = 'waiting-for-turn-reply'
         response = self.rpc.request('turn/start', {'threadId': self.variant.thread_id,
                    'input': [{'type': 'text', 'text': prompt}], 'effort': self.config.args.reasoning})
         turn_id = response.get('turn', {}).get('id')
         if not turn_id:
             raise HarnessError('turn/start omitted turn identity')
         self.active_turn = turn_id
+        self.status_phase = 'running-turn'
         self.variant.requested_turn_ids.add(turn_id)
         if cycle is not None:
             self.variant.begin_probe(cycle, turn_id)
@@ -1957,8 +2153,8 @@ class LiveVariant:
             self.variant.interruptions.append({'turn_id': turn_id, 'status': completed.get('status')})
         # Notifications may race with turn completion. Drain boundedly for usage;
         # never start the next paid turn while usage is unknown.
-        grace = time.monotonic() + 2
-        while time.monotonic() < grace:
+        grace = continuous_time() + 2
+        while continuous_time() < grace:
             try:
                 self.variant.require_usage_since(before, turn_id)
                 break
@@ -1978,9 +2174,9 @@ class LiveVariant:
                     e.get('method') == 'item/completed' and e['params'].get('item', {}).get('type') == 'commandExecution'
                     for e in current_events()):
                 required.add('postToolUse')
-            deadline = time.monotonic() + min(3, self.variant.budget.remaining())
+            deadline = continuous_time() + min(3, self.variant.budget.remaining())
             while not required <= {e['params']['run']['eventName'] for e in current_events()
-                                   if e.get('method') == 'hook/completed'} and time.monotonic() < deadline:
+                                   if e.get('method') == 'hook/completed'} and continuous_time() < deadline:
                 self.rpc.pump(.1)
             events = current_events()
             prime = any(e.get('method') == 'hook/completed' and e['params']['run']['eventName'] == 'sessionStart' for e in events)
@@ -2000,6 +2196,8 @@ class LiveVariant:
                 answer = {}  # Invalid JSON is a failed actual probe, not a retry with hints.
             self.variant.finish_probe(cycle, turn_id, answer,
                                       action_evidence(self.variant.fixture, self.workspace, cycle, prior=effects_before))
+        self.status_phase = 'idle'
+        self.report_status(force=True, diagnostic_only=True)
         return turn_id
 
     def recover(self):
@@ -2058,9 +2256,19 @@ class LiveVariant:
             raise HarnessError('more compactions than requested; recovery evidence is incomplete')
 
     def close(self):
+        self.status_phase = 'closing'
         try:
             self.transport.close(self.variant.thread_id, self.active_turn or self.variant.active_turn, self.notify)
+        except BaseException as exc:
+            self.status_error = type(exc).__name__
+            raise
+        else:
+            self.status_phase = 'closed'
         finally:
+            try:
+                self.report_status(force=True, diagnostic_only=True)
+            except Exception:
+                pass
             self.log.close()
 
 
@@ -2255,6 +2463,7 @@ def output_results(config, fixture, variants, budget, metadata, error):
     native_tokens = variants['native'].usage.totals()['inputTokens']
     om_tokens = variants['om'].usage.totals()['inputTokens']
     overhead = om_tokens - native_tokens if native_tokens is not None and om_tokens is not None else None
+    timing = budget.timing()
     result = {'schema': SCHEMA, 'mode': config.mode, 'status': status,
               'release_pass': config.mode == 'release' and counts_complete and not reasons,
               'compaction_measurement_contract': 'configured-policy-and-observed-reduction-v2',
@@ -2262,7 +2471,8 @@ def output_results(config, fixture, variants, budget, metadata, error):
               'variants': {name: v.result(config.compact_limit) for name, v in variants.items()},
               'budget': {'max_seconds': budget.max_seconds, 'max_input_tokens': budget.max_input_tokens,
                          'observed_input_tokens': budget.input_tokens if any(v.usage.observations for v in variants.values()) else None,
-                         'input_overshoot': budget.overshoot, 'wall_seconds': budget.clock() - budget.started,
+                         'input_overshoot': budget.overshoot, 'wall_seconds': timing.get('elapsed_seconds'),
+                         'timing': timing,
                          'scope': 'whole run, both variants and all observed maintenance'},
               'input_token_overhead': overhead,
               'workload_exposure': {name: {'batches': len(v.workload_batches),
@@ -2308,6 +2518,7 @@ def main(argv=None):
             write_json(config.output / 'activation.json', result)
             print(str(config.output / 'activation.json'))
             return 0 if result['verified'] else 1
+        budget = RunBudget(config.args.max_seconds, config.args.max_input_tokens)
         fixture = Fixture.load(config.args.fixture.resolve(), config.split)
         if config.args.frozen_split_hash:
             fixture.check_hash(config.args.frozen_split_hash)
@@ -2319,7 +2530,6 @@ def main(argv=None):
     except OSError as exc:
         print('evaluation refused: cannot create fresh output directory', file=sys.stderr)
         return 2
-    budget = RunBudget(config.args.max_seconds, config.args.max_input_tokens)
     variants = {name: VariantRun(name, fixture, budget) for name in VARIANTS}
     metadata = {'fixture_sha256': fixture.fixture_hash, 'split_sha256': fixture.split_hash, 'rubric_sha256': fixture.rubric_hash,
                 'runner_sha256': digest(Path(__file__).read_bytes()), 'seed': fixture.seed,

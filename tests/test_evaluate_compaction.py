@@ -1316,6 +1316,184 @@ class InterruptDriverTests(unittest.TestCase):
             c.close()
 
 
+class ClockSafetyTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+
+    def clocks(self, seconds=1000):
+        values = {'elapsed': 0., 'epoch': 10000., 'active': 0.}
+        budget = evalmod.RunBudget(seconds, 1000000, lambda: values['elapsed'],
+                                   epoch_clock=lambda: values['epoch'], active_clock=lambda: values['active'])
+        return values, budget
+
+    def test_epoch_jumps_do_not_change_elapsed_budget(self):
+        values, budget = self.clocks()
+        for epoch in (1000000., -1000000.):
+            values.update(elapsed=10., active=10., epoch=epoch)
+            self.assertEqual(budget.remaining(), 990.)
+            budget.check()
+            snapshot = budget.timing()
+            self.assertEqual(snapshot['elapsed_seconds'], 10.)
+            self.assertTrue(snapshot['clock_discrepancy_warning'])
+            self.assertEqual(snapshot['epoch_minus_elapsed_seconds'], epoch - 10000. - 10.)
+
+    def test_suspend_counts_toward_wall_ceiling_and_retains_received_usage(self):
+        values, budget = self.clocks(seconds=100)
+        v = evalmod.VariantRun('native', self.fixture, budget); v.start_thread('owned')
+        def receive(timeout):
+            values.update(elapsed=101., active=1., epoch=10101.)
+            return usage('owned', 123)
+        rpc = evalmod.RpcClient(receive, lambda e: None, budget, v.event)
+        with self.assertRaisesRegex(evalmod.HarnessError, 'wall deadline'):
+            rpc.pump()
+        self.assertEqual(v.usage.totals()['inputTokens'], 123)
+        self.assertEqual(budget.input_tokens, 123)
+        self.assertEqual(budget.timing()['elapsed_minus_active_seconds'], 100.)
+
+    def test_delayed_reply_warns_without_silence_cancellation(self):
+        values = {'elapsed': 0., 'epoch': 10000., 'active': 0.}
+        budget = evalmod.RunBudget(1000, 1000000, lambda: values['elapsed'])
+        class SlowHost(FakeHost):
+            def send(self, request):
+                super().send(request)
+                if request.get('method') == 'turn/start':
+                    self.delay = 22
+            def receive(self, timeout):
+                if getattr(self, 'delay', 0):
+                    self.delay -= 1
+                    values['elapsed'] += 30; values['active'] += 30; values['epoch'] += 30
+                    return None
+                return super().receive(timeout)
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = evalmod.VariantRun('native', self.fixture, budget)
+        with patch.object(evalmod.time, 'monotonic', side_effect=lambda: values['active']):
+            client = evalmod.LiveVariant(DriverTests.config(self), v, workspace, {}, [workspace], SlowHost)
+            try:
+                client.preflight(); client.start(); client.turn('ordinary slow reply')
+                status = json.loads((self.path / 'native-status.json').read_text())
+                self.assertTrue(status['silence_warning_seen'])
+                self.assertEqual(v.usage.totals()['inputTokens'], 100)
+                self.assertNotIn('turn/interrupt', [r.get('method') for r in client.transport.sent])
+            finally:
+                client.close()
+
+    def test_status_is_bounded_and_local_receipt_not_remote_epoch_driven(self):
+        values, budget = self.clocks()
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = evalmod.VariantRun('native', self.fixture, budget)
+        client = evalmod.LiveVariant(DriverTests.config(self), v, workspace, {}, [workspace], FakeHost)
+        self.addCleanup(client.close); client.preflight(); client.start()
+        values['elapsed'] = 5
+        client.notify({'method': 'item/started', 'emittedAtMs': -90000000,
+                       'params': {'threadId': v.thread_id, 'turnId': 'local',
+                                  'item': {'id': 'cmd', 'type': 'commandExecution', 'command': 'PRIVATE' * 10000}}})
+        values['elapsed'] = 10
+        client.report_status(force=True)
+        path = self.path / 'native-status.json'; raw = path.read_text(); status = json.loads(raw)
+        self.assertEqual(status['last_event_age_seconds'], 5)
+        self.assertEqual(status['pending_command_count'], 1)
+        self.assertLess(len(raw.encode()), 8192)
+        self.assertNotIn('PRIVATE', raw)
+        self.assertFalse(list(self.path.glob('*status.json.tmp')))
+
+    def test_owned_process_exit_and_status_write_failure_preserve_primary_error(self):
+        values, budget = self.clocks()
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = evalmod.VariantRun('native', self.fixture, budget)
+        client = evalmod.LiveVariant(DriverTests.config(self), v, workspace, {}, [workspace], FakeHost)
+        self.addCleanup(client.close)
+        from unittest.mock import Mock
+        client.transport.process = Mock(); client.transport.process.poll.return_value = 23
+        with self.assertRaisesRegex(evalmod.HarnessError, 'owned App Server exited'):
+            client.rpc.pump()
+        status = json.loads((self.path / 'native-status.json').read_text())
+        self.assertEqual(status['host_exit_code'], 23)
+        with patch.object(evalmod, 'write_json', side_effect=OSError('status disk denied')):
+            with self.assertRaisesRegex(evalmod.HarnessError, 'owned App Server exited'):
+                client.rpc.pump()
+
+    def test_unavailable_clock_refuses_before_live_work(self):
+        with patch.object(evalmod, 'clock_source', side_effect=evalmod.HarnessError('suspend-aware clock unavailable')):
+            with self.assertRaisesRegex(evalmod.HarnessError, 'clock unavailable'):
+                evalmod.RunBudget(100, 1000)
+
+    def test_late_live_usage_is_retained_before_deadline_blocks_next_request(self):
+        values, budget = self.clocks(seconds=100)
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = evalmod.VariantRun('native', self.fixture, budget)
+        client = evalmod.LiveVariant(DriverTests.config(self), v, workspace, {}, [workspace], FakeHost)
+        self.addCleanup(client.close); client.preflight(); client.start()
+        def receive(timeout):
+            values['elapsed'] = 101
+            return usage(v.thread_id, 321)
+        client.rpc.receive = receive
+        sent = len(client.transport.sent)
+        with self.assertRaisesRegex(evalmod.HarnessError, 'wall deadline'):
+            client.rpc.pump()
+        self.assertEqual(budget.input_tokens, 321)
+        self.assertEqual(v.usage.totals()['inputTokens'], 321)
+        self.assertIn('tokenUsage', (self.path / 'native-events.jsonl').read_text())
+        with self.assertRaisesRegex(evalmod.HarnessError, 'wall deadline'):
+            client.rpc.send_request('turn/start', {})
+        self.assertEqual(len(client.transport.sent), sent)
+
+    def test_exited_host_retains_buffered_usage_before_terminal_failure(self):
+        from unittest.mock import Mock
+        values, budget = self.clocks()
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = evalmod.VariantRun('native', self.fixture, budget)
+        client = evalmod.LiveVariant(DriverTests.config(self), v, workspace, {}, [workspace], FakeHost)
+        self.addCleanup(client.close); client.preflight(); client.start()
+        client.transport.queue.append(usage(v.thread_id, 456))
+        client.transport.process = Mock(); client.transport.process.poll.return_value = 23
+        with self.assertRaisesRegex(evalmod.HarnessError, 'owned App Server exited'):
+            client.rpc.pump()
+        self.assertEqual(budget.input_tokens, 456)
+        self.assertEqual(v.usage.totals()['inputTokens'], 456)
+        self.assertIn('tokenUsage', (self.path / 'native-events.jsonl').read_text())
+        status = json.loads((self.path / 'native-status.json').read_text())
+        self.assertEqual(status['reported_input_tokens'], 456)
+        self.assertEqual(status['host_exit_code'], 23)
+
+    def test_status_throttles_events_and_reports_cleanup_without_masking_failure(self):
+        values, budget = self.clocks()
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = evalmod.VariantRun('native', self.fixture, budget)
+        client = evalmod.LiveVariant(DriverTests.config(self), v, workspace, {}, [workspace], FakeHost)
+        client.preflight(); client.start()
+        with patch.object(evalmod, 'write_json', wraps=evalmod.write_json) as write:
+            client.report_status(force=True)
+            for _ in range(100):
+                client.notify({'method': 'item/agentMessage/delta', 'params': {'threadId': v.thread_id}})
+                client.report_status()
+            self.assertEqual(write.call_count, 1)
+        with patch.object(client.transport, 'close', side_effect=RuntimeError('primary shutdown failure')), \
+             patch.object(client, 'report_status', side_effect=OSError('diagnostic failure')):
+            with self.assertRaisesRegex(RuntimeError, 'primary shutdown failure'):
+                client.close()
+        self.assertTrue(client.log.closed)
+        self.assertEqual(client.status_phase, 'closing')
+
+    def test_invalid_clock_final_diagnostics_preserve_original_failure(self):
+        values, budget = self.clocks()
+        values['elapsed'] = float('nan')
+        with self.assertRaisesRegex(evalmod.HarnessError, 'clock invalid'):
+            budget.check()
+        config = DriverTests.config(self)
+        variants = {name: evalmod.VariantRun(name, self.fixture, budget) for name in ('native', 'om')}
+        result = evalmod.output_results(config, self.fixture, variants, budget, {}, 'original failure')
+        self.assertIn('original failure', result['eligibility_reasons'])
+        self.assertIsNone(result['budget']['wall_seconds'])
+        self.assertIn('clock_error', result['budget']['timing'])
+
+    def test_clock_unavailable_cli_refuses_before_output_or_live(self):
+        output = self.path / 'new-output'
+        with patch.object(evalmod, 'clock_source', side_effect=OSError('no supported clock')), \
+             patch.object(evalmod, 'live') as live:
+            self.assertEqual(evalmod.main(['--mode', 'dry-run', '--output', str(output)]), 2)
+        live.assert_not_called()
+        self.assertFalse(output.exists())
+
+
 class CompactionPolicyTests(unittest.TestCase):
     setUp = HarnessTests.setUp
 

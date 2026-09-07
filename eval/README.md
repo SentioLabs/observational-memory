@@ -98,6 +98,39 @@ maintenance can change how many batches fit between compactions. Results include
 batch hashes/counts/bytes and usage to reach the cycle target; they do not pretend
 that unequal workload lengths measure identical work throughput.
 
+## Elapsed time and live status
+
+Live budgets use a suspend-aware monotonic clock: `mach_continuous_time` on macOS
+and `CLOCK_BOOTTIME` on Linux. An unavailable or invalid source refuses execution
+before paid work. Elapsed decisions never fall back to epoch time. Suspend counts
+against the whole-run ceiling; on resume the runner checks it before more work.
+No process can enforce a deadline while the operating system has suspended it, so
+elapsed overrun can be visible when execution resumes. The final budget records
+continuous elapsed, epoch elapsed, ordinary monotonic elapsed and their maximum
+observed discrepancies. Epoch values label snapshots and diagnose disagreement;
+they do not establish continuous active waiting or identify its cause.
+
+`native-status.json` and `om-status.json` are bounded atomic snapshots, updated at
+most once every two seconds while the runner pumps events, plus explicit phase
+and failure updates. They contain owned thread/turn IDs, pending RPC methods and
+command counts, the latest locally received public event kind and age, remaining
+wall budget, observed input, process exit and public error classification. They
+contain no command text, response content, authentication or stderr. Diagnostic
+write failures cannot replace the run's primary error; missing or stale snapshots
+are themselves inconclusive. Shutdown records distinguish `closing` from a
+successfully returned `closed` phase and preserve the error classification.
+
+A pending reply or turn with no public event for 60 elapsed seconds produces a
+**warning only**. There is no separate silence timeout for model replies. Pending
+commands, retryable public errors and unclassified waiting remain distinct; the
+runner does not claim silence means model reasoning or network failure. Confirmed
+owned-host exit/disconnection, terminal public errors, actual shared wall/input
+ceilings and existing integrity failures still stop execution. Buffered final
+usage is drained boundedly on confirmed exit, and delivered usage is recorded
+before a resumed deadline refusal. Unreported in-flight usage remains unknown.
+The operator must not convert an epoch gap or silence warning into a stall abort.
+No persistent sleep settings or existing run artifacts are changed.
+
 ## Frozen cases and live commands
 
 A preview's `frozen-manifest.json` contains:
