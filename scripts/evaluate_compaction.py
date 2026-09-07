@@ -791,7 +791,7 @@ class RunConfig:
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', choices=('dry-run', 'replay', 'pilot', 'release'), required=True)
+    parser.add_argument('--mode', choices=('dry-run', 'replay', 'activation-check', 'pilot', 'release'), required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--allow-paid-inference', action='store_true')
     parser.add_argument('--max-seconds', type=int)
@@ -850,6 +850,11 @@ def parse_args(argv):
         raise HarnessError('candidate binary path unavailable')
     if args.plugin_root and not args.plugin_root.is_dir():
         raise HarnessError('candidate plugin path unavailable')
+    if args.mode == 'activation-check':
+        if (not args.om_binary or not args.plugin_root or not os.access(args.om_binary, os.X_OK)
+                or args.native_home or args.om_home or args.allow_paid_inference or args.model or args.reasoning
+                or args.max_input_tokens):
+            raise HarnessError('activation-check requires candidate binary/plugin and no live homes or paid flag')
     if args.mode == 'replay' and not args.replay_events:
         raise HarnessError('replay requires --replay-events')
     return RunConfig(args.mode, args.output.resolve(), cycles, args.compact_limit, args.scope, split, args)
@@ -877,10 +882,11 @@ def schema_preflight(codex, directory, budget, env):
         return json.loads(matches[0].read_text())
     requests = canonical(schema('ClientRequest')).decode()
     notifications = canonical(schema('ServerNotification')).decode()
-    for method in ('initialize', 'thread/start', 'turn/start', 'turn/interrupt', 'config/read', 'model/list', 'account/read', 'skills/list'):
+    for method in ('initialize', 'thread/start', 'turn/start', 'turn/interrupt', 'config/read', 'model/list', 'account/read',
+                   'skills/list', 'hooks/list', 'config/value/write'):
         if '"' + method + '"' not in requests:
             raise HarnessError('installed host lacks required method: ' + method)
-    for method in ('item/started', 'item/completed', 'turn/completed', 'thread/tokenUsage/updated'):
+    for method in ('item/started', 'item/completed', 'turn/completed', 'thread/tokenUsage/updated', 'hook/completed'):
         if '"' + method + '"' not in notifications:
             raise HarnessError('installed host lacks required event: ' + method)
     item = schema('ItemCompletedNotification')
@@ -1036,7 +1042,7 @@ def finish_home(home, baseline, output, release_exposures=None):
                            'baseline': baseline, 'created': created, 'release_exposures': release_exposures or []})
 
 
-def effective_comparison(config, variant, expected_market):
+def effective_comparison(config, variant, expected_market, trusted_hooks=None):
     value = copy.deepcopy(config)
     # Normalize only the integration this run staged, never a path supplied by
     # the received config. Preserve all residual marketplace/settings drift.
@@ -1070,12 +1076,163 @@ def effective_comparison(config, variant, expected_market):
         del markets['om-evaluation']
     else:
         raise HarnessError('unknown evaluation variant')
+    if trusted_hooks:
+        hooks = value.get('hooks', {})
+        state = hooks.get('state') if isinstance(hooks, dict) else None
+        if not isinstance(state, dict):
+            raise HarnessError('evaluation hook trust configuration unavailable')
+        for key, hash_value in trusted_hooks.items():
+            if state.get(key) != {'trusted_hash': hash_value}:
+                raise HarnessError('evaluation hook trust differs from reviewed definitions')
+            del state[key]
+        empty_hooks = {event: [] for event in ('Interrupt', 'PermissionRequest', 'PostCompact', 'PostToolUse',
+            'PreCompact', 'PreToolUse', 'SessionEnd', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop', 'UserPromptSubmit')}
+        if hooks == {**empty_hooks, 'state': {}}:
+            value['hooks'] = None  # Host defaults materialized solely by the reviewed trust write.
     # Writable roots are independently checked against each variant's exact
     # synthetic workspace/store; all other sandbox settings remain comparable.
     sandbox = value.get('sandbox_workspace_write')
     if isinstance(sandbox, dict):
         sandbox.pop('writable_roots', None)
     return value
+
+
+HOOKS = {'sessionStart': ('SessionStart', 'session_start', 5, 2500),
+         'userPromptSubmit': ('UserPromptSubmit', 'user_prompt_submit', 5, None),
+         'postToolUse': ('PostToolUse', 'post_tool_use', 5, None),
+         'stop': ('Stop', 'stop', 5, None), 'interrupt': ('Interrupt', 'interrupt', 3, None)}
+PLUGIN_ID = 'observational-memory@om-evaluation'
+
+
+def validate_hooks(response, variant, workspace, installed=None, expected=None):
+    rows = response.get('data') if isinstance(response, dict) else None
+    if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get('warnings') or rows[0].get('errors')
+            or Path(rows[0].get('cwd', '')).resolve() != workspace.resolve()
+            or not isinstance(rows[0].get('hooks'), list)):
+        raise HarnessError('evaluation hook discovery failed or ambiguous')
+    hooks = rows[0]['hooks']
+    if variant == 'native':
+        if hooks:
+            raise HarnessError('native evaluation must have no hooks')
+        return {}
+    if variant != 'om' or installed is None or len(hooks) != len(HOOKS):
+        raise HarnessError('evaluation requires exactly five reviewed OM hooks')
+    hashes, events = {}, set()
+    for hook in hooks:
+        if not isinstance(hook, dict):
+            raise HarnessError('malformed evaluation hook')
+        event = hook.get('eventName')
+        if event not in HOOKS or event in events:
+            raise HarnessError('unexpected or duplicate evaluation hook')
+        events.add(event)
+        _, key, timeout, limit = HOOKS[event]
+        required = {'key': f'{PLUGIN_ID}:hooks/hooks.json:{key}:0:0', 'handlerType': 'command',
+                    'command': f'sh "{installed.resolve()}/scripts/run.sh" hook --client codex',
+                    'async': False, 'matcher': None, 'timeoutSec': timeout, 'statusMessage': None,
+                    'additionalContextLimit': limit, 'sourcePath': str(installed.resolve() / 'hooks/hooks.json'),
+                    'source': 'plugin', 'pluginId': PLUGIN_ID, 'enabled': True, 'isManaged': False,
+                    'trustStatus': 'trusted' if expected is not None else 'untrusted'}
+        allowed = set(required) | {'eventName', 'displayOrder', 'currentHash'}
+        if (set(hook) != allowed or any(type(hook[k]) is not type(v) or hook[k] != v for k, v in required.items())
+                or type(hook['displayOrder']) is not int
+                or not isinstance(hook['currentHash'], str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', hook['currentHash'])):
+            raise HarnessError('evaluation hook definition or trust differs from reviewed candidate')
+        hashes[hook['key']] = hook['currentHash']
+    if expected is not None and hashes != expected:
+        raise HarnessError('evaluation hook hashes changed after review')
+    return hashes
+
+
+def activation_binding(config, candidate):
+    installed, data = Path(candidate['installed']), Path(candidate['data'])
+    expected = {'hooks': {event: [{'hooks': [{'type': 'command',
+        'command': 'sh "${PLUGIN_ROOT}/scripts/run.sh" hook --client codex', 'timeout': timeout,
+        **({'additionalContextLimit': limit} if limit is not None else {})}]}]
+        for event, _, timeout, limit in HOOKS.values()}}
+    if json.loads((installed / 'hooks/hooks.json').read_text()) != expected:
+        raise HarnessError('staged hook manifest is not the reviewed five-hook contract')
+    if tree_hash(installed) != candidate['staged_plugin_sha256']:
+        raise HarnessError('installed plugin differs from staged reviewed bytes')
+    return {'installed': str(installed.resolve()), 'data': str(data.resolve()),
+            'plugin_sha256': candidate['staged_plugin_sha256'],
+            'candidate_sha256': digest(config.args.om_binary.read_bytes()),
+            'meter_sha256': digest((data / 'bin/om').read_bytes())}
+
+
+def verify_activation_bytes(binding):
+    data = Path(binding['data'])
+    if (tree_hash(Path(binding['installed'])) != binding['plugin_sha256']
+            or digest((data / 'bin/om-candidate').read_bytes()) != binding['candidate_sha256']
+            or digest((data / 'bin/om').read_bytes()) != binding['meter_sha256']):
+        raise HarnessError('reviewed activation plugin/candidate/meter bytes changed')
+
+
+class ActivationSession:
+    """Public App Server control only; no account read or live usage accounting."""
+    def __init__(self, codex, workspace, env, options, budget):
+        argv = [codex, 'app-server']
+        for key, value in options.items():
+            argv.extend(['-c', key + '=' + json.dumps(value)])
+        self.transport = ProcessTransport(argv, env, workspace)
+        self.transport.budget = budget
+        self.events = []
+        self.errors = []
+        def receive(timeout):
+            event = self.transport.receive(timeout)
+            if event and 'error' in event:
+                self.errors.append(event)
+            return event
+        self.rpc = RpcClient(receive, self.transport.send, budget, self.events.append)
+        try:
+            self.rpc.request('initialize', {'clientInfo': {'name': 'om_activation', 'version': '1'},
+                                          'capabilities': {'experimentalApi': True}})
+            self.transport.send({'method': 'initialized', 'params': {}})
+        except BaseException:
+            try:
+                self.transport.close(notify=self.events.append)
+            except BaseException:
+                pass  # Initialization remains the primary failure; caller cannot certify ownership.
+            raise
+
+    def close(self):
+        primary = sys.exc_info()[1]
+        try:
+            self.transport.close(notify=self.events.append)
+        except BaseException:
+            if primary is not None:
+                raise primary
+            raise
+
+
+def trust_candidate(config, binding, budget, env, workspace, options):
+    verify_activation_bytes(binding)
+    session = ActivationSession(config.args.codex, workspace, env, options, budget)
+    try:
+        hashes = validate_hooks(session.rpc.request('hooks/list', {'cwds': [str(workspace)]}),
+                                'om', workspace, Path(binding['installed']))
+        verify_activation_bytes(binding)
+        for key, value in hashes.items():
+            session.rpc.request('config/value/write', {'keyPath': 'hooks.state.' + json.dumps(key) + '.trusted_hash',
+                'value': value, 'mergeStrategy': 'upsert', 'filePath': str(Path(env['CODEX_HOME']) / 'config.toml')})
+    finally:
+        session.close()
+    session = ActivationSession(config.args.codex, workspace, env, options, budget)
+    try:
+        verify_activation_bytes(binding)
+        validate_hooks(session.rpc.request('hooks/list', {'cwds': [str(workspace)]}),
+                       'om', workspace, Path(binding['installed']), hashes)
+        return hashes
+    finally:
+        session.close()
+
+
+def prepare_live_activation(config, candidate, budget, env):
+    binding = activation_binding(config, candidate)
+    workspace = (config.output / 'om/workspace').resolve()
+    options = settings(config)
+    options['sandbox_workspace_write.writable_roots'] = [str(workspace), binding['data']]
+    binding['hooks'] = trust_candidate(config, binding, budget, env, workspace, options)
+    return binding
 
 
 def process_env(home):
@@ -1115,14 +1272,14 @@ def verify_effective(value, config):
     return effective
 
 
-def stage_plugin(config, budget):
+def stage_plugin(config, budget, env=None):
     """Use supplied candidate only. Version substitution is confined to staging."""
     args, output = config.args, config.output
-    capabilities = json.loads(run_local([str(args.om_binary.resolve()), 'capabilities'], budget))
+    capabilities = json.loads(run_local([str(args.om_binary.resolve()), 'capabilities'], budget, env))
     version = capabilities.get('version', '')
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?', version):
         raise HarnessError('candidate must have explicit semantic version')
-    run_local([str(args.om_binary.resolve()), 'check-compatibility', '--protocol', '2', '--client', 'codex'], budget)
+    run_local([str(args.om_binary.resolve()), 'check-compatibility', '--protocol', '2', '--client', 'codex'], budget, env)
     market = output / 'candidate-market'
     plugin = market / 'plugin'
     shutil.copytree(args.plugin_root.resolve(), plugin, ignore=shutil.ignore_patterns('__pycache__', '.test-runtime'))
@@ -1137,7 +1294,7 @@ def stage_plugin(config, budget):
     write_json(manifest, {'name': 'om-evaluation', 'interface': {'displayName': 'OM evaluation'},
                          'plugins': [{'name': 'observational-memory', 'source': {'source': 'local', 'path': './plugin'},
                                       'policy': {'installation': 'AVAILABLE', 'authentication': 'ON_INSTALL'}}]})
-    env = process_env(args.om_home.resolve())
+    env = env if env is not None else process_env(args.om_home.resolve())
     run_local([args.codex, 'plugin', 'marketplace', 'add', str(market), '--json'], budget, env)
     run_local([args.codex, 'plugin', 'add', 'observational-memory@om-evaluation', '--json'], budget, env)
     installed = list((args.om_home / 'plugins/cache/om-evaluation/observational-memory').iterdir())
@@ -1191,7 +1348,10 @@ def meter_main(real, meter):
     if hook:
         session = payload.get('session_id')
     started = time.monotonic()
-    entry = {'input_bytes': len(raw), 'hook': hook, 'session': session,
+    entry = {'input_bytes': len(raw), 'hook': hook, 'session': session, 'command': command,
+             'hook_event': payload.get('hook_event_name') if hook else None,
+             'hook_source': payload.get('source') if hook else None,
+             'turn_id': payload.get('turn_id') if hook else None,
              'deferrals': [], 'hook_unavailable': False, 'staged_command_substitution': False,
              'owned_prompt_restored': False}
     # Serialize the exact per-session Stop map and each append. No ledger state is
@@ -1209,6 +1369,9 @@ def meter_main(real, meter):
             entry['owned_prompt_restored'] = True
         result = subprocess.run([str(real)] + args, input=delivered, capture_output=True)
         output = result.stdout
+        entry['prime_valid'] = (command == 'prime' and result.returncode == 0 and isinstance(session, str)
+            and ('Session: ' + json.dumps(session)).encode() in output
+            and ('Store: ' + json.dumps(str(real.parent.parent.resolve()))).encode() in output)
         try:
             response = json.loads(output)
         except ValueError:
@@ -1267,6 +1430,273 @@ def install_meter(data):
     binary.write_text(wrapper)
     binary.chmod(0o755)
     return meter
+
+
+def verify_intervention(events, calls, binding, thread_id, required, prime=False):
+    """Combine native hook completions, actual metered calls, and native prime output."""
+    runs = [e['params']['run'] for e in events if e.get('method') == 'hook/completed'
+            and e.get('params', {}).get('threadId') == thread_id]
+    for run in runs:
+        if (run.get('eventName') not in HOOKS or run.get('source') != 'plugin'
+                or run.get('sourcePath') != str(Path(binding['installed']) / 'hooks/hooks.json')
+                or run.get('handlerType') != 'command' or run.get('executionMode') != 'sync'
+                or run.get('status') not in (('completed', 'blocked') if run.get('eventName') == 'stop' else ('completed',))
+                or any(e.get('kind') in ('error', 'warning') for e in run.get('entries', []))):
+            raise HarnessError('OM activation has an unexpected or failed native hook')
+    owned = [c for c in calls if c.get('session') == thread_id]
+    if any((c.get('hook') and (c.get('exit_code') != 0 or c.get('hook_unavailable')))
+           or (c.get('command') == 'prime' and not c.get('prime_valid')) for c in owned):
+        raise HarnessError('OM activation has a failed metered hook or prime')
+    if (not set(required) <= {r['eventName'] for r in runs}
+            or not {HOOKS[event][0] for event in required} <= {c.get('hook_event') for c in owned if c.get('hook')}):
+        raise HarnessError('OM activation missing required native/metered lifecycle evidence')
+    if prime:
+        commands = [e['params']['item'] for e in events if e.get('method') == 'item/completed'
+                    and e.get('params', {}).get('threadId') == thread_id
+                    and e['params'].get('item', {}).get('type') == 'commandExecution']
+        contexts = [entry['text'] for run in runs if run['eventName'] == 'sessionStart'
+                    for entry in run.get('entries', []) if entry.get('kind') == 'context']
+        delivered = [m.group(1) for context in contexts for m in re.finditer(r'Ledger command: (.*?)\. Review', context)]
+        valid = [item for item in commands if item.get('exitCode') == 0
+                 and ('Session: ' + json.dumps(thread_id)) in item.get('aggregatedOutput', '')
+                 and any(action.get('command') == command + ' prime' for action in item.get('commandActions', [])
+                         for command in delivered)]
+        if not valid or not any(c.get('command') == 'prime' and c.get('prime_valid') for c in owned):
+            raise HarnessError('OM activation missing successful hook-delivered prime command')
+    return {'verified': True, 'native_events': sorted({r['eventName'] for r in runs}),
+            'metered_events': sorted({c['hook_event'] for c in owned if c.get('hook')}), 'prime_verified': prime}
+
+
+
+def activation_check(config, budget):
+    """Unauthenticated local host proof. Stub usage never enters VariantRun/RunBudget.charge."""
+    import http.server
+    import threading
+    root = config.output / 'activation'
+    root.mkdir()
+    workspace = root / 'workspace'; workspace.mkdir()
+    home = root / 'om-home'; home.mkdir()
+    native = root / 'native-home'; native.mkdir()
+    temporary = root / 'tmp'; temporary.mkdir()
+    env = {'PATH': os.environ['PATH'], 'HOME': str(root), 'CODEX_HOME': str(home),
+           'TMPDIR': str(temporary), 'LANG': 'en_US.UTF-8'}
+    local_budget = RunBudget(min(120, budget.remaining()), None)
+    host = schema_preflight(config.args.codex, root / 'host-schema', local_budget, env)
+    local_config = copy.copy(config)
+    local_config.output = root
+    local_config.args = copy.copy(config.args)
+    local_config.args.om_home = home
+    candidate = stage_plugin(local_config, local_budget, env)
+    data = Path(candidate['data']); meter = install_meter(data)
+    binding = activation_binding(local_config, candidate)
+    verify_activation_bytes(binding)
+    calls = lambda: [json.loads(line) for line in meter.read_text().splitlines()]
+    requests, controls, evidence = [], {}, {}
+    phase = {'name': 'native', 'sent': False}
+    failures = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            try:
+                self.connection.settimeout(max(.1, min(10, local_budget.remaining())))
+                length = int(self.headers.get('Content-Length', '0'))
+                if length <= 0 or length > 4_000_000:
+                    raise HarnessError('invalid local activation request size')
+                request = json.loads(self.rfile.read(length))
+                requests.append(request)
+                number = len(requests)
+                text = '\n'.join(part.get('text', '') for item in request.get('input', [])
+                                 for part in item.get('content', []) if isinstance(part, dict))
+                turn_meta = json.loads(request.get('client_metadata', {}).get('x-codex-turn-metadata', '{}'))
+                compact = turn_meta.get('request_kind') == 'compaction'
+                if phase['name'] in ('prime', 'bad-prime', 'interrupt') and not phase['sent'] and not compact:
+                    phase['sent'] = True
+                    if phase['name'] == 'interrupt':
+                        command = 'python3 -c "import time; time.sleep(20)"'
+                    else:
+                        matches = re.findall(r'Ledger command: (.*?)\. Review', text)
+                        if not matches:
+                            raise HarnessError('local activation request lacks delivered SessionStart command')
+                        command = matches[-1] + (' prime --invalid-activation-option' if phase['name'] == 'bad-prime' else ' prime')
+                    item = {'id': f'ctc_{number}', 'type': 'custom_tool_call', 'call_id': f'call_{number}',
+                            'name': 'exec', 'namespace': 'functions',
+                            'input': 'text(await tools.exec_command(' + json.dumps({'cmd': command, 'max_output_tokens': 4000}) + '));'}
+                else:
+                    item = {'id': f'msg_{number}', 'type': 'message', 'role': 'assistant',
+                            'content': [{'type': 'output_text', 'text': 'Local activation complete.', 'annotations': []}]}
+                events = [{'type': 'response.output_item.done', 'output_index': 0, 'item': item},
+                          {'type': 'response.completed', 'response': {'id': f'resp_{number}', 'status': 'completed',
+                            'output': [item], 'usage': {'input_tokens': 10, 'output_tokens': 10, 'total_tokens': 20}}}]
+                body = ''.join('event: ' + e['type'] + '\ndata: ' + json.dumps(e) + '\n\n' for e in events).encode()
+                self.send_response(200); self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+            except Exception as exc:
+                failures.append(str(exc))
+                try:
+                    self.send_error(500, 'local activation failed')
+                except OSError:
+                    pass
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server.daemon_threads = True
+    worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
+    options = settings(config)
+    options.update({'model': 'gpt-6-astra', 'model_reasoning_effort': 'high', 'model_provider': 'om_activation',
+                    'model_providers.om_activation.name': 'Local activation',
+                    'model_providers.om_activation.base_url': f'http://127.0.0.1:{server.server_port}/v1',
+                    'model_providers.om_activation.wire_api': 'responses',
+                    'model_providers.om_activation.requires_openai_auth': False,
+                    'sandbox_workspace_write.writable_roots': [str(workspace.resolve()), str(data.resolve())]})
+    session = None
+
+    def connect(which=home):
+        selected = dict(options)
+        if which == native:
+            selected['sandbox_workspace_write.writable_roots'] = [str(workspace.resolve())]
+        return ActivationSession(config.args.codex, workspace, {**env, 'CODEX_HOME': str(which)}, selected, local_budget)
+
+    def until(predicate):
+        while not predicate():
+            local_budget.check()
+            if failures:
+                raise HarnessError('local activation provider failed: ' + failures[0])
+            session.rpc.pump(.1)
+
+    def run_turn(name, thread=None):
+        phase.update(name=name, sent=False)
+        if thread is None:
+            thread = session.rpc.request('thread/start', {'model': 'gpt-6-astra', 'cwd': str(workspace),
+                'approvalPolicy': 'never', 'sandbox': 'workspace-write'})['thread']['id']
+        before, count = len(session.events), len(calls())
+        turn = session.rpc.request('turn/start', {'threadId': thread,
+            'input': [{'type': 'text', 'text': 'Check this isolated synthetic activation.'}]})['turn']['id']
+        if name == 'interrupt':
+            until(lambda: any(e.get('method') == 'item/started' and e.get('params', {}).get('turnId') == turn
+                              and e['params'].get('item', {}).get('type') == 'commandExecution' for e in session.events[before:]))
+            session.rpc.request('turn/interrupt', {'threadId': thread, 'turnId': turn})
+        until(lambda: any(e.get('method') == 'turn/completed' and e.get('params', {}).get('turn', {}).get('id') == turn
+                          for e in session.events[before:]))
+        # Hook completion can trail interrupted-turn completion by a short bounded interval.
+        if name == 'interrupt':
+            until(lambda: any(e.get('method') == 'hook/completed' and e['params']['run']['eventName'] == 'interrupt'
+                              for e in session.events[before:]))
+        evidence[name] = session.events[before:]
+        return thread, session.events[before:], calls()[count:]
+
+    def refused(name, operation):
+        try:
+            operation()
+        except HarnessError as exc:
+            controls[name] = {'refused': True, 'reason': str(exc),
+                'provenance': ('actual host turn and meter log' if name in ('untrusted', 'failed_prime', 'failed_hook')
+                               else 'actual hooks/list after isolated definition/config mutation')}
+        else:
+            raise HarnessError('activation negative control unexpectedly accepted: ' + name)
+
+    try:
+        session = connect(native)
+        native_listing = session.rpc.request('hooks/list', {'cwds': [str(workspace)]})
+        validate_hooks(native_listing, 'native', workspace)
+        native_config = session.rpc.request('config/read', {'cwd': str(workspace), 'includeLayers': True})['config']
+        _, native_events, _ = run_turn('native')
+        if any(e.get('method', '').startswith('hook/') for e in native_events):
+            raise HarnessError('native activation control unexpectedly executed hooks')
+        controls['native_zero_hooks'] = {'verified': True, 'provenance': 'actual native host turn and hooks/list'}
+        native_config = session.rpc.request('config/read', {'cwd': str(workspace), 'includeLayers': True})['config']
+        session.close(); session = connect()
+        listing = session.rpc.request('hooks/list', {'cwds': [str(workspace)]})
+        validate_hooks(listing, 'om', workspace, Path(binding['installed']))
+        thread, events, metered = run_turn('untrusted')
+        refused('untrusted', lambda: verify_intervention(events, metered, binding, thread, HOOKS, prime=True))
+        if metered:
+            raise HarnessError('untrusted activation control executed candidate')
+        evidence['untrusted'] = events
+        session.close(); session = None
+        hashes = trust_candidate(local_config, binding, local_budget, env, workspace, options)
+        binding['hooks'] = hashes
+        session = connect()
+        trusted = session.rpc.request('hooks/list', {'cwds': [str(workspace)]})
+        validate_hooks(trusted, 'om', workspace, Path(binding['installed']), hashes)
+        om_config = session.rpc.request('config/read', {'cwd': str(workspace), 'includeLayers': True})['config']
+        write_json(root / 'effective-configs.json', {'native': native_config, 'om': om_config})
+        if (effective_comparison(native_config, 'native', root / 'candidate-market')
+                != effective_comparison(om_config, 'om', root / 'candidate-market', hashes)):
+            raise HarnessError('local activation effective configurations differ beyond reviewed integration')
+        thread, events, metered = run_turn('prime')
+        startup = verify_intervention(events, metered, binding, thread,
+                                      {'sessionStart', 'userPromptSubmit', 'postToolUse', 'stop'}, prime=True)
+        evidence['startup'] = events
+        _, events, metered = run_turn('interrupt', thread)
+        interrupted = verify_intervention(events, metered, binding, thread, {'userPromptSubmit', 'interrupt'})
+        evidence['interrupt'] = events
+        thread, events, metered = run_turn('bad-prime')
+        refused('failed_prime', lambda: verify_intervention(events, metered, binding, thread,
+            {'sessionStart', 'userPromptSubmit', 'postToolUse', 'stop'}, prime=True))
+        evidence['failed_prime'] = events
+        real = data / 'bin/om-candidate'; mode = real.stat().st_mode
+        try:
+            real.chmod(0)
+            thread, events, metered = run_turn('failed-hook')
+            refused('failed_hook', lambda: verify_intervention(events, metered, binding, thread,
+                {'sessionStart', 'userPromptSubmit', 'postToolUse', 'stop'}, prime=True))
+            evidence['failed_hook'] = events
+        finally:
+            real.chmod(mode)
+        session.close(); session = None
+        hook_file = Path(binding['installed']) / 'hooks/hooks.json'; original = hook_file.read_bytes()
+        for label in ('missing', 'modified'):
+            try:
+                altered = json.loads(original)
+                if label == 'missing':
+                    del altered['hooks']['Interrupt']
+                else:
+                    altered['hooks']['SessionStart'][0]['hooks'][0]['timeout'] = 6
+                hook_file.write_text(json.dumps(altered))
+                session = connect()
+                changed = session.rpc.request('hooks/list', {'cwds': [str(workspace)]})
+                refused(label, lambda: validate_hooks(changed, 'om', workspace, Path(binding['installed']), hashes))
+            finally:
+                if session:
+                    session.close(); session = None
+                hook_file.write_bytes(original)
+        session = connect()
+        key = next(iter(hashes))
+        session.rpc.request('config/value/write', {'keyPath': 'hooks.state.' + json.dumps(key) + '.enabled',
+            'value': False, 'mergeStrategy': 'upsert', 'filePath': str(home / 'config.toml')})
+        disabled = session.rpc.request('hooks/list', {'cwds': [str(workspace)]})
+        refused('disabled', lambda: validate_hooks(disabled, 'om', workspace, Path(binding['installed']), hashes))
+        verify_activation_bytes(binding)
+        result = {'verified': True, 'kind': 'unauthenticated-local-stub', 'inference_requests': 0,
+                  'synthetic_provider_requests': len(requests), 'synthetic_usage_excluded': True,
+                  'effective_config_equivalent': True,
+                  'host': host, 'binding': binding, 'controls': controls, 'startup': startup, 'interrupt': interrupted,
+                  'compaction_coverage': 'not exercised; separate native compaction canary and live campaign'}
+        write_json(root / 'activation.json', result)
+        return result
+    finally:
+        primary = sys.exc_info()[1]
+        cleanup_errors = []
+        def cleanup(operation):
+            try:
+                operation()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if session:
+            cleanup(lambda: write_json(root / 'rpc-errors.json', session.errors))
+            cleanup(session.close)
+        cleanup(server.shutdown)
+        cleanup(server.server_close)
+        cleanup(lambda: worker.join(timeout=1))
+        cleanup(lambda: write_json(root / 'native-events.json', evidence))
+        cleanup(lambda: write_json(root / 'stub-requests.json', requests))
+        cleanup(lambda: write_json(root / 'meter-calls.json', calls()))
+        cleanup(lambda: write_json(root / 'controls.json', controls))
+        cleanup(budget.check)
+        if cleanup_errors and primary is None:
+            raise cleanup_errors[0]
 
 
 
@@ -1346,6 +1776,9 @@ class LiveVariant:
         self.transport = transport_factory(argv, env, workspace)
         self.transport.budget = variant.budget
         self.active_turn = None
+        self.fixture_index = 0
+        self.activation = getattr(config, 'activation', None) if variant.name == 'om' else None
+        self.activation_events, self.activation_evidence = [], None
         self.log = (config.output / (variant.name + '-events.jsonl')).open('w')
         self.rpc = RpcClient(self.transport.receive, self.transport.send, variant.budget, self.notify)
 
@@ -1355,11 +1788,28 @@ class LiveVariant:
         if self.variant.thread_id and p.get('threadId') == self.variant.thread_id:
             self.log.write(json.dumps(redact(event), ensure_ascii=False) + '\n')
             self.log.flush()
+            if event.get('method') == 'hook/completed':
+                if self.variant.name == 'native':
+                    raise HarnessError('native evaluation unexpectedly executed a hook')
+                if self.activation:
+                    verify_intervention([event], [], self.activation, self.variant.thread_id, set())
+            if (event.get('method') == 'hook/completed' or
+                    (event.get('method') == 'item/completed' and p.get('item', {}).get('type') == 'commandExecution')):
+                self.activation_events.append(event)
         self.variant.event(event)
 
     def preflight(self):
-        self.rpc.request('initialize', {'clientInfo': {'name': 'om_eval', 'title': 'OM evaluation', 'version': '1'}})
+        self.rpc.request('initialize', {'clientInfo': {'name': 'om_eval', 'title': 'OM evaluation', 'version': '1'},
+                                        'capabilities': {'experimentalApi': True}})
         self.transport.send({'method': 'initialized', 'params': {}})
+        listing = self.rpc.request('hooks/list', {'cwds': [str(self.workspace)]})
+        if self.variant.name == 'native':
+            validate_hooks(listing, 'native', self.workspace)
+        elif self.activation:
+            verify_activation_bytes(self.activation)
+            validate_hooks(listing, 'om', self.workspace, Path(self.activation['installed']), self.activation['hooks'])
+        else:
+            raise HarnessError('OM activation trust was not prepared')
         account = self.rpc.request('account/read', {'refreshToken': False}).get('account')
         if not account or account.get('type') != 'chatgpt':
             raise HarnessError('normal Codex ChatGPT sign-in required in each dedicated evaluation home')
@@ -1419,6 +1869,13 @@ class LiveVariant:
                 raise HarnessError('unmatched external instruction source: evaluation isolation failed')
 
     def turn(self, prompt, cycle=None, interrupt=False):
+        event_offset = len(self.activation_events)
+        call_offset = 0
+        if self.activation:
+            verify_activation_bytes(self.activation)
+            validate_hooks(self.rpc.request('hooks/list', {'cwds': [str(self.workspace)]}), 'om', self.workspace,
+                           Path(self.activation['installed']), self.activation['hooks'])
+            call_offset = len((Path(self.activation['data']) / 'calls.jsonl').read_text().splitlines())
         before = len(self.variant.usage.observations)
         effects_before = action_evidence(self.variant.fixture, self.workspace, cycle, before=True) if cycle else None
         response = self.rpc.request('turn/start', {'threadId': self.variant.thread_id,
@@ -1459,6 +1916,20 @@ class LiveVariant:
             except HarnessError:
                 self.rpc.pump(0.1)
         self.variant.require_usage_since(before, turn_id)
+        if self.activation:
+            required = {'userPromptSubmit', 'interrupt' if completed.get('status') == 'interrupted' else 'stop'}
+            if self.activation_evidence is None:
+                required |= {'sessionStart', 'postToolUse'}
+            deadline = time.monotonic() + min(3, self.variant.budget.remaining())
+            while not required <= {e['params']['run']['eventName'] for e in self.activation_events[event_offset:]
+                                   if e.get('method') == 'hook/completed'} and time.monotonic() < deadline:
+                self.rpc.pump(.1)
+            events = self.activation_events[event_offset:]
+            prime = any(e.get('method') == 'hook/completed' and e['params']['run']['eventName'] == 'sessionStart' for e in events)
+            calls = [json.loads(line) for line in (Path(self.activation['data']) / 'calls.jsonl').read_text().splitlines()[call_offset:]]
+            checked = verify_intervention(events, calls, self.activation, self.variant.thread_id, required, prime=prime)
+            if self.activation_evidence is None:
+                self.activation_evidence = checked
         if cycle is not None:
             values = list(self.variant.messages.get(turn_id, {}).values())
             try:
@@ -1474,17 +1945,26 @@ class LiveVariant:
             cycle = len(self.variant.compactions)
             self.turn(self.variant.fixture.probe_prompt(cycle), cycle=cycle)
 
-    def drive(self):
+    def fixture_turn(self, event):
+        prompt = event['text']
+        if self.variant.name == 'om':
+            prompt += '\n' + event.get('om_instruction', '')
+            prompt += '\nUse the installed $observational-memory skill for this task. ' \
+                      'Bulky tool logs may be explicitly deferred after identifying their source/span; ' \
+                      'keep their searchable evidence and honest coverage.'
+        self.turn(prompt, interrupt=event.get('interrupt', False))
+        self.recover()
+        self.fixture_index += 1
+
+    def begin_fixture(self):
         self.start()
-        for event in self.variant.fixture.workload['events']:
-            prompt = event['text']
-            if self.variant.name == 'om':
-                prompt += '\n' + event.get('om_instruction', '')
-                prompt += '\nUse the installed $observational-memory skill for this task. ' \
-                          'Bulky tool logs may be explicitly deferred after identifying their source/span; ' \
-                          'keep their searchable evidence and honest coverage.'
-            self.turn(prompt, interrupt=event.get('interrupt', False))
-            self.recover()
+        self.fixture_turn(self.variant.fixture.workload['events'][0])
+
+    def drive(self):
+        if self.variant.thread_id is None:
+            self.start()
+        for event in self.variant.fixture.workload['events'][self.fixture_index:]:
+            self.fixture_turn(event)
         verify_deferrals(self)
         index = 0
         while len(self.variant.compactions) < self.config.cycles:
@@ -1558,13 +2038,8 @@ def live(config, fixture, variants, budget, metadata):
     args = config.args
     protected = {Path.home() / '.codex/config.toml', Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')) / 'config.toml'}
     global_before = {str(p): digest(p.read_bytes()) if p.is_file() else None for p in protected}
-    homes = {name: getattr(args, name + '_home').resolve() for name in VARIANTS}
-    states = {name: validate_home(home) for name, home in homes.items()}
-    release_exposures = sorted({item for state in states.values() for item in state.get('release_exposures', [])})
-    if config.mode == 'release' and fixture.rubric_hash in release_exposures:
-        raise HarnessError('these release cases were already exposed in these homes; not fresh held-out evidence')
-    baselines = {}
-    envs = {name: process_env(home) for name, home in homes.items()}
+    homes, baselines = {}, {}
+    release_exposures = []
     errors = metadata['finalization_errors'] = []
     metadata['home_finalization'] = {}
     unsafe_homes = set()
@@ -1585,6 +2060,15 @@ def live(config, fixture, variants, budget, metadata):
             return {'status': 'failed', 'error': error['error']}
 
     try:
+        metadata['activation_canary'] = activation_check(config, budget)
+        if not metadata['activation_canary'].get('verified'):
+            raise HarnessError('local activation canary failed before paid work')
+        homes = {name: getattr(args, name + '_home').resolve() for name in VARIANTS}
+        states = {name: validate_home(home) for name, home in homes.items()}
+        release_exposures = sorted({item for state in states.values() for item in state.get('release_exposures', [])})
+        if config.mode == 'release' and fixture.rubric_hash in release_exposures:
+            raise HarnessError('these release cases were already exposed in these homes; not fresh held-out evidence')
+        envs = {name: process_env(home) for name, home in homes.items()}
         for name, home in homes.items():
             baselines[name] = prepare_home(home, config.output)
         metadata['host'] = schema_preflight(args.codex, config.output / 'host-schema', budget, envs['native'])
@@ -1592,6 +2076,10 @@ def live(config, fixture, variants, budget, metadata):
         data = Path(metadata['candidate']['data'])
         meter = install_meter(data)
         metadata['meter_sha256'] = digest((data / 'bin/om').read_bytes())
+        unsafe_homes.add('om')  # Trust setup also owns App Server processes.
+        config.activation = prepare_live_activation(config, metadata['candidate'], budget, envs['om'])
+        unsafe_homes.discard('om')
+        metadata['activation_binding'] = config.activation
         metadata['meter_staging'] = {'command': 'scoped PATH assignment to metered om',
             'owned_stop_prompt': 'exact per-session emitted-to-native mapping before hook delivery',
             'candidate_bytes_unchanged': True}
@@ -1606,13 +2094,17 @@ def live(config, fixture, variants, budget, metadata):
                 client.preflight()
             # Validate the exact staged integration before excluding its entries.
             compared = {name: effective_comparison(variants[name].effective['config'], name,
-                                                  config.output / 'candidate-market') for name in VARIANTS}
+                        config.output / 'candidate-market', config.activation['hooks'] if name == 'om' else None) for name in VARIANTS}
             if compared['native'] != compared['om']:
                 raise HarnessError('native and OM effective configurations are not equivalent')
             if variants['native'].effective['base_skills'] != variants['om'].effective['base_skills']:
                 raise HarnessError('native and OM base skill/tool opportunities differ')
             if config.mode == 'release':
                 release_exposures.append(fixture.rubric_hash)
+            clients[1].begin_fixture()
+            metadata['om_activation'] = clients[1].activation_evidence
+            if not (metadata['om_activation'] or {}).get('verified'):
+                raise HarnessError('OM activation failed before matched workload batches')
             for client in clients:
                 client.drive()
         finally:
@@ -1641,6 +2133,9 @@ def live(config, fixture, variants, budget, metadata):
             finalize('candidate integrity', candidate_check)
     except BaseException as exc:
         primary_error = exc
+        if metadata.get('om_activation'):
+            metadata['om_activation']['verified'] = False
+            metadata['om_activation']['error'] = 'live intervention run did not complete successfully'
         raise  # Preserve the original failure, including operator interruption.
     finally:
         for name, home in homes.items():
@@ -1667,7 +2162,14 @@ def live(config, fixture, variants, budget, metadata):
 
 
 def output_results(config, fixture, variants, budget, metadata, error):
+    invalid_activation = config.mode in ('pilot', 'release') and not (metadata.get('om_activation') or {}).get('verified')
+    if invalid_activation:
+        error = error or 'OM activation not verified; intervention is invalid'
     comparison = quality(variants['native'], variants['om'], config.cycles)
+    if invalid_activation:
+        comparison['quality_pass'] = False
+        comparison['comparison'] = 'not established'
+        comparison['eligibility_reasons'].append('OM intervention validity was not established')
     counts_complete = all(v.scorecard()['actual_compactions'] == config.cycles and
                           v.scorecard()['scored_recoveries'] == config.cycles for v in variants.values())
     status = 'failed' if error else ('complete' if counts_complete else 'incomplete')
@@ -1731,6 +2233,16 @@ def output_results(config, fixture, variants, budget, metadata, error):
 def main(argv=None):
     try:
         config = parse_args(argv)
+        if config.mode == 'activation-check':
+            config.output.mkdir(parents=True, exist_ok=False)
+            try:
+                result = activation_check(config, RunBudget(min(120, config.args.max_seconds or 120), None))
+            except (HarnessError, OSError, ValueError, KeyError, TypeError) as exc:
+                result = {'verified': False, 'kind': 'unauthenticated-local-stub', 'error': str(exc),
+                          'inference_requests': 0, 'synthetic_usage_excluded': True}
+            write_json(config.output / 'activation.json', result)
+            print(str(config.output / 'activation.json'))
+            return 0 if result['verified'] else 1
         fixture = Fixture.load(config.args.fixture.resolve(), config.split)
         if config.args.frozen_split_hash:
             fixture.check_hash(config.args.frozen_split_hash)

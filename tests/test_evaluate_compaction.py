@@ -25,6 +25,22 @@ def compact(thread, ident, kind='contextCompaction'):
             'item': {'id': ident, 'type': kind}}}
 
 
+def fake_hook_listing(workspace, installed, trusted=False):
+    hooks = []
+    for event, key, timeout, limit in (
+        ('sessionStart', 'session_start', 5, 2500), ('userPromptSubmit', 'user_prompt_submit', 5, None),
+        ('postToolUse', 'post_tool_use', 5, None), ('stop', 'stop', 5, None), ('interrupt', 'interrupt', 3, None)):
+        hooks.append({'key': f'observational-memory@om-evaluation:hooks/hooks.json:{key}:0:0',
+            'eventName': event, 'handlerType': 'command',
+            'command': f'sh "{installed.resolve()}/scripts/run.sh" hook --client codex',
+            'async': False, 'matcher': None, 'timeoutSec': timeout, 'statusMessage': None,
+            'additionalContextLimit': limit, 'sourcePath': str(installed.resolve() / 'hooks/hooks.json'),
+            'source': 'plugin', 'pluginId': 'observational-memory@om-evaluation', 'displayOrder': len(hooks),
+            'enabled': True, 'isManaged': False, 'currentHash': 'sha256:' + str(len(hooks)) * 64,
+            'trustStatus': 'trusted' if trusted else 'untrusted'})
+    return {'data': [{'cwd': str(workspace), 'hooks': hooks, 'warnings': [], 'errors': []}]}
+
+
 class HarnessTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -291,7 +307,7 @@ class FakeHost:
     """Independent scripted App Server transport; no model/subprocess or gold access."""
     def __init__(self, argv, env, cwd):
         self.queue, self.sent, self.closed = [], [], False
-        self.skills = []
+        self.skills, self.hooks = [], []
         self.cwd, self.input, self.turn_count = Path(cwd).resolve(), 0, 0
         self.thread = 'test-thread'
         self.config = {}
@@ -304,7 +320,7 @@ class FakeHost:
                     self.config.setdefault(root, {})[key] = value
                 else:
                     self.config[key] = value
-        self.config.update({'compact_prompt': None, 'model_context_window': None, 'plugins': {}, 'marketplaces': {}})
+        self.config.update({'compact_prompt': None, 'model_context_window': None, 'plugins': {}, 'marketplaces': {}, 'hooks': None})
 
     def send(self, request):
         self.sent.append(request)
@@ -318,6 +334,8 @@ class FakeHost:
             result = {'config': self.config}
         elif method == 'skills/list':
             result = {'data': [{'skills': self.skills, 'errors': []}]}
+        elif method == 'hooks/list':
+            result = {'data': [{'cwd': str(self.cwd), 'hooks': self.hooks, 'warnings': [], 'errors': []}]}
         elif method == 'model/list':
             result = {'data': [{'model': 'test-model', 'hidden': False,
                                'supportedReasoningEfforts': [{'reasoningEffort': 'high'}]}]}
@@ -544,6 +562,9 @@ class HomeLifecycleTests(unittest.TestCase):
             (om / 'cache').mkdir(); (om / 'cache/owned').write_text('host state')
             raise evalmod.HarnessError('original preflight failure')
         with patch.object(evalmod, 'schema_preflight', side_effect=fail), \
+             patch.object(evalmod, 'activation_check', return_value={'verified': True}), \
+             patch.object(Path, 'home', return_value=self.path / 'synthetic-user'), \
+             patch.dict(evalmod.os.environ, {'CODEX_HOME': str(self.path / 'synthetic-user/.codex')}), \
              patch.object(evalmod.subprocess, 'Popen', side_effect=AssertionError('model spawn')):
             with self.assertRaisesRegex(evalmod.HarnessError, '^original preflight failure$'):
                 evalmod.live(config, fixture, variants, budget, metadata)
@@ -558,6 +579,29 @@ class HomeLifecycleTests(unittest.TestCase):
         self.assertIsNone(variants['native'].usage.totals()['inputTokens'])
         for home in (native, om):
             self.assertEqual((home / 'auth.json').read_text(), 'private-normal-login')
+
+    def test_failed_activation_shutdown_leaves_om_ownership_incomplete(self):
+        import argparse
+        native, om = self.home('trust-native'), self.home('trust-om')
+        data = self.path / 'staged'; (data / 'bin').mkdir(parents=True)
+        (data / 'bin/om').write_text('meter')
+        config = evalmod.RunConfig('pilot', self.path, 1, 200000, 'total', 'pilot',
+            argparse.Namespace(native_home=native, om_home=om, codex='unused'))
+        metadata = {}
+        with patch.object(evalmod, 'activation_check', return_value={'verified': True}), \
+             patch.object(evalmod, 'schema_preflight', return_value={}), \
+             patch.object(evalmod, 'stage_plugin', return_value={'data': str(data)}), \
+             patch.object(evalmod, 'install_meter', return_value=data / 'calls.jsonl'), \
+             patch.object(evalmod, 'prepare_live_activation', side_effect=KeyboardInterrupt('trust shutdown')), \
+             patch.object(Path, 'home', return_value=self.path / 'synthetic-user'), \
+             patch.dict(evalmod.os.environ, {'CODEX_HOME': str(self.path / 'synthetic-user/.codex')}):
+            with self.assertRaisesRegex(KeyboardInterrupt, 'trust shutdown'):
+                evalmod.live(config, self.fixture, {}, evalmod.RunBudget(20, 1000), metadata)
+        self.assertEqual(metadata['home_finalization']['native']['status'], 'complete')
+        self.assertEqual(metadata['home_finalization']['om']['status'], 'failed')
+        self.assertTrue(metadata['global_config_unchanged'])
+        with self.assertRaisesRegex(evalmod.HarnessError, 'incomplete'):
+            evalmod.validate_home(om)
 
     def test_both_home_errors_and_global_drift_remain_visible_with_primary_error(self):
         import argparse, os
@@ -576,6 +620,7 @@ class HomeLifecycleTests(unittest.TestCase):
             global_config.write_text('simulated external drift')
             raise evalmod.HarnessError('original failure')
         with patch.object(evalmod, 'schema_preflight', side_effect=fail), \
+             patch.object(evalmod, 'activation_check', return_value={'verified': True}), \
              patch.object(Path, 'home', return_value=protected.parent), \
              patch.dict(os.environ, {'CODEX_HOME': str(protected)}), \
              patch.object(evalmod.subprocess, 'Popen', side_effect=AssertionError('model spawn')):
@@ -662,6 +707,142 @@ class OMAndShutdownTests(unittest.TestCase):
         self.assertEqual(result['status'], 'failed')
         self.assertFalse(result['release_pass'])
 
+class ActivationTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+
+    def listing(self):
+        installed = self.path / 'plugin'; installed.mkdir()
+        workspace = self.path / 'workspace'; workspace.mkdir()
+        return fake_hook_listing(workspace, installed), workspace, installed
+
+    def test_only_exact_five_candidate_hooks_can_be_trusted(self):
+        listing, workspace, installed = self.listing()
+        hashes = evalmod.validate_hooks(listing, 'om', workspace, installed)
+        self.assertEqual(len(hashes), 5)
+        for mutate in (lambda h: h.pop(), lambda h: h.append(copy.deepcopy(h[0])),
+                       lambda h: h[0].update({'enabled': False}), lambda h: h[0].update({'trustStatus': 'modified'}),
+                       lambda h: h[0].update({'command': 'sh /other/run.sh'}),
+                       lambda h: h[0].update({'sourcePath': '/other/hooks.json'}),
+                       lambda h: h[0].update({'timeoutSec': 6}), lambda h: h[0].update({'async': True}),
+                       lambda h: h[0].update({'matcher': 'startup'}), lambda h: h[0].update({'pluginId': 'other'})):
+            changed = copy.deepcopy(listing); mutate(changed['data'][0]['hooks'])
+            with self.assertRaises(evalmod.HarnessError):
+                evalmod.validate_hooks(changed, 'om', workspace, installed)
+        with self.assertRaises(evalmod.HarnessError):
+            evalmod.validate_hooks(listing, 'native', workspace)
+        listing['data'][0]['hooks'] = []
+        self.assertEqual(evalmod.validate_hooks(listing, 'native', workspace), {})
+
+    def test_revalidation_never_accepts_modified_or_missing_trust(self):
+        listing, workspace, installed = self.listing()
+        expected = evalmod.validate_hooks(listing, 'om', workspace, installed)
+        with self.assertRaises(evalmod.HarnessError):
+            evalmod.validate_hooks(listing, 'om', workspace, installed, expected)
+        for hook in listing['data'][0]['hooks']:
+            hook['trustStatus'] = 'trusted'
+        self.assertEqual(evalmod.validate_hooks(listing, 'om', workspace, installed, expected), expected)
+        listing['data'][0]['hooks'][0]['currentHash'] = 'sha256:' + 'f' * 64
+        with self.assertRaises(evalmod.HarnessError):
+            evalmod.validate_hooks(listing, 'om', workspace, installed, expected)
+
+    def test_missing_activation_is_a_failure_in_both_paid_modes(self):
+        for mode in ('pilot', 'release'):
+            config = DriverTests.config(self); config.mode = mode
+            variants = {name: evalmod.VariantRun(name, self.fixture, evalmod.RunBudget(30, 10000)) for name in evalmod.VARIANTS}
+            result = evalmod.output_results(config, self.fixture, variants, variants['om'].budget,
+                                           {'om_plugin_verified': False}, None)
+            self.assertEqual(result['status'], 'failed')
+            self.assertFalse(result['quality']['quality_pass'])
+            self.assertTrue(any('activation' in reason for reason in result['eligibility_reasons']))
+
+    def test_canary_failure_checks_global_config_without_preparing_live_homes(self):
+        config = DriverTests.config(self)
+        global_dir = self.path / 'global'; global_dir.mkdir()
+        global_config = global_dir / 'config.toml'; global_config.write_text('original')
+        def failed(*args):
+            global_config.write_text('changed')
+            raise evalmod.HarnessError('primary canary failure')
+        metadata = {}
+        with patch.object(Path, 'home', return_value=self.path / 'synthetic-user'), \
+             patch.dict(evalmod.os.environ, {'CODEX_HOME': str(global_dir)}), \
+             patch.object(evalmod, 'activation_check', side_effect=failed), \
+             patch.object(evalmod, 'prepare_home', side_effect=AssertionError('live home touched')):
+            with self.assertRaisesRegex(evalmod.HarnessError, 'primary canary failure'):
+                evalmod.live(config, self.fixture, {}, evalmod.RunBudget(20, 1000), metadata)
+        self.assertFalse(metadata['global_config_unchanged'])
+        self.assertEqual(metadata['global_config_finalization']['status'], 'failed')
+        self.assertEqual(metadata['home_finalization'], {})
+
+    def test_initialize_failure_always_closes_new_transport_and_preserves_failure(self):
+        from unittest.mock import Mock
+        for close_error in (None, KeyboardInterrupt()):
+            transport = Mock()
+            transport.close.side_effect = close_error
+            with patch.object(evalmod, 'ProcessTransport', return_value=transport), \
+                 patch.object(evalmod.RpcClient, 'request', side_effect=evalmod.HarnessError('initialize failed')):
+                with self.assertRaisesRegex(evalmod.HarnessError, 'initialize failed'):
+                    evalmod.ActivationSession('unused', self.path, {}, {}, evalmod.RunBudget(5, None))
+            transport.close.assert_called_once()
+
+    def test_binding_rejects_each_changed_component(self):
+        installed = self.path / 'plugin'; installed.mkdir()
+        script = installed / 'run.sh'; script.write_text('reviewed script')
+        data = self.path / 'data'; (data / 'bin').mkdir(parents=True)
+        candidate = data / 'bin/om-candidate'; candidate.write_text('candidate')
+        meter = data / 'bin/om'; meter.write_text('meter')
+        binding = {'installed': str(installed), 'data': str(data), 'plugin_sha256': evalmod.tree_hash(installed),
+                   'candidate_sha256': evalmod.digest(candidate.read_bytes()), 'meter_sha256': evalmod.digest(meter.read_bytes())}
+        evalmod.verify_activation_bytes(binding)
+        for path in (script, candidate, meter):
+            original = path.read_bytes(); path.write_bytes(b'changed')
+            with self.assertRaisesRegex(evalmod.HarnessError, 'bytes changed'):
+                evalmod.verify_activation_bytes(binding)
+            path.write_bytes(original)
+
+    def test_complete_hook_set_is_checked_before_any_trust_write(self):
+        from unittest.mock import Mock
+        listing, workspace, installed = self.listing()
+        listing['data'][0]['hooks'].pop()
+        session = Mock(); session.rpc.request.return_value = listing
+        with patch.object(evalmod, 'verify_activation_bytes'), \
+             patch.object(evalmod, 'ActivationSession', return_value=session):
+            with self.assertRaises(evalmod.HarnessError):
+                evalmod.trust_candidate(DriverTests.config(self), {'installed': str(installed)},
+                    evalmod.RunBudget(5, None), {'CODEX_HOME': str(self.path)}, workspace, {})
+        self.assertEqual([call.args[0] for call in session.rpc.request.call_args_list], ['hooks/list'])
+        session.close.assert_called_once()
+
+    def test_intervention_requires_owned_native_and_metered_success(self):
+        binding = {'installed': '/isolated/plugin'}
+        event = {'method': 'hook/completed', 'params': {'threadId': 'owned', 'run': {
+            'eventName': 'userPromptSubmit', 'source': 'plugin', 'sourcePath': '/isolated/plugin/hooks/hooks.json',
+            'handlerType': 'command', 'executionMode': 'sync', 'status': 'completed', 'entries': []}}}
+        call = {'session': 'owned', 'hook': True, 'hook_event': 'UserPromptSubmit', 'exit_code': 0}
+        self.assertTrue(evalmod.verify_intervention([event], [call], binding, 'owned', {'userPromptSubmit'})['verified'])
+        for events, calls in (([], [call]), ([event], []), ([event], [{**call, 'session': 'other'}]),
+                              ([event], [{**call, 'exit_code': 1}]),
+                              ([event], [call, {'session': 'owned', 'command': 'prime', 'prime_valid': False}])):
+            with self.assertRaises(evalmod.HarnessError):
+                evalmod.verify_intervention(events, calls, binding, 'owned', {'userPromptSubmit'})
+        with self.assertRaisesRegex(evalmod.HarnessError, 'hook-delivered prime'):
+            evalmod.verify_intervention([event], [call, {'session': 'owned', 'command': 'prime', 'prime_valid': True}],
+                                        binding, 'owned', {'userPromptSubmit'}, prime=True)
+
+    def test_public_activation_timeout_and_separate_result(self):
+        binary = self.path / 'om'; binary.write_text('candidate'); binary.chmod(0o700)
+        plugin = self.path / 'plugin'; plugin.mkdir()
+        output = self.path / 'proof'
+        def check(config, budget):
+            self.assertEqual(budget.max_seconds, 7)
+            self.assertIsNone(budget.max_input_tokens)
+            return {'verified': True, 'synthetic_usage_excluded': True}
+        with patch.object(evalmod, 'activation_check', side_effect=check):
+            self.assertEqual(evalmod.main(['--mode', 'activation-check', '--output', str(output),
+                '--om-binary', str(binary), '--plugin-root', str(plugin), '--max-seconds', '7']), 0)
+        self.assertTrue((output / 'activation.json').is_file())
+        self.assertFalse((output / 'results.json').exists())
+
+
 class EffectiveComparisonTests(unittest.TestCase):
     setUp = HarnessTests.setUp
 
@@ -676,6 +857,25 @@ class EffectiveComparisonTests(unittest.TestCase):
         om['marketplaces'] = {'om-evaluation': {'source_type': 'local', 'source': str(market.resolve()),
             'ref': None, 'last_revision': None, 'last_updated': None, 'sparse_paths': None}}
         return native, om, market
+
+    def test_actual_serialized_hook_defaults_normalize_only_reviewed_trust(self):
+        native, om, market = self.configs()
+        native['hooks'] = None
+        hashes = {'reviewed': 'sha256:' + 'a' * 64}
+        om['hooks'] = {event: [] for event in ('Interrupt', 'PermissionRequest', 'PostCompact', 'PostToolUse',
+            'PreCompact', 'PreToolUse', 'SessionEnd', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop', 'UserPromptSubmit')}
+        om['hooks']['state'] = {'reviewed': {'trusted_hash': hashes['reviewed']}}
+        expected = evalmod.effective_comparison(native, 'native', market)
+        self.assertEqual(expected, evalmod.effective_comparison(om, 'om', market, hashes))
+        for mutate in (lambda h: h.update({'unknown': []}), lambda h: h['SessionStart'].append({'command': 'extra'}),
+                       lambda h: h['state'].update({'other': {'trusted_hash': 'extra'}})):
+            changed = copy.deepcopy(om); mutate(changed['hooks'])
+            self.assertNotEqual(expected, evalmod.effective_comparison(changed, 'om', market, hashes))
+        for value in (None, {}, {'reviewed': {'trusted_hash': 'changed'}},
+                      {'reviewed': {'trusted_hash': hashes['reviewed'], 'enabled': True}}):
+            changed = copy.deepcopy(om); changed['hooks']['state'] = value
+            with self.assertRaises(evalmod.HarnessError):
+                evalmod.effective_comparison(changed, 'om', market, hashes)
 
     def test_only_intended_entries_are_normalized_without_mutating_inputs(self):
         native, om, market = self.configs()
@@ -783,6 +983,40 @@ class MatchedRunTests(unittest.TestCase):
 
                     self.skills = [{'name': 'observational-memory:observational-memory',
                                     'pluginId': 'observational-memory@om-evaluation', 'scope': 'user', 'enabled': True}]
+                    self.hooks = fake_hook_listing(self.cwd, plugin, True)['data'][0]['hooks']
+                    self.config['hooks'] = {event: [] for event in ('Interrupt', 'PermissionRequest', 'PostCompact', 'PostToolUse',
+                        'PreCompact', 'PreToolUse', 'SessionEnd', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop', 'UserPromptSubmit')}
+                    self.config['hooks']['state'] = {h['key']: {'trusted_hash': h['currentHash']} for h in self.hooks}
+
+                def send(self, request):
+                    super().send(request)
+                    if request.get('method') != 'turn/start':
+                        return
+                    tid = f't{self.turn_count}'
+                    prime = self.turn_count == 1 or 'Analyze new incident' in request['params']['input'][0]['text']
+                    names = [('sessionStart', 'SessionStart')] if prime else []
+                    names += [('userPromptSubmit', 'UserPromptSubmit'), ('postToolUse', 'PostToolUse'), ('stop', 'Stop')]
+                    data = om_home / 'plugins/data/store'
+                    command = f"PATH='{data}/bin' om --store '{data}' --session '{self.thread}'"
+                    records, events = [], []
+                    for event, raw in names:
+                        run = {'eventName': event, 'source': 'plugin', 'sourcePath': str(plugin.resolve() / 'hooks/hooks.json'),
+                               'handlerType': 'command', 'executionMode': 'sync', 'status': 'completed',
+                               'entries': [{'kind': 'context', 'text': 'Ledger command: ' + command + '. Review one page.'}] if event == 'sessionStart' else []}
+                        events.append({'method': 'hook/completed', 'params': {'threadId': self.thread, 'turnId': tid, 'run': run}})
+                        records.append({'session': self.thread, 'command': 'hook', 'hook': True, 'hook_event': raw,
+                                        'exit_code': 0, 'hook_unavailable': False, 'input_bytes': 5, 'output_bytes': 7})
+                    if prime and not getattr(self, 'omit_prime', False):
+                        events.append({'method': 'item/completed', 'params': {'threadId': self.thread, 'turnId': tid,
+                            'item': {'id': 'prime-' + tid, 'type': 'commandExecution', 'exitCode': 0,
+                                     'aggregatedOutput': 'Session: ' + json.dumps(self.thread),
+                                     'commandActions': [{'command': command + ' prime'}]}}})
+                        records.append({'session': self.thread, 'command': 'prime', 'prime_valid': True,
+                                        'hook': False, 'exit_code': 0, 'input_bytes': 0, 'output_bytes': 100})
+                    self.queue[0:0] = events
+                    with (data / 'calls.jsonl').open('a') as log:
+                        for record in records:
+                            log.write(json.dumps(record) + '\n')
 
             clients = []
 
@@ -797,7 +1031,15 @@ class MatchedRunTests(unittest.TestCase):
             def stage(cfg, run_budget):
                 data = om_home / 'plugins/data/store'; (data / 'bin').mkdir(parents=True)
                 (data / 'bin/om').write_text('meter')
+                (data / 'bin/om-candidate').write_bytes(candidate.read_bytes())
                 return {'data': str(data)}
+
+            def activation(cfg, staged, run_budget, env):
+                data = Path(staged['data'])
+                return {'installed': str(plugin.resolve()), 'data': str(data.resolve()),
+                        'plugin_sha256': evalmod.tree_hash(plugin), 'candidate_sha256': evalmod.digest(candidate.read_bytes()),
+                        'meter_sha256': evalmod.digest((data / 'bin/om').read_bytes()),
+                        'hooks': {h['key']: h['currentHash'] for h in fake_hook_listing(self.path, plugin, True)['data'][0]['hooks']}}
 
             def meter(data):
                 path = data / 'calls.jsonl'
@@ -805,6 +1047,10 @@ class MatchedRunTests(unittest.TestCase):
                 return path
 
             with patch.object(evalmod, 'schema_preflight', return_value={'version': 'fake'}), \
+                 patch.object(Path, 'home', return_value=self.path / 'synthetic-user'), \
+                 patch.dict(evalmod.os.environ, {'CODEX_HOME': str(self.path / 'synthetic-user/.codex')}), \
+                 patch.object(evalmod, 'activation_check', return_value={'verified': True, 'synthetic_usage_excluded': True}), \
+                 patch.object(evalmod, 'prepare_live_activation', side_effect=activation), \
                  patch.object(evalmod, 'stage_plugin', side_effect=stage), \
                  patch.object(evalmod, 'install_meter', side_effect=meter), \
                  patch.object(evalmod, 'LiveVariant', side_effect=make_client), \
@@ -815,7 +1061,15 @@ class MatchedRunTests(unittest.TestCase):
                     result = evalmod.output_results(config, fixture, variants, budget, meta, str(caught.exception))
                     self.assertEqual(result['status'], 'failed')
                     self.assertEqual(len(clients), 2)
-                    if finalization:
+                    if error == 'OM activation missing successful hook-delivered prime command':
+                        self.assertGreater(result['budget']['observed_input_tokens'], 0)
+                        self.assertIsNone(variants['native'].usage.totals()['inputTokens'])
+                        self.assertEqual(variants['om'].workload_batches, [])
+                        self.assertEqual(variants['native'].workload_batches, [])
+                        self.assertFalse(result['quality']['quality_pass'])
+                        self.assertFalse({'thread/start', 'turn/start'} &
+                                         {r.get('method') for r in clients[0].transport.sent})
+                    elif finalization:
                         self.assertEqual(result['budget']['observed_input_tokens'], 1080)
                         self.assertEqual([len(v.probes) for v in variants.values()], [2, 2])
                         self.assertTrue(meta['finalization_errors'])
@@ -856,6 +1110,12 @@ class MatchedRunTests(unittest.TestCase):
 
     def test_both_live_variants_share_budget_and_can_reuse_homes(self):
         self.run_matched()
+
+    def test_missing_actual_prime_stops_before_native_work_and_retains_om_input(self):
+        def mutate(name, host):
+            if name == 'om':
+                host.omit_prime = True
+        self.run_matched(mutate, 'OM activation missing successful hook-delivered prime command')
 
     def test_finalization_failure_cannot_turn_completed_work_into_success(self):
         def mutate(name, host):
@@ -1198,7 +1458,7 @@ class CorrectiveRegressionTests(unittest.TestCase):
         om.deferral_evidence = {'verified': True}
         config = DriverTests.config(self); config.mode = 'release'; config.cycles = 50
         result = evalmod.output_results(config, self.fixture, {'native': native, 'om': om},
-                                       self.budget(), {'om_plugin_verified': True}, None)
+                                       self.budget(), {'om_plugin_verified': True, 'om_activation': {'verified': True}}, None)
         self.assertTrue(result['quality']['quality_pass'])
         self.assertFalse(result['release_pass'])
         self.assertEqual(len(result['eligibility_reasons']), 2)

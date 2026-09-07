@@ -33,6 +33,51 @@ hooks/ledger commands, including quoted paths and session names. An explicit
 integration checks. Set the ordinary Go cache environment when needed. No model
 or authentication calls are involved.
 
+## Local activation proof
+
+```sh
+python3 scripts/evaluate_compaction.py --mode activation-check \
+  --output /absolute/fresh/activation-proof --om-binary /absolute/candidate/om \
+  --plugin-root /absolute/observational-memory --codex codex --max-seconds 120
+```
+
+This public entry point runs the production plugin staging and meter against a
+loopback Responses stub in new unauthenticated homes. It uses normal
+`workspace-write` sandboxing and never calls an inference provider or reads an
+account. The default and maximum wall ceiling are 120 seconds; a smaller explicit
+`--max-seconds` tightens it. A failed or timed-out check returns nonzero. Dedicated
+live homes and paid/model flags are refused. On hosts that prohibit nested sandbox
+creation, run the parent command outside that enclosing sandbox while retaining
+the App Server's normal sandbox policy.
+
+`activation.json` records candidate, installed plugin and meter hashes; actual
+SessionStart, UserPromptSubmit, PostToolUse, Stop and Interrupt evidence; the
+successful native command executing the hook-delivered `prime`; effective config
+equivalence; and negative-control provenance. Native-zero, untrusted, failed-hook
+and failed-prime controls execute actual host turns. Missing/modified definitions
+and disabled hooks are checked with actual `hooks/list` after isolated mutations.
+Raw native notifications, metered calls and stub requests live under `activation/`.
+Synthetic provider token metadata is separate and never contributes quality,
+release scores or live input consumption. Manual compaction is not exercised by
+this check; the separate native compaction canary and live campaign cover it.
+
+Both live modes run this check before preparing signed-in homes, within the
+existing whole-run wall ceiling. Before trusting anything, the runner validates
+all five exact staged hook definitions and referenced plugin/candidate/meter
+bytes. It writes only their reviewed hashes to the dedicated OM home, verifies
+them through a fresh server, and checks identities again before every live turn.
+Native hooks and unexpected definitions are refused. Only reviewed trust entries
+and their exact serialized empty defaults are normalized in config comparison;
+all residual settings remain comparable.
+
+The first original OM fixture turn establishes actual live hooks and prime before
+native workload execution or either variant's generated batches. Its original
+prompt and all reported input usage remain part of the run. Each following OM
+turn must retain actual native and metered lifecycle evidence. Missing or failed
+activation makes either paid mode invalid and cannot produce a quality tie or
+release PASS. This changes the runner's frozen hash; preserve old pilot artifacts
+and generate a new preview before any separately authorized live attempt.
+
 The fixture separates model-visible files/events from gold cases. It includes
 repeated corrections, rejected proposals, a completed migration, a changed
 objective, an interrupted turn, Unicode and a 48KB log with a middle error.
