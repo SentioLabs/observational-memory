@@ -1917,16 +1917,29 @@ class LiveVariant:
                 self.rpc.pump(0.1)
         self.variant.require_usage_since(before, turn_id)
         if self.activation:
+            def current_events():
+                return [e for e in self.activation_events[event_offset:] if e['params'].get('turnId') == turn_id]
+
             required = {'userPromptSubmit', 'interrupt' if completed.get('status') == 'interrupted' else 'stop'}
             if self.activation_evidence is None:
                 required |= {'sessionStart', 'postToolUse'}
+            # A later completed command still needs actual tool capture. An
+            # interrupted command instead supplies the Interrupt lifecycle.
+            if completed.get('status') == 'completed' and any(
+                    e.get('method') == 'item/completed' and e['params'].get('item', {}).get('type') == 'commandExecution'
+                    for e in current_events()):
+                required.add('postToolUse')
             deadline = time.monotonic() + min(3, self.variant.budget.remaining())
-            while not required <= {e['params']['run']['eventName'] for e in self.activation_events[event_offset:]
+            while not required <= {e['params']['run']['eventName'] for e in current_events()
                                    if e.get('method') == 'hook/completed'} and time.monotonic() < deadline:
                 self.rpc.pump(.1)
-            events = self.activation_events[event_offset:]
+            events = current_events()
             prime = any(e.get('method') == 'hook/completed' and e['params']['run']['eventName'] == 'sessionStart' for e in events)
             calls = [json.loads(line) for line in (Path(self.activation['data']) / 'calls.jsonl').read_text().splitlines()[call_offset:]]
+            # SessionStart and ledger CLI commands omit turn_id; turn-scoped
+            # metered hooks must belong to this turn, not a delayed prior call.
+            calls = [c for c in calls if not c.get('hook') or c.get('hook_event') == 'SessionStart'
+                     or c.get('turn_id') == turn_id]
             checked = verify_intervention(events, calls, self.activation, self.variant.thread_id, required, prime=prime)
             if self.activation_evidence is None:
                 self.activation_evidence = checked

@@ -74,6 +74,10 @@ The first original OM fixture turn establishes actual live hooks and prime befor
 native workload execution or either variant's generated batches. Its original
 prompt and all reported input usage remain part of the run. Each following OM
 turn must retain actual native and metered lifecycle evidence. Missing or failed
+PostToolUse after a normally completed command invalidates that turn, including
+after startup; delayed evidence from an earlier turn cannot satisfy it. A turn
+without a completed command does not require PostToolUse, and interrupted commands
+retain their distinct Interrupt obligation. Missing or failed
 activation makes either paid mode invalid and cannot produce a quality tie or
 release PASS. This changes the runner's frozen hash; preserve old pilot artifacts
 and generate a new preview before any separately authorized live attempt.

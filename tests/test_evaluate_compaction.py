@@ -996,6 +996,9 @@ class MatchedRunTests(unittest.TestCase):
                     prime = self.turn_count == 1 or 'Analyze new incident' in request['params']['input'][0]['text']
                     names = [('sessionStart', 'SessionStart')] if prime else []
                     names += [('userPromptSubmit', 'UserPromptSubmit'), ('postToolUse', 'PostToolUse'), ('stop', 'Stop')]
+                    omit_post = getattr(self, 'omit_later_post', None) if self.turn_count > 1 else None
+                    if getattr(self, 'no_tool_post', False) and not prime:
+                        names.remove(('postToolUse', 'PostToolUse'))
                     data = om_home / 'plugins/data/store'
                     command = f"PATH='{data}/bin' om --store '{data}' --session '{self.thread}'"
                     records, events = [], []
@@ -1004,7 +1007,7 @@ class MatchedRunTests(unittest.TestCase):
                                'handlerType': 'command', 'executionMode': 'sync', 'status': 'completed',
                                'entries': [{'kind': 'context', 'text': 'Ledger command: ' + command + '. Review one page.'}] if event == 'sessionStart' else []}
                         events.append({'method': 'hook/completed', 'params': {'threadId': self.thread, 'turnId': tid, 'run': run}})
-                        records.append({'session': self.thread, 'command': 'hook', 'hook': True, 'hook_event': raw,
+                        records.append({'session': self.thread, 'turn_id': tid, 'command': 'hook', 'hook': True, 'hook_event': raw,
                                         'exit_code': 0, 'hook_unavailable': False, 'input_bytes': 5, 'output_bytes': 7})
                     if prime and not getattr(self, 'omit_prime', False):
                         events.append({'method': 'item/completed', 'params': {'threadId': self.thread, 'turnId': tid,
@@ -1013,6 +1016,18 @@ class MatchedRunTests(unittest.TestCase):
                                      'commandActions': [{'command': command + ' prime'}]}}})
                         records.append({'session': self.thread, 'command': 'prime', 'prime_valid': True,
                                         'hook': False, 'exit_code': 0, 'input_bytes': 0, 'output_bytes': 100})
+                    if omit_post in ('both', 'native'):
+                        events = [e for e in events if e.get('params', {}).get('run', {}).get('eventName') != 'postToolUse']
+                    if omit_post in ('both', 'meter'):
+                        records = [c for c in records if c.get('hook_event') != 'PostToolUse']
+                    if omit_post == 'stale_native':
+                        for event in events:
+                            if event.get('params', {}).get('run', {}).get('eventName') == 'postToolUse':
+                                event['params']['turnId'] = 't1'
+                    if omit_post == 'stale_meter':
+                        for record in records:
+                            if record.get('hook_event') == 'PostToolUse':
+                                record['turn_id'] = 't1'
                     self.queue[0:0] = events
                     with (data / 'calls.jsonl').open('a') as log:
                         for record in records:
@@ -1069,6 +1084,15 @@ class MatchedRunTests(unittest.TestCase):
                         self.assertFalse(result['quality']['quality_pass'])
                         self.assertFalse({'thread/start', 'turn/start'} &
                                          {r.get('method') for r in clients[0].transport.sent})
+                    elif error == 'OM activation missing required native/metered lifecycle evidence':
+                        self.assertGreater(variants['om'].usage.totals()['inputTokens'], 100)
+                        self.assertEqual(clients[1].transport.turn_count, 2)
+                        self.assertEqual(len(variants['om'].workload_batches), 1)
+                        self.assertEqual(len(variants['om'].probes), 0)
+                        self.assertEqual(result['budget']['observed_input_tokens'],
+                                         sum(v.usage.totals()['inputTokens'] for v in variants.values()))
+                        self.assertFalse(meta['om_activation']['verified'])
+                        self.assertFalse(result['quality']['quality_pass'])
                     elif finalization:
                         self.assertEqual(result['budget']['observed_input_tokens'], 1080)
                         self.assertEqual([len(v.probes) for v in variants.values()], [2, 2])
@@ -1116,6 +1140,20 @@ class MatchedRunTests(unittest.TestCase):
             if name == 'om':
                 host.omit_prime = True
         self.run_matched(mutate, 'OM activation missing successful hook-delivered prime command')
+
+    def test_later_tool_turn_missing_posttool_stops_and_keeps_usage(self):
+        for missing in ('both', 'native', 'meter', 'stale_native', 'stale_meter'):
+            with self.subTest(missing=missing):
+                def mutate(name, host):
+                    if name == 'om':
+                        host.omit_later_post = missing
+                self.run_matched(mutate, 'OM activation missing required native/metered lifecycle evidence')
+
+    def test_no_tool_turn_does_not_require_posttool(self):
+        def mutate(name, host):
+            if name == 'om':
+                host.no_tool_post = True
+        self.run_matched(mutate)
 
     def test_finalization_failure_cannot_turn_completed_work_into_success(self):
         def mutate(name, host):
