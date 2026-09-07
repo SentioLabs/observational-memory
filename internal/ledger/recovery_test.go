@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -98,6 +99,8 @@ func TestImportPreservesNewSessionPromptAndIsolation(t *testing.T) {
 	check(t, target.SetState("prompt_id", promptID))
 	check(t, target.SetState("stop_turn", "old-guard"))
 	check(t, target.Pause(true))
+	beforeSource := readSnapshotForTest(t, source)
+	beforeLocal := readTestUnits(t, target, promptID)
 	status, err := target.Import(sourceStore, "source")
 	check(t, err)
 	if status.PendingSources != 2 || status.Active.Observations != 1 || !status.Paused || status.LastCheckpointAt == "" || status.ImportedFrom == nil || status.ImportedFrom.Session != "source" {
@@ -110,6 +113,12 @@ func TestImportPreservesNewSessionPromptAndIsolation(t *testing.T) {
 	}
 	incomingUnits := readTestUnits(t, target, pending.Page.Items[0].SourceID)
 	localUnits := readTestUnits(t, target, promptID)
+	if len(localUnits) != len(beforeLocal) || localUnits[0].ID != beforeLocal[0].ID || localUnits[0].Text != beforeLocal[0].Text {
+		t.Fatal("destination prompt identity or complete text changed")
+	}
+	if !reflect.DeepEqual(beforeSource, readSnapshotForTest(t, source)) {
+		t.Fatal("import modified original source snapshot")
+	}
 	if localUnits[0].Seq <= incomingUnits[len(incomingUnits)-1].Seq || localUnits[0].ReviewState != ReviewPending {
 		t.Fatal("destination evidence units were not appended as pending")
 	}
