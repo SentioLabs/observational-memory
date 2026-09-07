@@ -161,7 +161,9 @@ sign-in and the model/reasoning advertised by that host.
 
 After those choices, use the following commands. The variables name the actual
 operator-approved values, not defaults. Both maximums cover **the entire run and
-both variants**, including their model maintenance/compaction work.
+both variants**. The wall ceiling includes all work; the input ceiling covers
+reported public counters, including reported maintenance, and excludes unavailable
+remote-compaction provider usage. It cannot cap unreported provider input.
 
 ```sh
 # Set PILOT_PREVIEW and RELEASE_PREVIEW to the fresh previews above.
@@ -316,6 +318,40 @@ The [configuration reference](https://learn.chatgpt.com/docs/config-file/config-
 and [App Server contract](https://learn.chatgpt.com/docs/app-server) supply the
 public policy and lifecycle. This correction does not rescore or promote prior
 failed pilot artifacts. The full 50-cycle recovery and release gates remain.
+
+The JSON `usage` mapping is a **reported public-counter subtotal**, explicitly
+labeled by `usage_scope`. It is not provider-complete usage. Each
+`compaction_evidence` entry records `provider_usage: null`, an unavailable status
+and subscription/source-version provenance. Both remote compaction implementations
+in the matched host omit their provider usage from this public cumulative-counter
+stream. Context recomputation keeps the cumulative totals and replaces `last`
+with a local estimate. The local fallback can report differently; public lifecycle
+alone does not identify complete provider-cost coverage, so attribution remains
+conservative. Later ordinary response counters never fill the missing component.
+
+`reported_input_token_difference` preserves the known OM-minus-native subtotal
+difference. Per-variant `provider_complete_usage`, root
+`provider_complete_input_token_overhead` and the legacy `input_token_overhead`
+are null. Unknown compaction costs are neither zero nor assumed to cancel between
+variants. Recovery quality can still be evaluated under the original rubric;
+complete cost, savings or subscription-overhead claims are unsupported. The
+`usage_measurement_contract` names this reported-only interpretation explicitly.
+These semantics follow the matched official source's
+[remote v2 completion handling](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/compact_remote_v2.rs#L430),
+[legacy remote installation](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/compact_remote.rs#L266),
+and the context recomputation linked above. No internal raw-event subscription
+or feature/provider change is used to fill the gap.
+
+The optional forced diagnostic path uses `LiveVariant.force_compaction()` only
+on an idle owned pilot thread with `--force-compaction`. It requires a new
+standalone turn and exactly one matching compaction start/completion, a fresh
+same-turn unambiguous smaller context estimate, and successful turn completion.
+It then performs ordinary recovery with the unchanged fresh-response usage guard.
+An interrupted/failed manual turn or missing/duplicate/wrong lifecycle/context
+identity refuses recovery. This boundary is not paid-usage evidence and never
+earns the configured automatic-policy grade. Ordinary turns still cannot use a
+context estimate to bypass missing or stale response usage. Prior failed smoke
+results remain failed and are not rescored by this correction.
 
 Optional absent fields remain null. Cached input is already part of input; reasoning output is reported
 separately without adding it to output twice. Counter resets require an explicit

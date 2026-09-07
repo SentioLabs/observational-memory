@@ -618,6 +618,14 @@ class VariantRun:
             request_usage = type(pre.get('inputTokens')) is int and pre['inputTokens'] > 0
             evidence.append({
                 'item_id': cycle['item_id'],
+                'provider_usage': None, 'provider_usage_status': 'unavailable',
+                'provider_usage_reason': 'The public subscription does not separately attribute remote compaction provider usage. '
+                    'A context-only estimate is not provider usage; later ordinary usage cannot fill this gap. '
+                    'Local fallback can report differently, but this lifecycle does not attest provider-complete coverage.',
+                'provider_usage_provenance': {
+                    'subscription': 'thread/tokenUsage/updated.tokenUsage',
+                    'reference_host_version': '0.153.4',
+                    'reference_source_revision': '3d2ee51ca2d5db578f328aa75e20aa22c0197c9a'},
                 'configured_policy_compaction_verified': bool(policy_verified and reduction
                                                               and cycle['turn_id'] in self.requested_turn_ids),
                 'context_reduction_verified': bool(reduction),
@@ -702,6 +710,7 @@ class VariantRun:
     def result(self, compact_limit=200000):
         return {'scorecard': self.scorecard(), 'compactions': self.compactions, 'probes': self.probes,
                 'usage': self.usage.totals(),
+                'usage_scope': 'reported_public_counter_subtotal', 'provider_complete_usage': None,
                 'usage_provenance': {k: ('thread/tokenUsage/updated.tokenUsage.total.' + k
                                           if self.usage.totals()[k] is not None else None) for k in FIELDS},
                 'usage_segments': [vars(s) for s in self.usage.segments],
@@ -1945,6 +1954,7 @@ class LiveVariant:
         self.status_phase = 'preflight'
         self.status_error = None
         self.last_public_error = None
+        self.manual_boundary_events = None
         self.rpc.observer = self.report_status
 
     def report_status(self, force=False, error=None, diagnostic_only=False):
@@ -2022,6 +2032,17 @@ class LiveVariant:
 
     def notify(self, event):
         p = event.get('params', {})
+        # Collect only identities/status for the narrowly requested diagnostic boundary.
+        if self.manual_boundary_events is not None and p.get('threadId') == self.variant.thread_id:
+            method = event.get('method')
+            if method in ('turn/started', 'turn/completed'):
+                self.manual_boundary_events.append({'method': method, 'turn_id': p.get('turn', {}).get('id'),
+                                                    'status': p.get('turn', {}).get('status')})
+            elif method in ('item/started', 'item/completed') and p.get('item', {}).get('type') == 'contextCompaction':
+                self.manual_boundary_events.append({'method': method, 'turn_id': p.get('turnId'),
+                                                    'item_id': p['item'].get('id')})
+            if len(self.manual_boundary_events) > 64:
+                raise HarnessError('ambiguous manual compaction lifecycle')
         # Store only newly owned synthetic thread events, never account/config payloads.
         if self.variant.thread_id and p.get('threadId') == self.variant.thread_id:
             # A diagnostic timestamp failure must not discard delivered usage.
@@ -2237,6 +2258,50 @@ class LiveVariant:
         self.start()
         self.fixture_turn(self.variant.fixture.workload['events'][0])
 
+    def force_compaction(self):
+        """Pilot-only owned boundary; context estimates never substitute for response usage."""
+        v = self.variant
+        v.budget.check()
+        if (self.config.mode != 'pilot' or not self.config.args.force_compaction
+                or not v.thread_id or v.live_thread_id != v.thread_id
+                or self.active_turn or v.active_turn or self.manual_boundary_events is not None):
+            raise HarnessError('manual compaction requires an idle owned forced-pilot thread')
+        before, samples = len(v.compactions), len(v.usage.observations)
+        prior_turns = set(v.turns) | v.requested_turn_ids
+        prior_items = set(v.compaction_starts)
+        self.manual_boundary_events = []
+        self.status_phase = 'manual-compaction'
+        try:
+            self.rpc.request('thread/compact/start', {'threadId': v.thread_id})
+            while not any(e['method'] == 'turn/completed' for e in self.manual_boundary_events):
+                self.rpc.pump(1)
+            events = self.manual_boundary_events
+            starts = [e for e in events if e['method'] == 'turn/started']
+            ends = [e for e in events if e['method'] == 'turn/completed']
+            items = [e for e in events if e['method'] == 'item/started']
+            completed = [e for e in events if e['method'] == 'item/completed']
+            if (any(len(group) != 1 for group in (starts, ends, items, completed))
+                    or [e['method'] for e in events] != ['turn/started', 'item/started', 'item/completed', 'turn/completed']):
+                raise HarnessError('manual compaction requires one distinct matched lifecycle')
+            turn, item = starts[0]['turn_id'], items[0]['item_id']
+            if (not isinstance(turn, str) or not turn or turn in prior_turns
+                    or not isinstance(item, str) or not item or item in prior_items
+                    or any(e['turn_id'] != turn for e in ends + items + completed)
+                    or completed[0]['item_id'] != item or ends[0]['status'] != 'completed'
+                    or len(v.compactions) != before + 1):
+                raise HarnessError('manual compaction identity or completion mismatch')
+            boundary = v.compactions[-1]
+            evidence = v.compaction_evidence(self.config.compact_limit)[-1]
+            if (boundary['item_id'] != item or boundary['turn_id'] != turn
+                    or not evidence['context_reduction_verified']
+                    or boundary['after_usage']['observation_index'] <= samples):
+                raise HarnessError('manual compaction lacks a fresh matched context boundary')
+            v.budget.check()
+            self.status_phase = 'idle'
+            return boundary
+        finally:
+            self.manual_boundary_events = None
+
     def drive(self):
         if self.variant.thread_id is None:
             self.start()
@@ -2260,14 +2325,7 @@ class LiveVariant:
                                                       'model_visible_bytes': len(prompt.encode())})
             self.turn(prompt)
             if self.config.args.force_compaction and len(self.variant.compactions) == len(self.variant.probes):
-                before = len(self.variant.compactions)
-                samples = len(self.variant.usage.observations)
-                self.rpc.request('thread/compact/start', {'threadId': self.variant.thread_id})
-                while len(self.variant.compactions) == before:
-                    self.rpc.pump(1)
-                while len(self.variant.usage.observations) <= samples:
-                    self.rpc.pump(1)
-                self.variant.require_usage_since(samples)
+                self.force_compaction()
             self.recover()
         if len(self.variant.compactions) != self.config.cycles:
             raise HarnessError('more compactions than requested; recovery evidence is incomplete')
@@ -2484,20 +2542,24 @@ def output_results(config, fixture, variants, budget, metadata, error):
     result = {'schema': SCHEMA, 'mode': config.mode, 'status': status,
               'release_pass': config.mode == 'release' and counts_complete and not reasons,
               'compaction_measurement_contract': 'configured-policy-and-observed-reduction-v2',
+              'usage_measurement_contract': 'reported-public-usage-with-unavailable-compaction-v1',
               'quality': comparison, 'eligibility_reasons': reasons, 'metadata': metadata,
               'variants': {name: v.result(config.compact_limit) for name, v in variants.items()},
               'budget': {'max_seconds': budget.max_seconds, 'max_input_tokens': budget.max_input_tokens,
                          'observed_input_tokens': budget.input_tokens if any(v.usage.observations for v in variants.values()) else None,
                          'input_overshoot': budget.overshoot, 'wall_seconds': timing.get('elapsed_seconds'),
                          'timing': timing,
-                         'scope': 'whole run, both variants and all observed maintenance'},
-              'input_token_overhead': overhead,
+                         'scope': 'whole run and both variants; reported public input only, including reported maintenance; '
+                                  'unavailable compaction provider input is not covered by this reported-input ceiling'},
+              'reported_input_token_difference': overhead,
+              'input_token_overhead': None, 'provider_complete_input_token_overhead': None,
               'workload_exposure': {name: {'batches': len(v.workload_batches),
                                            'bytes': sum(b['bytes'] for b in v.workload_batches),
                                            'model_visible_bytes': sum(b['model_visible_bytes'] for b in v.workload_batches)}
                                     for name, v in variants.items()},
               'measurement_notes': ['Cumulative total input counts cached input already; reasoning output is not added to output.',
                                     'last contains request usage or a context-only estimate; neither exposes the exact automatic compaction trigger. Configured-policy lifecycle and context reduction are graded separately from the literal prior-request threshold comparison.',
+                                    'Reported public counters are a known subtotal; compaction provider usage and provider-complete totals/overhead are unavailable. Later ordinary usage does not fill this gap.',
                                     'Absent measurements are null. Overshoot between observations is possible.',
                                     'No subscription allowance, dollar conversion, or universal savings claim.',
                                     'Usage compares reaching the same compaction target; automatic thresholds may consume different lengths of the same generated workload sequence. See workload_exposure.']}
@@ -2506,17 +2568,20 @@ def output_results(config, fixture, variants, budget, metadata, error):
              '', f'Mode: {config.mode}; split: {fixture.split}; seed: {fixture.seed}; threshold: {config.compact_limit}/{config.scope}.',
              '', 'Compaction evidence grades configured-policy host compaction and observed context reduction. '
              'Exact trigger tokens and cause are unavailable; the prior request total is a separate observation.',
-             '', '| Variant | Actual compactions | Scored recoveries | Critical failures | Noncritical accuracy | Input tokens |',
+             '', '| Variant | Actual compactions | Scored recoveries | Critical failures | Noncritical accuracy | Reported input subtotal |',
              '| --- | ---: | ---: | ---: | ---: | ---: |']
     for name, variant in variants.items():
         score = variant.scorecard()
         lines.append(f'| {name} | {score["actual_compactions"]} | {score["scored_recoveries"]} | '
                      f'{score["critical_failures"]} | {score["noncritical_accuracy"]} | {variant.usage.totals()["inputTokens"]} |')
-    lines.extend(['', f'Input overhead (OM − native): {overhead}. Observed overshoot: {budget.overshoot}.',
+    lines.extend(['', f'Reported input subtotal difference (OM − native): {overhead}. Observed reported-input overshoot: {budget.overshoot}.',
+                  '', 'Provider-complete usage and input overhead: unavailable. Compaction provider usage is null; '
+                  'context estimates and later ordinary response usage cannot fill or cancel this missing component.',
                   '', 'Eligibility:', '', *['- ' + r for r in reasons], '', 'Frozen identities:', '',
                   *['- ' + k + ': `' + str(v) + '`' for k, v in metadata.items() if k.endswith('sha256')],
                   '', 'Cumulative input includes cached input; output and reasoning are reported separately. '
                   'Unavailable values are null. This is an observed ceiling, not a hard request cap. '
+                  'The input ceiling covers reported public counters only, not unavailable provider compaction input. '
                   'A dry-run/replay/pilot never supplies release evidence. Equal quality is not superiority.', ''])
     (config.output / 'report.md').write_text('\n'.join(lines))
     return result

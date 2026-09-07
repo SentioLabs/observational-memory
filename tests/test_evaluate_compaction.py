@@ -1554,6 +1554,163 @@ class ClockSafetyTests(unittest.TestCase):
         self.assertEqual(client.rpc.wait_response(ident), {'accepted': True})
 
 
+class CompactionUsageTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+
+    def client(self, mutate=None, recovery=None):
+        fixture = evalmod.Fixture.load(ROOT / 'eval/fixtures/continuity.json', 'pilot')
+        clock = {'now': 0.}
+        class ManualHost(FakeHost):
+            def send(self, request):
+                if request.get('method') == 'thread/compact/start':
+                    self.sent.append(request)
+                    item = compact(self.thread, 'manual-item'); item['params']['turnId'] = 'manual-turn'
+                    estimate = usage(self.thread, self.input, turn='manual-turn')
+                    estimate['params']['tokenUsage']['last'] = {'totalTokens': 40, 'inputTokens': 0, 'outputTokens': 0}
+                    events = [
+                        {'method': 'turn/started', 'params': {'threadId': self.thread, 'turn': {'id': 'manual-turn'}}},
+                        {**copy.deepcopy(item), 'method': 'item/started'}, estimate, item,
+                        {'method': 'turn/completed', 'params': {'threadId': self.thread,
+                                                             'turn': {'id': 'manual-turn', 'status': 'completed'}}}]
+                    if mutate:
+                        mutate(events)
+                    self.queue.extend(events)
+                    self.queue.append({'id': request['id'], 'result': {}})
+                else:
+                    offset = len(self.queue)
+                    super().send(request)
+                    if request.get('method') == 'turn/start' and self.turn_count > 1 and recovery:
+                        events = self.queue[offset:]; recovery(events); self.queue[offset:] = events
+            def receive(self, timeout):
+                if not self.queue:
+                    clock['now'] += .25
+                return super().receive(timeout)
+        directory = self.path / str(len(list(self.path.iterdir()))); directory.mkdir()
+        workspace = directory / 'workspace'; fixture.prepare(workspace)
+        budget = evalmod.RunBudget(10, 100000, lambda: clock['now'])
+        v = evalmod.VariantRun('native', fixture, budget)
+        config = DriverTests.config(self); config.output = directory; config.cycles = 1; config.args.force_compaction = True
+        client = evalmod.LiveVariant(config, v, workspace, {}, [workspace], ManualHost)
+        self.addCleanup(client.close); client.preflight(); client.start(); client.turn('ordinary baseline')
+        return client, clock
+
+    def test_manual_context_boundary_accepts_no_provider_increment_then_guards_recovery(self):
+        client, clock = self.client()
+        client.force_compaction()
+        self.assertEqual(client.variant.usage.totals()['inputTokens'], 100)
+        self.assertEqual(len(client.variant.compactions), 1)
+        self.assertFalse(client.variant.compaction_evidence(200000)[0]['configured_policy_compaction_verified'])
+        client.turn('actual recovery', cycle=1)
+        self.assertEqual(client.variant.usage.totals()['inputTokens'], 200)
+        self.assertEqual(client.variant.scorecard()['scored_recoveries'], 1)
+        result = client.variant.result()
+        self.assertEqual(result['usage_scope'], 'reported_public_counter_subtotal')
+        self.assertIsNone(result['provider_complete_usage'])
+        self.assertIsNone(result['compaction_evidence'][0]['provider_usage'])
+        self.assertEqual(result['compaction_evidence'][0]['provider_usage_status'], 'unavailable')
+
+    def test_manual_boundary_rejects_missing_wrong_duplicate_and_stale_evidence(self):
+        controls = {
+            'wrong-thread': lambda e: [x['params'].update(threadId='other') for x in e],
+            'missing-turn': lambda e: e[1]['params'].pop('turnId'),
+            'wrong-turn': lambda e: e[3]['params'].update(turnId='other'),
+            'wrong-item': lambda e: e[3]['params']['item'].update(id='other'),
+            'missing-item': lambda e: e[3]['params']['item'].pop('id'),
+            'missing-start': lambda e: e.pop(1),
+            'duplicate-start': lambda e: e.insert(2, copy.deepcopy(e[1])),
+            'duplicate-completion': lambda e: e.insert(4, copy.deepcopy(e[3])),
+            'duplicate-turn': lambda e: e.insert(1, copy.deepcopy(e[0])),
+            'missing-completion': lambda e: e.pop(3),
+            'completion-after-turn': lambda e: e.append(e.pop(3)),
+            'start-before-turn': lambda e: e.insert(0, e.pop(1)),
+            'missing-estimate': lambda e: e.pop(2),
+            'wrong-estimate-turn': lambda e: e[2]['params'].update(turnId='other'),
+            'stale-estimate': lambda e: e.insert(1, e.pop(2)),
+            'nonreducing-estimate': lambda e: e[2]['params']['tokenUsage']['last'].update(totalTokens=100),
+            'request-not-estimate': lambda e: e[2]['params']['tokenUsage']['last'].update(inputTokens=40),
+            'counter-decrease': lambda e: e[2]['params']['tokenUsage']['total'].update(inputTokens=99),
+            'ambiguous-estimate': lambda e: e.insert(3, {**copy.deepcopy(e[2]), 'params': {
+                **copy.deepcopy(e[2]['params']), 'tokenUsage': {'total': {'inputTokens': 100},
+                'last': {'totalTokens': 30, 'inputTokens': 0, 'outputTokens': 0}}}}),
+            'interrupted': lambda e: e[-1]['params']['turn'].update(status='interrupted'),
+            'failed': lambda e: e[-1]['params']['turn'].update(status='failed'),
+            'missing-turn-completion': lambda e: e.pop(),
+        }
+        for name, mutate in controls.items():
+            with self.subTest(name=name):
+                client, _ = self.client(mutate)
+                with self.assertRaises(evalmod.HarnessError):
+                    client.force_compaction()
+                self.assertEqual(client.variant.scorecard()['scored_recoveries'], 0)
+                self.assertEqual(len([r for r in client.transport.sent if r.get('method') == 'turn/start']), 1)
+
+    def test_reported_subtotal_difference_is_not_provider_complete_overhead(self):
+        client, _ = self.client()
+        client.rpc.request('thread/compact/start', {'threadId': client.variant.thread_id})
+        native = client.variant
+        om = evalmod.VariantRun('om', native.fixture, native.budget); om.start_thread('om-owned'); om.event(usage('om-owned', 150))
+        result = evalmod.output_results(client.config, native.fixture, {'native': native, 'om': om},
+            native.budget, {'om_activation': {'verified': True}}, 'retained infrastructure failure')
+        self.assertEqual(result['reported_input_token_difference'], 50)
+        self.assertIsNone(result['provider_complete_input_token_overhead'])
+        self.assertIsNone(result['input_token_overhead'])
+        self.assertIn('reported', result['budget']['scope'])
+        report = (client.config.output / 'report.md').read_text()
+        self.assertIn('Reported input subtotal', report)
+        self.assertIn('Provider-complete', report)
+        self.assertNotIn('Input overhead (OM', report)
+
+    def test_manual_boundary_never_bypasses_stale_or_failed_ordinary_recovery(self):
+        def stale(events):
+            for e in events:
+                if e.get('method') == 'thread/tokenUsage/updated':
+                    e['params']['tokenUsage']['total']['inputTokens'] = 100
+        for name, recovery in [('stale', stale), *[(status, lambda events, s=status:
+                next(e for e in events if e.get('method') == 'turn/completed')['params']['turn'].update(status=s)) for status in ('failed', 'interrupted')]]:
+            with self.subTest(name=name):
+                client, clock = self.client(recovery=recovery); client.force_compaction()
+                with patch.object(evalmod, 'continuous_time', side_effect=lambda: clock['now']):
+                    with self.assertRaises(evalmod.HarnessError):
+                        client.turn('recovery must have fresh usage', cycle=1)
+                self.assertEqual(client.variant.scorecard()['scored_recoveries'], 0)
+
+    def test_manual_diagnostic_requires_live_scope_and_preserves_budgets(self):
+        for kind in ('not-forced', 'not-pilot', 'not-owned', 'input', 'wall'):
+            client, clock = self.client()
+            if kind == 'not-forced': client.config.args.force_compaction = False
+            elif kind == 'not-pilot': client.config.mode = 'release'
+            elif kind == 'not-owned': client.variant.live_thread_id = None
+            elif kind == 'input': client.variant.budget.max_input_tokens = 100
+            else: clock['now'] = 10
+            before = len(client.transport.sent)
+            with self.subTest(kind=kind), self.assertRaises(evalmod.HarnessError):
+                client.force_compaction()
+            self.assertEqual(len(client.transport.sent), before)
+
+    def test_later_reported_input_or_wall_cap_still_stops_recovery(self):
+        for kind in ('input', 'wall'):
+            client, clock = self.client(); client.force_compaction()
+            if kind == 'input': client.variant.budget.max_input_tokens = 150
+            else: clock['now'] = 10
+            with self.subTest(kind=kind), self.assertRaises(evalmod.HarnessError):
+                client.turn('budgeted recovery', cycle=1)
+            self.assertEqual(client.variant.scorecard()['scored_recoveries'], 0)
+            self.assertEqual(client.variant.budget.input_tokens, 200 if kind == 'input' else 100)
+            self.assertIsNone(client.variant.result()['compaction_evidence'][0]['provider_usage'])
+
+    def test_automatic_compaction_cost_stays_unknown_after_later_ordinary_usage(self):
+        client, _ = self.client(); client.config.args.force_compaction = False
+        client.turn('Analyze new incident automatic fixture')
+        before = client.variant.result()
+        self.assertEqual(before['usage']['inputTokens'], 220)
+        self.assertIsNone(before['compaction_evidence'][0]['provider_usage'])
+        client.turn('later ordinary response')
+        after = client.variant.result()
+        self.assertEqual(after['usage']['inputTokens'], 320)
+        self.assertIsNone(after['compaction_evidence'][0]['provider_usage'])
+        self.assertIsNone(after['provider_complete_usage'])
+
+
 class CompactionPolicyTests(unittest.TestCase):
     setUp = HarnessTests.setUp
 
