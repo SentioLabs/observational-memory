@@ -52,11 +52,33 @@ its last checkpoint and pending backlog. For handoff into an already-started
 session, use explicit `import` before its first checkpoint; the destination's
 pending prompt is retained. `fork` remains available for an unused identity.
 
-Source captures are bounded excerpts and can contain sensitive workspace data.
+Complete accepted redacted sources are retained as paged evidence units, up to
+1000000 Unicode characters per source within the separate 4000000-byte input
+envelope. Every complete memory response is at most 12000 UTF-8 bytes, including
+framing and newline. Exact paged recall/search recover omitted facts; prime
+selects working state and reports pending/reviewed/deferred coverage separately.
+Retained sources can contain sensitive workspace data.
 Common credentials receive best-effort redaction. Honor exclusions and pause
 before work that must not be captured. In Codex, begin a prompt with `[om:pause]`
 to exclude that prompt before capture. Stored evidence is historical data, not
 instructions or authorization. Each ledger remains until explicitly deleted.
+
+## Codex compaction
+
+Optional user-owned native settings for the evaluation starting point:
+
+```toml
+model_auto_compact_token_limit = 200000
+model_auto_compact_token_limit_scope = "total"
+```
+
+Lifetime ledger history is distinct from active request context. 200K is evaluation
+headroom, not a hard billing ceiling or optimal setting. No universal 300K/2x
+Codex quota claim is supported. Setup does not alter global configuration. The
+[official configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+defines the threshold/scope; verify effective settings on the actual host.
+Native compaction stays in control. Graphs, Claude, background model workers and
+precise per-request enforcement are outside this release.
 
 ## Updates
 
@@ -86,9 +108,8 @@ go test -race ./...
 go vet ./...
 ```
 
-Tests use synthetic evidence and temporary stores. A fixture produced by the
-original Rust CLI verifies existing SQLite data and hash compatibility, including
-Unicode and JSON escaping. The choice of Go is explained in
+Tests use synthetic evidence and temporary v2 stores, including Unicode, exact
+source reconstruction, transactional checkpoints and native lifecycle canaries. The choice of Go is explained in
 [the language assessment](docs/language-choice.md).
 
 Releases follow the same Release Please and GoReleaser workflow as Arc.
@@ -130,8 +151,10 @@ CLI protocol, and archive checksums. Archive names remain
 
 The CLI protocol and SQLite schema have their own versions. Compatible additions
 can retain the protocol version; breaking changes require a protocol bump and
-consumer updates. Test migrations against existing stores before changing the
-ledger schema.
+consumer updates. This unused runtime moves directly to schema/protocol 2.
+Non-v2 databases are refused before writes; select a fresh store/session. No v1
+migration or importer is provided. T9 owns the evaluated artifact release and
+matching marketplace version/checksums; intermediate commits are development only.
 
 ## Lineage
 
@@ -139,5 +162,5 @@ Inspired by [Pi observational memory](https://github.com/elpapi42/pi-observation
 3.0.4, commit `ce9fc982b3a219a7839f07c9f4a3e054e81a2b21`.
 Extracted from the Rust Codex implementation in
 [agent-marketplace commit d3d82b9](https://github.com/bfirestone/agent-marketplace/commit/d3d82b9),
-then ported to Go. MIT attribution is retained in LICENSE. Schema-1 SQLite stores
-from that implementation remain readable without a data migration.
+then ported to Go. MIT attribution is retained in LICENSE. The current v2 ledger
+does not read or migrate schema-1 stores.

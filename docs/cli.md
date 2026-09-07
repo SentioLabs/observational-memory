@@ -1,81 +1,155 @@
-# CLI contract, version 1
+# CLI contract, version 2
 
-`om capabilities` prints one JSON object containing `version`,
-`protocol_version`, `ledger_schema`, and `clients`. Currently the only client is
-`codex`. `check-compatibility --protocol 1 --client codex` exits zero with
-`{"compatible":true}` when supported, and exits nonzero otherwise. These commands
-need no store and do not create a ledger. Binary releases and marketplace plugin
-versions are independent.
+`om capabilities` reports `version`, `protocol_version: 2`, `ledger_schema: 2`,
+and `clients: ["codex"]`. `check-compatibility --protocol 2 --client codex`
+returns `{"compatible":true}` or exits nonzero. Both need no store and create
+no ledger. Binary release versions are independent of protocol/schema versions.
+Successful memory commands write bounded JSON only, except text `prime`/plain
+`view`. Failures exit nonzero with stderr diagnostics. Standalone self-update is
+outside the bounded memory protocol.
 
-## Core commands
+Use the hook's exact executable, `--store`, and `--session`, preserving shell
+quoting. Never interpolate evidence text into commands. Each store contains
+`session-<hash>/memory.sqlite3`; model tools need write permission for its SQLite
+journals independently of hooks. See the marketplace plugin for setup.
 
-Pass `--store PATH --session ID` before the command. `--store` can default to
-`OBSERVATIONAL_MEMORY_STORE`; there is no implicit agent environment or working
-directory fallback. Different clients should use separate stores unless sharing
-an exact session identity is intentional. Sessions are stored at
-`session-<hash>/memory.sqlite3`. Schema version 1 preserves the original Codex
-plugin's paths, IDs, sequence numbers, timestamps, support links, and cursors.
+| Command | Result |
+| --- | --- |
+| `pending [--cursor TOKEN]` | Oldest pending evidence units, resolved `through`, `revision`, coverage and `page`. |
+| `apply` | Checkpoint JSON on stdin; assigned IDs, revision and coverage receipt. |
+| `prime` | Selected working state and memory, checkpoint and recovery debt. |
+| `view` | Selected whole active records with omissions reported. |
+| `view --all [--cursor TOKEN]` | Exact paged inspection, including retired records. |
+| `recall ID [--cursor TOKEN]` | Exact paged fields, support and evidence; accepts memory, source or evidence-unit IDs. |
+| `search QUERY --sources --include-retired [--cursor TOKEN]` | Literal search of memories and sources, including retired memories with replacement IDs. Omit flags for active memories only. |
+| `status` | Session/database, stored-source bytes/count, unit count, coverage, state metadata, pause and import origin. |
+| `capture` | JSON `{kind,text,key}`; returns `{source_id,unit_count,first_unit_id}`. |
+| `pause` / `resume` | Disable/re-enable automatic capture and reminders. |
+| `fork --to-session ID` | Isolated snapshot into an absent destination. |
+| `import --from-store PATH --from-session ID` | Seed an unprepared destination, retaining its pending local evidence and pause preference. |
 
-| Command | stdin | stdout |
-| --- | --- | --- |
-| `capture` | `{kind,text,key}` | JSON `{source_id}` |
-| `pending` | None | JSON `{through,sources}` |
-| `apply` | Checkpoint object below | JSON `{through,observations,reflections,retired}` |
-| `status` | None | JSON session, database path, paused, through, pending/active counts, last_checkpoint_at, imported_from |
-| `prime` | None | Prepared memory with session/store, checkpoint time and pending backlog |
-| `view` | None | Quoted active memory, at most 12K UTF-8 bytes including framing |
-| `view --all` | None | JSON array of active and retired entries |
-| `recall ID` | None | JSON entry and cited sources; reflections also include observations |
-| `pause` / `resume` | None | JSON status; client adapters honor the paused state |
-| `fork --to-session ID` | None | JSON status of a new independent snapshot |
-| `import --from-store PATH --from-session ID` | None | JSON status after importing into an uncheckpointed session |
+`OBSERVATIONAL_MEMORY_STORE` is a standalone default; model commands retain the
+explicit hook store. No current-directory, native-memory, or other-session fallback
+exists. V2 refuses non-v2 databases before writing; choose a fresh store/session.
+There is no v1 migration or import command.
 
-`kind` is `user`, `assistant`, or `tool`; `key` identifies the capture's origin.
-Source IDs begin with `s-`, observations with `o-`, and reflections with `r-`.
-Identical captures with the same role, origin key, and text are idempotent.
-Explicit capture remains available while automatic adapter capture is paused.
-Fork preserves evidence and checkpoint progress but clears transient adapter
-state. It prepares its snapshot before publishing and never overwrites an existing
-destination session. A failed backup does not reserve the destination.
+## Checkpoint example
 
-Import handles a destination whose SessionStart hook already opened a ledger.
-It refuses checkpointed or previously imported memory, copies the source history
-and progress, then appends the destination's pending sources (including its initial
-prompt). It preserves the destination pause preference and clears transient Stop
-and reminder state. All changes commit together. A source typo fails without
-creating a new source ledger. `imported_from` records the source store and session
-for both operations; later writes remain isolated.
+Run this synthetic fixture only with a dedicated temporary store/session. Its
+assertion reviews exact known routine content; it does not authorize blind
+acknowledgment of arbitrary logs. Pass the scoped ledger command as separate
+arguments after the script name. Subprocess argument arrays preserve paths and
+session quoting, and payload JSON travels through stdin.
 
-A checkpoint's arrays are optional:
+```python
+import json
+import subprocess
+import sys
 
-```json
-{
-  "through": 3,
-  "observations": [{"text":"A supported fact.","importance":"high","source_ids":["s-actual-id"]}],
-  "reflections": [{"text":"A durable conclusion.","observation_ids":["o-existing-id"]}],
-  "retire": [{"id":"o-older-id","reason":"Superseded.","replacement_ids":["o-newer-id"]}]
+ledger_command = sys.argv[1:]
+
+def run(command, payload=None):
+    result = subprocess.run(command, input=payload, text=True,
+                            capture_output=True, check=True)
+    assert len(result.stdout.encode("utf-8")) <= 12000
+    return result.stdout
+
+routine = "Synthetic routine check: no durable decision."
+source = json.loads(run(ledger_command + ["capture"], payload=json.dumps({
+    "kind": "tool", "text": routine, "key": "routine-fixture",
+})))
+pending = json.loads(run(ledger_command + ["pending"]))
+assert [unit["text"] for unit in pending["page"]["items"]] == [routine]
+assert pending["page"]["items"][0]["source_id"] == source["source_id"]
+assert not pending["page"].get("next_cursor")
+payload = {
+    "expected_through": pending["through"],
+    "expected_revision": pending["revision"],
+    "acknowledge": [unit["id"] for unit in pending["page"]["items"]],
+    "observations": [],
 }
+print(run(ledger_command + ["apply"], payload=json.dumps(payload)))
 ```
 
-Use the cursor and IDs returned by the runtime. Apply observations first, then
-use their assigned IDs in later reflection/retirement calls. Importance is
-`low`, `medium` (default), `high`, or `critical`. A reflection requires active
-observations. Retirement requires a newer active entry of the same kind or a
-newer reflection that cites the old observation. Retirement keeps evidence
-available through recall. Validation errors roll back the entire checkpoint,
-including its cursor. Identical observations at the same cursor do not duplicate
-or reactivate entries. Stale cursors fail; reread pending before retrying.
+For semantic observations use `{text,importance,evidence_ids}`, citing only
+reviewed supporting `e-` IDs. Importance is low, medium (default), high or critical.
+Use assigned `o-` IDs from receipts in reflections `{text,observation_ids}`. After
+recording a replacement, retirement uses `{id,reason,replacement_ids}`. Reflection
+and retirement preserve effective importance along supported replacements, not
+semantic correctness. Inspect source support before consolidating meaning.
 
-Sources over 24K characters retain marked head/tail excerpts. Pending chunks are
-approximately 48K characters. Views prioritize importance across entry types, then reflections at equal
-importance, then recency. Selected entries display in ledger order with their
-text quoted so embedded newlines cannot impersonate another record. `view --all` and `recall`
-are unbounded inspection commands. Memory grows until its session directory is
-explicitly removed. Timestamps describe capture time, not inferred event time.
+All checkpoints require `expected_through`, `expected_revision`, and `acknowledge`,
+including zero/empty values. `through` is the resolved queue boundary, not the
+last unit on a page. Acknowledge an exact ordered pending prefix; an empty prefix
+allows an urgent observation from explicitly retrieved evidence without skipping
+older evidence. Unknown, duplicate, noncontiguous or stale operations roll back.
+Exact retries return the original receipt; a different stale request requires a
+fresh `pending` read. Apply only after the host delivered the complete page.
 
-CLI failures exit nonzero and write diagnostics to stderr. Input is one JSON
-object limited to 4 MB. Successful machine-readable operations write JSON only
-to stdout; `prime` and plain `view` are the documented text exceptions.
+`defer_sources: [{source_id,reason}]` explicitly moves a pending tool source out of
+the queue after inspecting its identity/span. Reasons are nonempty and at most
+256 UTF-8 bytes. User/assistant sources cannot be deferred. Deferred units remain
+searchable/recallable with an unreviewed coverage gap and audit reason. Later,
+`review_deferred: [evidence_id]` reviews only the specific retrieved unit. Citation
+alone changes no coverage state. Do not also acknowledge units deferred by the
+same checkpoint. Pending, reviewed and deferred totals count stored evidence,
+not understanding or unreceived host events.
+
+`working_state` replaces the whole state object: objective, constraints, completed,
+open and next. Include still-valid facts in each submitted replacement. Each fact has `{text,evidence_ids}`; objective is one fact or null, the
+other fields are arrays. Its encoded limit is 3500 bytes, including citations.
+Absence/null leaves state unchanged; `{}` clears it. Omission does not withdraw
+durable facts. Retain still-valid facts; reread evidence for changes/conflicts.
+
+The combined checkpoint limit is 64 operations: acknowledgment IDs, deferrals,
+deferred-review IDs, observations, reflections, retirements, and one for a state
+update. Each pending page has at most 24 items, leaving mutation headroom.
+Automatic Stop/recovery does one pending page and one apply, then resumes work.
+
+## Exact reads and limits
+
+Every complete memory response is at most 12000 UTF-8 bytes, including serialized
+framing, cursors and final newline. Request at least 12000 output tokens from a
+tool that accepts an allowance. If the host marks a page truncated, reread it
+with adequate allowance before acknowledgment. Prime/view select whole records;
+exact inspection fragments fields/support and evidence with byte ranges.
+
+Use the returned `page.next_cursor`, keeping the original command arguments:
+
+```sh
+om --store /writable/plugin-data --session SESSION pending --cursor "$cursor"
+om --store /writable/plugin-data --session SESSION view --all --cursor "$cursor"
+om --store /writable/plugin-data --session SESSION recall "$id" --cursor "$cursor"
+om --store /writable/plugin-data --session SESSION search "$query" --sources --include-retired --cursor "$cursor"
+```
+
+Each cursor belongs to its own command/session snapshot. On a stale-cursor error,
+restart that read without a cursor. Mutations can invalidate affected reads;
+search also restarts when its indexed corpus changes. Concatenating field/unit
+ranges reconstructs exact accepted text. No page is an automatic authorization.
+
+Capture accepts up to 1000000 Unicode characters per source within the separate
+4000000-byte input envelope. Accepted redacted text is retained completely; unit
+text values fit 2048 JSON bytes. Host excerpts remain `source_incomplete`, not
+reconstructed full transcripts. Hooks cover submitted prompts, supported tool
+results and Stop final replies; commentary, hosted tools and interrupted events
+may be absent. Explicit capture can preserve permitted evidence already visible.
+Never read private transcripts or invent missing evidence. Retention lasts until
+explicit deletion; pause/exclusion and best-effort secret redaction still apply.
+
+The PostToolUse reminder uses 40000 pending UTF-8 bytes, once per resolved cursor.
+Stop measures pre-final debt: size or three subsequent completed root turns can
+trigger one pass. A new final tail alone never triggers that turn's continuation.
+Synthetic continuations do not age backlog; their actual final reply is captured.
+Deferred logs create no recurring maintenance debt. These are cadence heuristics,
+not active-context or billing measurements. Errors fail open to the user's work.
+
+Fork copies v2 evidence, state, support, coverage and pause preference into an
+absent destination. Import copies the snapshot then appends local pending sources,
+retaining destination pause and current-request precedence; prepared, reviewed,
+deferred or previously imported destinations are refused. Both reset transient
+retry/page/adapter identity and isolate later writes. Source typos do not create
+source ledgers; failed handoffs leave their destination absent or unchanged.
 
 ## Codex adapter
 
@@ -89,8 +163,8 @@ events with `agent_id` are ignored. The event supplies `session_id`. The caller
 passes `--store` explicitly, typically from Codex's `PLUGIN_DATA`.
 
 The adapter captures evidence, emits hook context, and requests at most one
-bounded checkpoint continuation per turn. It excludes its own continuation and
-ledger tool calls from capture. Errors produce an advisory hook JSON response
+bounded checkpoint continuation per turn. It excludes synthetic continuation prompts and exact scoped ledger tool calls
+from capture, while retaining the continuation’s actual final reply. Errors produce an advisory hook JSON response
 and stderr diagnostics, allowing the user's task to continue. CLI argument
 errors remain nonzero. Native Codex compaction stays in control.
 
