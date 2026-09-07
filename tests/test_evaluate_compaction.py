@@ -1532,6 +1532,27 @@ class ClockSafetyTests(unittest.TestCase):
             if transport.process.poll() is None:
                 transport.process.kill(); transport.process.wait()
 
+    def test_pending_rpc_diagnostics_allowlist_without_changing_requests(self):
+        _, budget = self.clocks()
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = evalmod.VariantRun('native', self.fixture, budget)
+        client = evalmod.LiveVariant(DriverTests.config(self), v, workspace, {}, [workspace], FakeHost)
+        self.addCleanup(client.close)
+        sent = []
+        client.rpc.send = sent.append
+        private_method = 'PRIVATE_RPC_LABEL_' + 'secret' * 500
+        ident = client.rpc.send_request(private_method, {'content': 'PRIVATE_REQUEST_BODY'})
+        client.rpc.send_request('model/list', {})
+        client.report_status(force=True)
+        raw = (self.path / 'native-status.json').read_text()
+        self.assertNotIn('PRIVATE_RPC_LABEL', raw)
+        self.assertNotIn('PRIVATE_REQUEST_BODY', raw)
+        self.assertEqual(json.loads(raw)['pending_rpc_methods'], ['model/list', 'other-rpc'])
+        self.assertEqual(sent[0], {'method': private_method, 'id': ident,
+                                   'params': {'content': 'PRIVATE_REQUEST_BODY'}})
+        client.rpc.receive = lambda timeout: {'id': ident, 'result': {'accepted': True}}
+        self.assertEqual(client.rpc.wait_response(ident), {'accepted': True})
+
 
 class CompactionPolicyTests(unittest.TestCase):
     setUp = HarnessTests.setUp

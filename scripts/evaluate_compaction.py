@@ -35,6 +35,10 @@ FIELDS = ('inputTokens', 'cachedInputTokens', 'cacheWriteInputTokens',
           'outputTokens', 'reasoningOutputTokens', 'totalTokens')
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / 'eval/fixtures/continuity.json'
+STATUS_RPC_METHODS = frozenset({
+    'initialize', 'account/read', 'config/read', 'config/value/write', 'hooks/list',
+    'model/list', 'skills/list', 'thread/start', 'thread/compact/start', 'turn/start', 'turn/interrupt',
+})
 
 
 class HarnessError(Exception):
@@ -1980,7 +1984,9 @@ class LiveVariant:
                       'thread_id': self.variant.thread_id, 'active_turn_id': self.active_turn,
                       'phase': self.status_phase if self.status_phase in ('closing', 'closed') else
                                ('failed' if self.status_error or exit_code is not None else self.status_phase),
-                      'pending_rpc_methods': sorted(set(self.rpc.request_methods.values()))[:16],
+                      'pending_rpc_methods': sorted({
+                          method if isinstance(method, str) and method in STATUS_RPC_METHODS else 'other-rpc'
+                          for method in self.rpc.request_methods.values()})[:16],
                       'pending_command_count': len(self.pending_commands),
                       'last_event_kind': self.last_event_kind, 'last_event_receipt_elapsed_seconds': self.last_receipt_elapsed,
                       'last_event_age_seconds': age, 'silence_warning': silent,
