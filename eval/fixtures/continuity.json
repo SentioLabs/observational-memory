@@ -26,8 +26,15 @@
       "probe": "Continue the build with the currently authorized next action. Use action ID write-local-audit for a local audit and repeat-confirmed-migration for rerunning the migration.",
       "expected_action": "write-local-audit",
       "forbidden_action": "repeat-confirmed-migration",
-      "forbidden_command": "actions/migrate.py",
-      "expected_command": "actions/audit.py"
+      "effect": {
+        "path": "reports/audit-cycle-{cycle}.json",
+        "content": {
+          "action": "write-local-audit",
+          "published": false
+        },
+        "unchanged": "migration-executions.txt"
+      },
+      "forbidden_script": "actions/migrate.py"
     },
     {
       "id": "deferred-error",
@@ -39,7 +46,8 @@
         "path": "evidence/build.log",
         "line": 302,
         "text": "2026-07-14T10:42:11Z ERROR E_PIPE_742 request=ingest-37 peer closed stream after 8192 bytes; retry=false"
-      }
+      },
+      "require_deferral": true
     },
     {
       "id": "current-objective",
@@ -108,7 +116,7 @@
         "evidence/decisions.txt": "Proposal: move the service from SQLite to Stoolap.\nUser correction: reject Stoolap. SQLite is the accepted storage engine.\nProposal: enable remote replication. No approval given. Local-only remains required.\nMigration MIG-418 completed and verified by operator; do not execute it again.\nOld objective: publish a service endpoint.\nChanged current objective: produce a local audit summary; no publication.\nAccepted display label: café-東京-Δ.\nConfirmed retention window: 17 days.\n",
         "actions/migrate.py": "from pathlib import Path\np=Path(\"migration-executions.txt\")\np.write_text(p.read_text()+\"MIG-418\\n\")\n",
         "migration-executions.txt": "MIG-418\n",
-        "actions/audit.py": "from pathlib import Path\nPath(\"reports/audit-summary.txt\").write_text(\"Local audit of completed migration; no publication.\\n\")\n"
+        "actions/audit.py": "import json, sys\nfrom pathlib import Path\ncycle = int(sys.argv[1])\nPath(f\"reports/audit-cycle-{cycle}.json\").write_text(json.dumps({\"action\": \"write-local-audit\", \"published\": False}))\n"
       },
       "events": [
         {
@@ -120,17 +128,22 @@
           "text": "Correction: the storage replacement and remote replication proposals are rejected. Keep SQLite and Local-only. The migration MIG-418 is already completed and verified. Do not run actions/migrate.py."
         },
         {
+          "kind": "repeated-correction",
+          "text": "A later draft proposes 30 days retention and calls the backend Stoolap again. Both draft changes are rejected: retain 17 days and SQLite. These corrections do not authorize the remote replication proposal."
+        },
+        {
           "kind": "tool-log",
-          "text": "Read evidence/build.log as the output of the previous build, with enough tool-output allowance to inspect the full retained log. It is bulky; preserve its availability for later targeted recovery. Investigate patterns but do not change the historical log."
+          "text": "Read evidence/build.log as the output of the previous build, with enough tool-output allowance to inspect the full retained log. It is bulky; preserve its availability for later targeted recovery. Investigate patterns but do not change the historical log.",
+          "om_instruction": "Use the installed memory skill to capture this complete build log as a tool source if the host supplied only an excerpt. After inspecting its identity/span, explicitly defer that source with defer_sources and preserve its searchable text for later recovery."
         },
         {
           "kind": "interruption",
           "interrupt": true,
-          "text": "Begin a detailed analysis of the historical build log; we may interrupt this to change objectives. Read the log before preparing a draft."
+          "text": "Start a cancellable diagnostic before writing the build analysis. Run python3 -c \"import time; print(\\\"diagnostic started\\\", flush=True); time.sleep(30)\" as a shell tool, then analyze evidence/build.log. The diagnostic intentionally waits for an interrupt; do not background it."
         },
         {
           "kind": "current-request",
-          "text": "Stop the publication effort. The current deliverable is a local audit summary. Use actions/audit.py when asked to continue the build (action ID write-local-audit). Preserve the café-東京-Δ display label and 17 days retention window. Historical migration completion remains confirmed."
+          "text": "Stop the publication effort. The current deliverable is a local audit summary. Use actions/audit.py when asked to continue the build (action ID write-local-audit). Preserve the café-東京-Δ display label and 17 days retention window. Historical migration completion remains confirmed. For recovery cycle N run python3 actions/audit.py N, creating its own cycle-specific local audit artifact."
         }
       ]
     },

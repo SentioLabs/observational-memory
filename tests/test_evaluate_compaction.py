@@ -173,7 +173,7 @@ class HarnessTests(unittest.TestCase):
             if i == fail:
                 answers['answers']['backend-correction']['answer'] = 'Stoolap'
             v.commands.append({'turn_id': f'p{i}', 'item': {'command': 'python3 actions/audit.py', 'exitCode': 0}})
-            v.finish_probe(i, f'p{i}', answers)
+            v.finish_probe(i, f'p{i}', answers, {'completed-step': {'performed': True, 'unchanged': True}})
 
     def test_missing_cycles_single_failure_and_tie(self):
         n, o = self.variant(), self.variant('om')
@@ -182,7 +182,7 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse(evalmod.quality(n, o)['quality_pass'])
         o.event(compact(o.thread_id, 'c50')); o.begin_probe(50, 'p50')
         o.commands.append({'turn_id': 'p50', 'item': {'command': 'python3 actions/audit.py', 'exitCode': 0}})
-        o.finish_probe(50, 'p50', self.correct_answers())
+        o.finish_probe(50, 'p50', self.correct_answers(), {'completed-step': {'performed': True, 'unchanged': True}})
         self.assertTrue(evalmod.quality(n, o)['quality_pass'])
         self.assertEqual(evalmod.quality(n, o)['comparison'], 'equal quality')
         bad = self.variant('om')
@@ -232,6 +232,371 @@ class HarnessTests(unittest.TestCase):
         replay.write_text(json.dumps(payload))
         self.assertNotEqual(evalmod.main(['--mode', 'replay', '--output', str(self.path / 'bad'),
                                           '--replay-events', str(replay)]), 0)
+
+class ResumeRegressionTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+    variant = HarnessTests.variant
+    budget = HarnessTests.budget
+    def test_started_compaction_preserves_true_before_usage(self):
+        v = self.variant(budget=self.budget(limit=1_000_000)); v.event(usage(v.thread_id, 210000))
+        event = compact(v.thread_id, 'c')
+        v.event({**event, 'method': 'item/started'})
+        v.event(usage(v.thread_id, 210100))
+        v.event(event)
+        self.assertEqual(v.compactions[0]['before_usage']['total']['inputTokens'], 210000)
+        self.assertEqual(v.compactions[0]['after_usage']['total']['inputTokens'], 210100)
+
+    def test_actions_need_fresh_effect_not_a_command_mention(self):
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        evidence = evalmod.action_evidence(self.fixture, workspace, 1, before=True)
+        after = evalmod.action_evidence(self.fixture, workspace, 1, prior=evidence)
+        self.assertFalse(after['completed-step']['performed'])
+        case = next(c for c in self.fixture.cases if c['id'] == 'completed-step')
+        target = workspace / case['effect']['path'].format(cycle=1)
+        target.write_text(json.dumps(case['effect']['content']))
+        after = evalmod.action_evidence(self.fixture, workspace, 1, prior=evidence)
+        self.assertTrue(after['completed-step']['performed'])
+        reused = evalmod.action_evidence(self.fixture, workspace, 1, before=True)
+        self.assertFalse(evalmod.action_evidence(self.fixture, workspace, 1, prior=reused)['completed-step']['performed'])
+
+    def test_fixture_rejects_cross_split_content_and_source_mismatch(self):
+        data = json.loads((ROOT / 'eval/fixtures/continuity.json').read_text())
+        data['workloads']['release']['files']['evidence/extra'] = 'PILOT_193'
+        path = self.path / 'bad.json'; path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(evalmod.HarnessError, 'split'):
+            evalmod.Fixture.load(path, 'release')
+        data['workloads']['release']['files'].pop('evidence/extra')
+        data['cases'][2]['source']['line'] = 1
+        path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(evalmod.HarnessError, 'source'):
+            evalmod.Fixture.load(path, 'release')
+
+    def test_optional_measurement_gaps_stay_null(self):
+        v = self.variant()
+        v.event(usage(v.thread_id, 10, outputTokens=2))
+        v.event(usage(v.thread_id, 20))
+        v.event(usage(v.thread_id, 30, outputTokens=7))
+        self.assertEqual(v.budget.input_tokens, 30)
+        self.assertIsNone(v.usage.totals()['outputTokens'])
+
+    def test_uncompleted_probe_cannot_be_followed_by_another(self):
+        v = self.variant(); v.event(compact(v.thread_id, 'a')); v.begin_probe(1, 'p1')
+        v.event(compact(v.thread_id, 'b'))
+        with self.assertRaises(evalmod.HarnessError):
+            v.begin_probe(2, 'p2')
+
+class FakeHost:
+    """Independent scripted App Server transport; no model/subprocess or gold access."""
+    def __init__(self, argv, env, cwd):
+        self.queue, self.sent, self.closed = [], [], False
+        self.cwd, self.input, self.turn_count = Path(cwd).resolve(), 0, 0
+        self.thread = 'test-thread'
+        self.config = {}
+        for i, arg in enumerate(argv):
+            if arg == '-c':
+                key, raw = argv[i + 1].split('=', 1)
+                value = json.loads(raw)
+                if '.' in key:
+                    root, key = key.split('.', 1)
+                    self.config.setdefault(root, {})[key] = value
+                else:
+                    self.config[key] = value
+        self.config.update({'compact_prompt': None, 'model_context_window': None})
+
+    def send(self, request):
+        self.sent.append(request)
+        method, p = request.get('method'), request.get('params', {})
+        result = {}
+        if method == 'initialized':
+            return
+        if method == 'account/read':
+            result = {'account': {'type': 'chatgpt', 'email': 'never-persist@example.test'}}
+        elif method == 'config/read':
+            result = {'config': self.config}
+        elif method == 'skills/list':
+            result = {'data': [{'skills': [], 'errors': []}]}
+        elif method == 'model/list':
+            result = {'data': [{'model': 'test-model', 'hidden': False,
+                               'supportedReasoningEfforts': [{'reasoningEffort': 'high'}]}]}
+        elif method == 'thread/start':
+            result = {'thread': {'id': self.thread}, 'model': 'test-model', 'reasoningEffort': 'high',
+                      'cwd': str(self.cwd), 'approvalPolicy': 'never', 'instructionSources': [str(self.cwd / 'AGENTS.md')]}
+        elif method == 'turn/start':
+            self.turn_count += 1
+            tid = f't{self.turn_count}'
+            result = {'turn': {'id': tid}}
+            prompt = p['input'][0]['text']
+            self.queue.append({'method': 'turn/started', 'params': {'threadId': self.thread, 'turn': {'id': tid}}})
+            if 'Analyze new incident' in prompt:
+                event = compact(self.thread, f'compact-{tid}'); event['params']['turnId'] = tid
+                self.queue.append({**event, 'method': 'item/started'})
+                self.input += 20
+                self.queue.append(usage(self.thread, self.input))
+                self.queue.append(event)
+            # Stale usage before the response is not new work. Include the actual
+            # final usage after the agent item just like the observed native host.
+            self.queue.append(usage(self.thread, self.input))
+            self.queue.append({'method': 'item/completed', 'params': {'threadId': self.thread, 'turnId': tid,
+                'item': {'type': 'agentMessage', 'id': f'm{tid}', 'text': '{"answers": {}}'}}})
+            self.input += 100
+            self.queue.append(usage(self.thread, self.input))
+            self.queue.append({'method': 'turn/completed', 'params': {'threadId': self.thread,
+                                'turn': {'id': tid, 'status': 'completed'}}})
+        if 'id' in request:
+            # Replies follow some notifications deliberately; exact IDs must work.
+            self.queue.append({'id': request['id'], 'result': result})
+
+    def receive(self, timeout):
+        if not self.queue:
+            return None
+        return self.queue.pop(0)
+
+    def close(self, thread_id=None, turn_id=None, notify=None):
+        self.closed = True
+
+
+class DriverTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+
+    def config(self):
+        import argparse
+        args = argparse.Namespace(codex='unused', model='test-model', reasoning='high', force_compaction=False)
+        return evalmod.RunConfig('pilot', self.path, 2, 200000, 'total', 'pilot', args)
+
+    def test_full_native_driver_orders_rpc_and_scores_actual_bad_answers(self):
+        fixture = evalmod.Fixture.load(ROOT / 'eval/fixtures/continuity.json', 'pilot')
+        workspace = self.path / 'workspace'; fixture.prepare(workspace)
+        variant = evalmod.VariantRun('native', fixture, evalmod.RunBudget(30, 10000))
+        client = evalmod.LiveVariant(self.config(), variant, workspace, {}, [workspace], FakeHost)
+        try:
+            client.preflight(); client.drive()
+            self.assertEqual(len(variant.compactions), 2)
+            self.assertEqual(variant.scorecard()['scored_recoveries'], 2)
+            self.assertEqual(variant.scorecard()['critical_failures'], 2)
+            self.assertEqual(variant.budget.input_tokens, 540)
+            self.assertEqual([p['turn_id'] for p in variant.probes.values()], ['t3', 't5'])
+            self.assertNotIn('thread/compact/start', [r.get('method') for r in client.transport.sent])
+            self.assertNotIn('never-persist', json.dumps(variant.result()))
+        finally:
+            client.close()
+        self.assertTrue(client.transport.closed)
+
+    def test_input_budget_can_interrupt_while_waiting_for_turn_reply(self):
+        fixture = evalmod.Fixture.load(ROOT / 'eval/fixtures/continuity.json', 'pilot')
+        workspace = self.path / 'workspace'; fixture.prepare(workspace)
+        variant = evalmod.VariantRun('native', fixture, evalmod.RunBudget(30, 90))
+        client = evalmod.LiveVariant(self.config(), variant, workspace, {}, [workspace], FakeHost)
+        try:
+            client.preflight()
+            with self.assertRaisesRegex(evalmod.HarnessError, 'input ceiling'):
+                client.drive()
+            self.assertEqual(variant.budget.overshoot, 10)
+            self.assertEqual(len(variant.probes), 0)
+        finally:
+            client.close()
+
+    def test_pilot_then_release_home_cleanup_preserves_auth_and_refuses_edits(self):
+        home = self.path / 'home'; home.mkdir()
+        auth = home / 'auth.json'; auth.write_text('private-test-signin')
+        baseline = evalmod.prepare_home(home)
+        (home / 'sessions').mkdir(); (home / 'sessions/owned').write_text('pilot evidence')
+        (home / 'plugins').mkdir(); (home / 'plugins/owned').write_text('pilot store')
+        evalmod.finish_home(home, baseline, self.path / 'pilot')
+        evalmod.prepare_home(home)
+        self.assertEqual(auth.read_text(), 'private-test-signin')
+        self.assertFalse((home / 'sessions').exists())
+        self.assertFalse((home / 'plugins').exists())
+        (home / 'sessions').mkdir(); (home / 'sessions/owned').write_text('release evidence')
+        evalmod.finish_home(home, baseline, self.path / 'release')
+        (home / 'sessions/owned').write_text('external change')
+        with self.assertRaisesRegex(evalmod.HarnessError, 'changed'):
+            evalmod.prepare_home(home)
+        self.assertEqual((home / 'sessions/owned').read_text(), 'external change')
+
+    def test_forbidden_execution_in_failed_workload_stays_failed_after_undo(self):
+        v = evalmod.VariantRun('om', self.fixture, evalmod.RunBudget(30, 1000)); v.start_thread('thread')
+        for command in ['cat actions/migrate.py', 'echo "python3 actions/migrate.py"', 'rg migrate.py evidence']:
+            self.assertFalse(evalmod.executes_script(command, 'actions/migrate.py'), command)
+        for command in ['python3 actions/migrate.py', 'cd . && python3 ./actions/migrate.py',
+                        'bash -c "python3 actions/migrate.py; exit 1"']:
+            self.assertTrue(evalmod.executes_script(command, 'actions/migrate.py'), command)
+        v.event({'method': 'item/started', 'params': {'threadId': 'thread', 'turnId': 'ordinary',
+                 'item': {'id': 'attempt', 'type': 'commandExecution', 'command': 'python3 actions/migrate.py'}}})
+        self.assertEqual(v.scorecard()['repeated_completed_actions'], 1)
+
+    def test_rerouted_model_and_effective_memory_mismatch_fail(self):
+        v = evalmod.VariantRun('native', self.fixture, evalmod.RunBudget(30, 1000)); v.start_thread('thread')
+        with self.assertRaisesRegex(evalmod.HarnessError, 'rerouted'):
+            v.event({'method': 'model/rerouted', 'params': {'threadId': 'thread', 'fromModel': 'selected', 'toModel': 'other'}})
+        with self.assertRaisesRegex(evalmod.HarnessError, 'memory'):
+            evalmod.verify_effective({'config': {'model_auto_compact_token_limit': 200000,
+                'model_auto_compact_token_limit_scope': 'total', 'memories': {'use_memories': True, 'generate_memories': False}}}, self.config())
+
+class OMAndShutdownTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+
+    def test_deferral_proof_requires_actual_successful_apply_and_retained_source(self):
+        from types import SimpleNamespace
+        data = self.path / 'data'; data.mkdir()
+        (data / 'calls.jsonl').write_text(json.dumps({'session': 'owned', 'deferrals': ['s-log']}) + '\n')
+        v = evalmod.VariantRun('om', self.fixture, evalmod.RunBudget(30, 1000)); v.start_thread('owned')
+        c = SimpleNamespace(variant=v, data=data, config=SimpleNamespace(args=SimpleNamespace(om_home=self.path)))
+        line = self.fixture.workload['files']['evidence/build.log']
+        page = {'page': {'items': [{'evidence': {'source_id': 's-log', 'start_byte': 0, 'text': line,
+                        'review_state': 'deferred', 'deferral_reason': 'bulky build output', 'source_incomplete': False}}]}}
+        def pages(*args, **kwargs):
+            offset = 10000 * pages.n
+            unit = copy.deepcopy(page['page']['items'][0]['evidence']); unit['text'] = line[offset:offset + 10000]; unit['start_byte'] = offset
+            pages.n += 1
+            return json.dumps({'page': {'items': [{'evidence': unit}], 'next_cursor': str(pages.n) if offset + 10000 < len(line) else ''}}, ensure_ascii=False)
+        pages.n = 0
+        with patch.object(evalmod, 'run_local', side_effect=pages):
+            evalmod.verify_deferrals(c)
+            self.assertTrue(v.deferral_evidence['verified'])
+        page['page']['items'][0]['evidence']['deferral_reason'] = ''
+        pages.n = 0
+        with patch.object(evalmod, 'run_local', side_effect=pages):
+            with self.assertRaisesRegex(evalmod.HarnessError, 'deferred'):
+                evalmod.verify_deferrals(c)
+        (data / 'calls.jsonl').write_text(json.dumps({'session': 'other', 'deferrals': ['s-log']}) + '\n')
+        with patch.object(evalmod, 'run_local', side_effect=AssertionError('wrong session read')):
+            with self.assertRaises(evalmod.HarnessError):
+                evalmod.verify_deferrals(c)
+
+    def test_shutdown_keeps_final_usage_after_ceiling_and_owns_interrupt(self):
+        from unittest.mock import Mock
+        v = evalmod.VariantRun('native', self.fixture, evalmod.RunBudget(30, 100)); v.start_thread('owned')
+        with self.assertRaises(evalmod.HarnessError):
+            v.event(usage('owned', 110))
+        transport = object.__new__(evalmod.ProcessTransport)
+        transport.process = Mock()
+        transport.process.poll.return_value = None
+        transport.selector = Mock()
+        transport.send = Mock()
+        events = iter([usage('owned', 135), {'method': 'turn/completed', 'params': {'threadId': 'owned',
+                       'turn': {'id': 'running', 'status': 'interrupted'}}}])
+        transport.receive = lambda timeout: next(events, None)
+        transport.close('owned', 'running', v.event)
+        self.assertEqual(v.budget.input_tokens, 135)
+        self.assertEqual(v.budget.overshoot, 35)
+        sent = transport.send.call_args.args[0]
+        self.assertEqual(sent['method'], 'turn/interrupt')
+        self.assertEqual(sent['params'], {'threadId': 'owned', 'turnId': 'running'})
+        transport.process.terminate.assert_not_called()
+
+    def test_stale_usage_after_final_message_is_insufficient(self):
+        v = evalmod.VariantRun('native', self.fixture, evalmod.RunBudget(30, 1000)); v.start_thread('owned')
+        v.event(usage('owned', 10))
+        v.event({'method': 'item/completed', 'params': {'threadId': 'owned', 'turnId': 't',
+                 'item': {'id': 'm', 'type': 'agentMessage', 'text': 'done'}}})
+        with self.assertRaisesRegex(evalmod.HarnessError, 'usage'):
+            v.require_usage_since(0)
+        v.event(usage('owned', 20))
+        v.require_usage_since(0)
+
+    def test_missing_or_malformed_replay_preserves_failure_artifact(self):
+        replay = self.path / 'bad.json'; replay.write_text('{"schema":1,"events":[null]}')
+        self.assertEqual(evalmod.main(['--mode', 'replay', '--output', str(self.path / 'out'),
+                                      '--replay-events', str(replay)]), 1)
+        result = json.loads((self.path / 'out/results.json').read_text())
+        self.assertEqual(result['status'], 'failed')
+        self.assertFalse(result['release_pass'])
+
+class MatchedRunTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+
+    def test_both_live_variants_share_budget_and_can_reuse_homes(self):
+        import argparse
+        fixture = evalmod.Fixture.load(ROOT / 'eval/fixtures/continuity.json', 'pilot')
+        native_home, om_home = self.path / 'native-home', self.path / 'om-home'
+        native_home.mkdir(); om_home.mkdir()
+        for home in (native_home, om_home):
+            (home / 'auth.json').write_text('private-fake-auth')
+        candidate = self.path / 'candidate'; candidate.write_text('candidate bytes')
+        plugin = self.path / 'plugin'; plugin.mkdir(); (plugin / 'identity').write_text('plugin bytes')
+        args = argparse.Namespace(native_home=native_home, om_home=om_home, codex='unused', om_binary=candidate,
+                                  plugin_root=plugin, model='test-model', reasoning='high', force_compaction=False)
+        for run_name in ('pilot-one', 'pilot-two'):
+            output = self.path / run_name; output.mkdir()
+            config = evalmod.RunConfig('pilot', output, 2, 200000, 'total', 'pilot', args)
+            for name in evalmod.VARIANTS:
+                fixture.prepare(output / name / 'workspace')
+            budget = evalmod.RunBudget(30, 10000)
+            variants = {n: evalmod.VariantRun(n, fixture, budget) for n in evalmod.VARIANTS}
+            meta = {'om_binary_sha256': evalmod.digest(candidate.read_bytes()), 'plugin_sha256': evalmod.tree_hash(plugin)}
+            real_client = evalmod.LiveVariant
+
+            class OMHost(FakeHost):
+                def send(self, request):
+                    if request.get('method') == 'skills/list':
+                        self.sent.append(request)
+                        self.queue.append({'id': request['id'], 'result': {'data': [{'errors': [], 'skills': [{
+                            'name': 'observational-memory:observational-memory', 'pluginId': 'observational-memory@om-evaluation',
+                            'scope': 'user', 'enabled': True}]}]}})
+                    else:
+                        super().send(request)
+
+            def make_client(cfg, variant, workspace, env, writable):
+                return real_client(cfg, variant, workspace, env, writable,
+                                   FakeHost if variant.name == 'native' else OMHost)
+
+            def stage(cfg, run_budget):
+                data = om_home / 'plugins/data/store'; (data / 'bin').mkdir(parents=True)
+                (data / 'bin/om').write_text('meter')
+                return {'data': str(data)}
+
+            def meter(data):
+                path = data / 'calls.jsonl'
+                path.write_text(json.dumps({'input_bytes': 5, 'output_bytes': 7, 'hook': True, 'exit_code': 0}) + '\n')
+                return path
+
+            with patch.object(evalmod, 'schema_preflight', return_value={'version': 'fake'}), \
+                 patch.object(evalmod, 'stage_plugin', side_effect=stage), \
+                 patch.object(evalmod, 'install_meter', side_effect=meter), \
+                 patch.object(evalmod, 'LiveVariant', side_effect=make_client), \
+                 patch.object(evalmod.subprocess, 'Popen', side_effect=AssertionError('subprocess')):
+                evalmod.live(config, fixture, variants, budget, meta)
+            self.assertEqual(budget.input_tokens, 1080)
+            self.assertTrue(meta['global_config_unchanged'])
+            self.assertEqual([len(v.probes) for v in variants.values()], [2, 2])
+            for home in (native_home, om_home):
+                self.assertEqual((home / 'auth.json').read_text(), 'private-fake-auth')
+                evalmod.validate_home(home)
+
+
+class InterruptDriverTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+
+    def test_interrupt_is_sent_during_owned_command_and_usage_is_retained(self):
+        class InterruptHost(FakeHost):
+            def send(self, request):
+                if request.get('method') == 'turn/start':
+                    self.sent.append(request)
+                    self.queue.extend([
+                        {'method': 'turn/started', 'params': {'threadId': self.thread, 'turn': {'id': 'slow'}}},
+                        usage(self.thread, 100),
+                        {'method': 'item/started', 'params': {'threadId': self.thread, 'turnId': 'slow',
+                         'item': {'id': 'cmd', 'type': 'commandExecution', 'command': 'python3 diagnostic.py'}}},
+                        {'id': request['id'], 'result': {'turn': {'id': 'slow'}}}])
+                elif request.get('method') == 'turn/interrupt':
+                    self.sent.append(request)
+                    self.queue.extend([{'id': request['id'], 'result': {}},
+                        {'method': 'turn/completed', 'params': {'threadId': self.thread,
+                         'turn': {'id': 'slow', 'status': 'interrupted'}}}])
+                else:
+                    super().send(request)
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = evalmod.VariantRun('native', self.fixture, evalmod.RunBudget(30, 1000))
+        config = DriverTests.config(self)
+        c = evalmod.LiveVariant(config, v, workspace, {}, [workspace], InterruptHost)
+        try:
+            c.preflight(); c.start(); c.turn('run diagnostic', interrupt=True)
+            self.assertEqual(v.interruptions, [{'turn_id': 'slow', 'status': 'interrupted'}])
+            self.assertEqual(v.budget.input_tokens, 100)
+            sent = [r for r in c.transport.sent if r.get('method') == 'turn/interrupt']
+            self.assertEqual(sent[0]['params'], {'threadId': 'test-thread', 'turnId': 'slow'})
+        finally:
+            c.close()
 
 
 if __name__ == '__main__':

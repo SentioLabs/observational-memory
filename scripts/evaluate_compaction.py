@@ -7,6 +7,7 @@ threads. Scores are deterministic exact-match rubric checks, never model judges.
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 from dataclasses import dataclass, field
 import hashlib
@@ -16,6 +17,7 @@ from pathlib import Path
 import random
 import re
 import selectors
+import shlex
 import shutil
 import subprocess
 import sys
@@ -75,6 +77,87 @@ def redact(value):
     return value
 
 
+
+def safe_relative(name):
+    path = Path(name)
+    if not name or path.is_absolute() or '..' in path.parts or name in ('.', 'AGENTS.md'):
+        raise HarnessError('fixture path escapes workspace or shadows runner instructions')
+    return path
+
+
+
+def executes_script(command, target):
+    """Recognize executed workload scripts, not cat/echo/source-text mentions."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|()')
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    segments, current = [], []
+    for token in tokens + [';']:
+        if token and all(ch in ';&|()' for ch in token):
+            if current:
+                segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    for words in segments:
+        while words and ('=' in words[0] or words[0] in ('env', 'command', 'exec')):
+            words.pop(0)
+        if not words:
+            continue
+        executable = Path(words[0]).name
+        if words[0].removeprefix('./').endswith(target):
+            return True
+        if executable in ('sh', 'bash', 'zsh') and '-c' in words:
+            pos = words.index('-c') + 1
+            if pos < len(words) and executes_script(words[pos], target):
+                return True
+        if executable.startswith('python'):
+            if any(word.removeprefix('./').endswith(target) for word in words[1:] if not word.startswith('-')):
+                return True
+            if '-c' in words:
+                pos = words.index('-c') + 1
+                try:
+                    tree = ast.parse(words[pos])
+                    for node in ast.walk(tree):
+                        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                                and node.func.attr == 'run_path' and node.args
+                                and isinstance(node.args[0], ast.Constant) and node.args[0].value == target):
+                            return True
+                except (IndexError, SyntaxError):
+                    pass
+    return False
+
+
+def action_evidence(fixture, workspace, cycle, before=False, prior=None):
+    """Read actual per-probe artifacts, never self-reported action success."""
+    result = {}
+    for case in fixture.cases:
+        effect = case.get('effect')
+        if not effect:
+            continue
+        target = workspace / effect['path'].format(cycle=cycle)
+        original = workspace / effect['unchanged']
+        if target.is_symlink() or original.is_symlink():
+            raise HarnessError('action evidence cannot be a symlink')
+        if before:
+            result[case['id']] = {'absent': not target.exists()}
+            continue
+        try:
+            actual = json.loads(target.read_text()) if target.is_file() else None
+        except (ValueError, UnicodeError):
+            actual = None
+        expected_original = fixture.workload['files'][effect['unchanged']].encode()
+        result[case['id']] = {
+            'performed': bool(prior and prior.get(case['id'], {}).get('absent') and actual == effect['content']),
+            'unchanged': original.is_file() and original.read_bytes() == expected_original,
+            'artifact_sha256': digest(target.read_bytes()) if target.is_file() else None,
+            'provenance': 'new cycle-specific workspace artifact plus original completed-operation record'}
+    return result
+
+
 @dataclass
 class Fixture:
     split: str
@@ -83,11 +166,14 @@ class Fixture:
     workload: dict
     fixture_hash: str
     split_hash: str
+    rubric_hash: str
 
     @classmethod
     def load(cls, path, split):
         raw = path.read_bytes()
         data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise HarnessError('invalid fixture object')
         if data.get('schema') != SCHEMA or split not in ('pilot', 'release'):
             raise HarnessError('unsupported fixture schema/split')
         ids, markers = set(), {'pilot': set(), 'release': set()}
@@ -98,14 +184,40 @@ class Fixture:
             markers[case['split']].update(case.get('markers', []))
         if markers['pilot'] & markers['release']:
             raise HarnessError('generated fact/error markers overlap splits')
+        for selected in ('pilot', 'release'):
+            workload = data['workloads'][selected]
+            files = workload['files']
+            for name, content in files.items():
+                safe_relative(name)
+                if not isinstance(content, str) or len(content) > 1_000_000:
+                    raise HarnessError('invalid source text')
+            visible = canonical(workload).decode()
+            other = 'release' if selected == 'pilot' else 'pilot'
+            if any(marker in visible for marker in markers[other]):
+                raise HarnessError('held-out split marker leaked into workload')
+            for case in (c for c in data['cases'] if c['split'] == selected):
+                if type(case.get('critical')) is not bool or not isinstance(case.get('probe'), str):
+                    raise HarnessError('invalid fixture rubric')
+                if 'source' in case:
+                    source = case['source']
+                    safe_relative(source['path'])
+                    lines = files.get(source['path'], '').splitlines()
+                    n = source['line']
+                    if type(n) is not int or n < 1 or n > len(lines) or lines[n - 1] != source['text']:
+                        raise HarnessError('gold exact source does not match workload')
+                if 'effect' in case:
+                    safe_relative(case['effect']['path'].format(cycle=1))
+                    safe_relative(case['effect']['unchanged'])
         # Only selected cases/workload leave validation; no held-out scoring in pilot.
         cases = [c for c in data['cases'] if c['split'] == split]
         workload = data['workloads'][split]
         if not cases or not any(c['critical'] for c in cases):
             raise HarnessError('empty rubric')
         frozen = {'seed': data['seed'], 'cases': cases, 'workload': workload,
-                  'generator': 'service-incident-v1', 'schema': SCHEMA}
-        return cls(split, data['seed'], cases, workload, digest(raw), digest(canonical(frozen)))
+                  'generator': 'service-incident-v1', 'schema': SCHEMA,
+                  'runner_sha256': digest(Path(__file__).read_bytes())}
+        rubric = {key: value for key, value in frozen.items() if key != 'runner_sha256'}
+        return cls(split, data['seed'], cases, workload, digest(raw), digest(canonical(frozen)), digest(canonical(rubric)))
 
     def check_hash(self, expected):
         if expected != self.split_hash:
@@ -137,7 +249,7 @@ class Fixture:
             region = rng.choice(regions)
             latency = rng.randrange(12, 950)
             status = rng.choices([200, 429, 503], [88, 8, 4])[0]
-            rows.append({'request': f'{self.split}-{index:05d}-{n:04d}', 'region': region,
+            rows.append({'request': f'{rng.getrandbits(48):012x}-{index:05d}-{n:04d}', 'region': region,
                          'latency_ms': latency, 'status': status, 'retry': status != 200,
                          'route': rng.choice(['/ingest', '/query', '/snapshot', '/health']),
                          'payload_bytes': rng.randrange(120, 45000)})
@@ -226,7 +338,7 @@ class Usage:
     def start(self, name, baseline, reason):
         if not reason or any(s.name == name for s in self.segments):
             raise HarnessError('usage segment requires unique identity and reset provenance')
-        if type(baseline.get('inputTokens')) is not int:
+        if type(baseline.get('inputTokens')) is not int or baseline['inputTokens'] < 0:
             raise HarnessError('usage segment needs observed input baseline')
         self.segments.append(UsageSegment(name, baseline, reason))
 
@@ -256,6 +368,13 @@ class VariantRun:
         self.effective = {}
         self.active_turn = None
         self.reroutes = []
+        self.compaction_starts = {}
+        self.workload_batches = []
+        self.interruptions = []
+        self.deferral_evidence = None
+        self.forbidden_attempts = set()
+        self.last_agent_usage_index = None
+        self.started_commands = {}
 
     def start_thread(self, ident):
         if self.thread_id or not ident:
@@ -271,11 +390,21 @@ class VariantRun:
         p, method = event.get('params', {}), event.get('method')
         if p.get('threadId') != self.thread_id or self.thread_id is None:
             return
+        if method in ('item/started', 'item/completed') and p.get('item', {}).get('type') == 'commandExecution':
+            item = p['item']
+            if method == 'item/started':
+                self.started_commands[item.get('id')] = p.get('turnId')
+            for case in self.fixture.cases:
+                if case.get('forbidden_script') and executes_script(item.get('command', ''), case['forbidden_script']):
+                    self.forbidden_attempts.add(item.get('id', '<missing-id>'))
         if method == 'model/rerouted':
             self.reroutes.append(redact(p))
             raise HarnessError('model rerouted away from authorized matched selection')
         if method == 'turn/started':
             self.active_turn = p.get('turn', {}).get('id')
+        if method == 'item/started' and p.get('item', {}).get('type') == 'contextCompaction':
+            self.compaction_starts[p['item'].get('id')] = (
+                copy.deepcopy(self.usage.observations[-1]) if self.usage.observations else None)
         if method == 'thread/tokenUsage/updated':
             self.budget.charge(self.usage.observe(p.get('tokenUsage', {}), p.get('turnId')))
         if method == 'item/completed':
@@ -288,15 +417,17 @@ class VariantRun:
                     self.seen.add(key)
                     self.compactions.append({'thread_id': self.thread_id, 'item_id': item['id'],
                         'turn_id': p.get('turnId'), 'completed_at_ms': p.get('completedAtMs'),
-                        'before_usage': copy.deepcopy(self.usage.observations[-1]) if self.usage.observations else None,
-                        'after_usage': None})
+                        'before_usage': self.compaction_starts.get(item['id']),
+                        'after_usage': copy.deepcopy(self.usage.observations[-1]) if self.usage.observations else None})
             elif item.get('type') == 'agentMessage':
                 self.messages.setdefault(p.get('turnId'), {})[item.get('id')] = item.get('text', '')
+                self.last_agent_usage_index = len(self.usage.observations)
             elif item.get('type') == 'commandExecution':
                 self.commands.append({'turn_id': p.get('turnId'), 'item': item})
         if method == 'turn/completed':
             turn = p.get('turn', {})
             self.turns[turn.get('id')] = turn
+            self.active_turn = None
         if method == 'error' and not p.get('willRetry', False):
             raise HarnessError('host reported a non-retryable turn error')
         if method == 'thread/tokenUsage/updated':
@@ -307,17 +438,19 @@ class VariantRun:
     def require_usage_since(self, samples):
         observations = self.usage.observations
         baseline = observations[samples - 1]['total']['inputTokens'] if samples else 0
-        if len(observations) <= samples or observations[-1]['total']['inputTokens'] <= baseline:
+        if (len(observations) <= samples or observations[-1]['total']['inputTokens'] <= baseline
+                or (self.last_agent_usage_index is not None and len(observations) <= self.last_agent_usage_index)):
             raise HarnessError('usage telemetry missing or stale for completed work; stopping before another request')
 
     def begin_probe(self, cycle, turn_id):
-        if cycle != len(self.compactions) or cycle != len(self.probes) + 1:
+        if (cycle != len(self.compactions) or cycle != len(self.probes) + 1
+                or any(p['scores'] is None for p in self.probes.values())):
             raise HarnessError('unprobed compaction: each cycle requires its own immediate recovery')
         if not turn_id or any(p['turn_id'] == turn_id for p in self.probes.values()):
             raise HarnessError('probe turn must have a distinct identity')
         self.probes[cycle] = {'turn_id': turn_id, 'scores': None}
 
-    def finish_probe(self, cycle, turn_id, response):
+    def finish_probe(self, cycle, turn_id, response, effects=None):
         probe = self.probes.get(cycle)
         if not probe or probe['turn_id'] != turn_id or probe['scores'] is not None:
             raise HarnessError('probe response identity mismatch or duplicate score')
@@ -325,25 +458,30 @@ class VariantRun:
         if len(self.compactions) != cycle:
             raise HarnessError('compaction occurred before its predecessor recovery completed')
         answers = response.get('answers', {}) if isinstance(response, dict) else {}
+        if not isinstance(answers, dict):
+            answers = {}
+        effects = effects or {}
         scores = []
         for case in self.fixture.cases:
             answer = answers.get(case['id'], {})
+            if not isinstance(answer, dict):
+                answer = {}
             text = answer.get('answer', '')
             stale = any(word.casefold() in str(text).casefold() for word in case.get('forbidden', []))
             repeated = answer.get('action') == case.get('forbidden_action') if 'forbidden_action' in case else False
-            if case.get('forbidden_command'):
-                repeated |= any(case['forbidden_command'] in c['item'].get('command', '') for c in self.commands)
+            if 'effect' in case:
+                repeated |= effects.get(case['id'], {}).get('unchanged') is not True or bool(self.forbidden_attempts)
             correct = (isinstance(text, str) and ('expected' not in case or text.strip() == case['expected'])
                        and ('expected_action' not in case or answer.get('action') == case['expected_action'])
                        and ('source' not in case or answer.get('source') == case['source'])
                        and not stale and not repeated)
-            if case.get('expected_command'):
-                correct &= any(c['turn_id'] == turn_id and case['expected_command'] in c['item'].get('command', '')
-                               and c['item'].get('exitCode') == 0 for c in self.commands)
+            if 'effect' in case:
+                correct &= effects.get(case['id'], {}).get('performed') is True
             scores.append({'case_id': case['id'], 'critical': case['critical'], 'correct': correct,
                            'stale': stale, 'repeated': repeated, 'exact_source': 'source' in case})
         probe['scores'] = scores
         probe['response'] = response
+        probe['effects'] = effects
 
     def scorecard(self):
         scores = [s for p in self.probes.values() for s in (p['scores'] or [])]
@@ -352,7 +490,7 @@ class VariantRun:
                 'scored_recoveries': sum(p['scores'] is not None for p in self.probes.values()),
                 'critical_failures': sum(s['critical'] and not s['correct'] for s in scores),
                 'stale_corrections': sum(s['stale'] for s in scores),
-                'repeated_completed_actions': sum(s['repeated'] for s in scores),
+                'repeated_completed_actions': max(len(self.forbidden_attempts), sum(s['repeated'] for s in scores)),
                 'noncritical_accuracy': (sum(s['correct'] for s in noncritical) / len(noncritical)
                                           if noncritical else None),
                 'exact_source_checks': sum(s['exact_source'] for s in scores),
@@ -360,8 +498,13 @@ class VariantRun:
 
     def result(self):
         return {'scorecard': self.scorecard(), 'compactions': self.compactions, 'probes': self.probes,
-                'usage': self.usage.totals(), 'usage_segments': [vars(s) for s in self.usage.segments],
+                'usage': self.usage.totals(),
+                'usage_provenance': {k: ('thread/tokenUsage/updated.tokenUsage.total.' + k
+                                          if self.usage.totals()[k] is not None else None) for k in FIELDS},
+                'usage_segments': [vars(s) for s in self.usage.segments],
                 'usage_observations': self.usage.observations, 'effective': self.effective, 'reroutes': self.reroutes,
+                'workload_batches': self.workload_batches, 'interruptions': self.interruptions,
+                'deferral_evidence': self.deferral_evidence, 'forbidden_attempts': sorted(self.forbidden_attempts),
                 'checkpoints': {str(n): [self.probes[k] for k in range(1, n + 1)]
                                 for n in (10, 25, 50) if all(k in self.probes for k in range(1, n + 1))}}
 
@@ -489,6 +632,18 @@ class ProcessTransport:
                             break
                 except (OSError, HarnessError):
                     pass
+            if notify:
+                deadline = time.monotonic() + 0.25
+                try:
+                    while time.monotonic() < deadline:
+                        event = self.receive(min(0.05, deadline - time.monotonic()))
+                        if event and 'method' in event and 'id' not in event:
+                            try:
+                                notify(event)
+                            except HarnessError:
+                                pass
+                except (OSError, HarnessError):
+                    pass
             self.process.stdin.close()
             try:
                 self.process.wait(timeout=3)
@@ -569,12 +724,13 @@ def parse_args(argv):
         if any(a in b.parents or b in a.parents for i, a in enumerate(paths) for b in paths[i + 1:]):
             raise HarnessError('homes and output must not overlap; auth must remain outside artifacts')
         for home in homes:
-            if not home.is_dir() or not os.access(home, os.W_OK):
-                raise HarnessError('evaluation homes must already exist and be writable after normal Codex sign-in')
-            if any((home / p).exists() for p in ('sessions', 'memories', 'skills', 'plugins', 'AGENTS.md')):
-                raise HarnessError('evaluation homes must be dedicated and unused (no sessions/memory/skills/plugins)')
+            validate_home(home)
         if not args.om_binary.is_file() or not os.access(args.om_binary, os.X_OK) or not args.plugin_root.is_dir():
             raise HarnessError('candidate binary/plugin path unavailable')
+    if args.om_binary and not args.om_binary.is_file():
+        raise HarnessError('candidate binary path unavailable')
+    if args.plugin_root and not args.plugin_root.is_dir():
+        raise HarnessError('candidate plugin path unavailable')
     if args.mode == 'replay' and not args.replay_events:
         raise HarnessError('replay requires --replay-events')
     return RunConfig(args.mode, args.output.resolve(), cycles, args.compact_limit, args.scope, split, args)
@@ -602,7 +758,7 @@ def schema_preflight(codex, directory, budget, env):
         return json.loads(matches[0].read_text())
     requests = canonical(schema('ClientRequest')).decode()
     notifications = canonical(schema('ServerNotification')).decode()
-    for method in ('initialize', 'thread/start', 'turn/start', 'turn/interrupt', 'config/read', 'model/list', 'account/read'):
+    for method in ('initialize', 'thread/start', 'turn/start', 'turn/interrupt', 'config/read', 'model/list', 'account/read', 'skills/list'):
         if '"' + method + '"' not in requests:
             raise HarnessError('installed host lacks required method: ' + method)
     for method in ('item/completed', 'turn/completed', 'thread/tokenUsage/updated'):
@@ -617,7 +773,7 @@ def schema_preflight(codex, directory, budget, env):
     if 'inputTokens' not in usage['TokenUsageBreakdown'].get('required', []) or 'total' not in usage['ThreadTokenUsage'].get('required', []):
         raise HarnessError('cumulative input telemetry unsupported')
     config = schema('ConfigReadResponse')['definitions']['Config']['properties']
-    for key in ('model_auto_compact_token_limit', 'model_auto_compact_token_limit_scope', 'memories'):
+    for key in ('model_auto_compact_token_limit', 'model_auto_compact_token_limit_scope'):
         if key not in config:
             raise HarnessError('effective compaction/memory configuration cannot be verified')
     start = schema('ThreadStartParams')
@@ -626,14 +782,94 @@ def schema_preflight(codex, directory, budget, env):
         raise HarnessError('workspace-write sandbox unsupported')
     if 'effort' not in schema('TurnStartParams')['properties']:
         raise HarnessError('explicit turn reasoning effort unsupported')
-    return {'schema_sha256': tree_hash(directory), 'version': run_local([codex, '--version'], budget, env).strip()}
+    return {'schema_sha256': tree_hash(directory), 'version': run_local([codex, '--version'], budget, env).strip(),
+            'binary_sha256': digest(Path(shutil.which(codex) or codex).resolve().read_bytes())}
+
+
+
+HOME_MARKER = '.om-eval-ownership.json'
+# Created by Codex/app-server or this runner in an otherwise unused evaluation
+# home. Auth files are never included, hashed into results, copied or deleted.
+GENERATED_HOME = re.compile(r'^(?:config\.toml|plugins|sessions|skills|memories|shell_snapshots|log|tmp|\.tmp|'
+                            r'goals_\d+\.sqlite(?:-shm|-wal)?|logs_\d+\.sqlite(?:-shm|-wal)?|'
+                            r'memories_\d+\.sqlite(?:-shm|-wal)?|queue_\d+\.sqlite(?:-shm|-wal)?|'
+                            r'state_\d+\.sqlite(?:-shm|-wal)?|models_cache\.json|version\.json|'
+                            r'installation_id|thread-writer-locks|thread_history_\d+\.sqlite(?:-shm|-wal)?|\.sandbox_migration|\.personality_migration)$')
+
+
+def path_hash(path):
+    if path.is_symlink():
+        raise HarnessError('evaluation home state contains a symlink')
+    return tree_hash(path) if path.is_dir() else digest(path.read_bytes())
+
+
+def validate_home(home):
+    if not home.is_dir() or not os.access(home, os.W_OK):
+        raise HarnessError('dedicated evaluation home must exist and be writable after normal sign-in')
+    marker = home / HOME_MARKER
+    if marker.is_file():
+        state = json.loads(marker.read_text())
+        if state.get('schema') != SCHEMA or state.get('home') != str(home.resolve()):
+            raise HarnessError('invalid evaluation home ownership record')
+        names = {p.name for p in home.iterdir()}
+        if names != set(state['baseline']) | set(state['created']) | {HOME_MARKER}:
+            raise HarnessError('evaluation home changed outside the prior run; refusing cleanup')
+        for name, expected in state['created'].items():
+            if not GENERATED_HOME.fullmatch(name) or path_hash(home / name) != expected:
+                raise HarnessError('runner-owned evaluation state changed; refusing cleanup')
+        return state
+    names = {p.name for p in home.iterdir()}
+    # These are authentication/installation artifacts of normal Codex sign-in.
+    if names - {'auth.json', 'installation_id', '.credentials.json'}:
+        raise HarnessError('use unused signed-in evaluation homes, or homes with verified runner ownership')
+    if any(p.is_symlink() for p in home.iterdir()):
+        raise HarnessError('evaluation authentication files must not be symlinks')
+    return {'baseline': sorted(names), 'created': {}}
+
+
+def prepare_home(home):
+    state = validate_home(home)
+    for name in state['created']:
+        target = home / name
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    (home / HOME_MARKER).unlink(missing_ok=True)
+    return state['baseline']
+
+
+def finish_home(home, baseline, output, release_exposures=None):
+    created = {}
+    for path in home.iterdir():
+        if path.name in baseline or path.name in ('auth.json', '.credentials.json'):
+            continue  # Normal authentication refresh remains private in this home.
+        if not GENERATED_HOME.fullmatch(path.name):
+            raise HarnessError('unexpected evaluation home state; cannot certify safe reuse')
+        created[path.name] = path_hash(path)
+    baseline = sorted(set(baseline) | {p.name for p in home.iterdir() if p.name in ('auth.json', '.credentials.json')})
+    write_json(home / HOME_MARKER, {'schema': SCHEMA, 'home': str(home.resolve()), 'run': str(output),
+                                   'baseline': baseline, 'created': created, 'release_exposures': release_exposures or []})
+
+
+def effective_comparison(config):
+    value = copy.deepcopy(config)
+    # Writable roots are independently checked against each variant's exact
+    # synthetic workspace/store; all other sandbox settings remain comparable.
+    sandbox = value.get('sandbox_workspace_write')
+    if isinstance(sandbox, dict):
+        sandbox.pop('writable_roots', None)
+    value.pop('plugins', None)
+    return value
 
 
 def process_env(home):
     env = dict(os.environ, CODEX_HOME=str(home))
     # Only the requested home/normal sign-in supplies auth and provider selection.
-    for key in ('OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_ACCESS_TOKEN', 'CODEX_REMOTE_TOKEN'):
-        env.pop(key, None)
+    for key in list(env):
+        if key.startswith(('OPENAI_', 'CODEX_')) and key != 'CODEX_HOME':
+            env.pop(key, None)
+    env.pop('OBSERVATIONAL_MEMORY_STORE', None)
     return env
 
 
@@ -644,7 +880,9 @@ def settings(config):
             'memories.use_memories': False, 'memories.generate_memories': False,
             'approval_policy': 'never', 'sandbox_mode': 'workspace-write',
             'sandbox_workspace_write.network_access': False, 'web_search': 'disabled',
-            'features.multi_agent': False}
+            'features.multi_agent': False, 'features.apps': False,
+            'sandbox_workspace_write.exclude_slash_tmp': True,
+            'sandbox_workspace_write.exclude_tmpdir_env_var': True}
 
 
 def verify_effective(value, config):
@@ -654,7 +892,7 @@ def verify_effective(value, config):
     memory = effective.get('memories', {})
     if memory.get('use_memories') is not False or memory.get('generate_memories') is not False:
         raise HarnessError('effective native memory isolation unavailable')
-    for key in ('compact_prompt', 'experimental_compact_prompt_file', 'model_context_window', 'developer_instructions'):
+    for key in ('compact_prompt', 'experimental_compact_prompt_file', 'model_context_window', 'developer_instructions', 'instructions'):
         if effective.get(key) is not None:
             raise HarnessError('evaluation requires native context window/compaction prompt and no extra instructions')
     if effective.get('model_provider') not in (None, 'openai') or effective.get('mcp_servers'):
@@ -719,7 +957,19 @@ started = time.monotonic()
 r = subprocess.run([{real}] + args, input=raw, capture_output=True)
 entry = {{'input_bytes': len(raw), 'output_bytes': len(r.stdout), 'stderr_bytes': len(r.stderr),
           'seconds': time.monotonic()-started, 'exit_code': r.returncode,
-          'hook': 'hook' in args}}
+          'hook': 'hook' in args, 'session': None, 'deferrals': [], 'hook_unavailable': False}}
+try:
+    payload = json.loads(raw) if raw else {{}}
+    response = json.loads(r.stdout)
+    if '--session' in args:
+        entry['session'] = args[args.index('--session')+1]
+    if 'hook' in args:
+        entry['session'] = payload.get('session_id')
+        entry['hook_unavailable'] = 'unavailable' in str(response).lower()
+    if 'apply' in args and r.returncode == 0:
+        entry['deferrals'] = [d['source_id'] for d in payload.get('defer_sources', [])]
+except (ValueError, KeyError, IndexError, TypeError):
+    pass
 fd = os.open({meter}, os.O_APPEND | os.O_WRONLY)
 os.write(fd, (json.dumps(entry)+'\\n').encode()); os.close(fd)
 sys.stdout.buffer.write(r.stdout); sys.stderr.buffer.write(r.stderr)
@@ -730,15 +980,60 @@ sys.exit(r.returncode)
     return meter
 
 
+
+def verify_deferrals(client):
+    """Read existing public v2 evidence; never seed, acknowledge or score it."""
+    if client.variant.name != 'om' or client.variant.fixture.split != 'release':
+        return
+    data = client.data
+    calls = [json.loads(line) for line in (data / 'calls.jsonl').read_text().splitlines()]
+    sources = sorted({source for call in calls if call.get('session') == client.variant.thread_id
+                      for source in call.get('deferrals', [])})
+    wanted = [client.variant.fixture.workload['files'][c['source']['path']]
+              for c in client.variant.fixture.cases if c.get('require_deferral')]
+    matched, audits = set(), []
+    for source in sources:
+        cursor, seen, units = None, set(), []
+        while True:
+            args = [str(data / 'bin/om'), '--store', str(data), '--session', client.variant.thread_id, 'recall', source]
+            if cursor:
+                args.extend(['--cursor', cursor])
+            raw = run_local(args, client.variant.budget, process_env(client.config.args.om_home))
+            if len(raw.encode()) > 12000:
+                raise HarnessError('OM audit recall exceeded v2 envelope')
+            page = json.loads(raw)['page']
+            units.extend(item['evidence'] for item in page['items'] if item.get('evidence'))
+            cursor = page.get('next_cursor')
+            if not cursor:
+                break
+            if cursor in seen:
+                raise HarnessError('OM recall cursor repeated')
+            seen.add(cursor)
+        units.sort(key=lambda u: u['start_byte'])
+        text = ''.join(u['text'] for u in units)
+        for line in wanted:
+            if line in text and any(u.get('deferral_reason') for u in units) and not any(u.get('source_incomplete') for u in units):
+                matched.add(line)
+        audits.append({'source_id': source, 'bytes': len(text.encode()), 'source_sha256': digest(text.encode()),
+                       'deferred_units': sum(u.get('review_state') == 'deferred' for u in units),
+                       'deferral_audit_units': sum(bool(u.get('deferral_reason')) for u in units)})
+    client.variant.deferral_evidence = {'verified': len(matched) == len(wanted) and bool(wanted),
+                                       'sources': audits, 'provenance': 'successful session apply plus public paged recall; full predefined tool source retained'}
+    if not client.variant.deferral_evidence['verified']:
+        raise HarnessError('required deferred tool-log source was not actually retained and explicitly deferred')
+
+
 class LiveVariant:
-    def __init__(self, config, variant, workspace, env, writable):
-        self.config, self.variant, self.workspace = config, variant, workspace
+    def __init__(self, config, variant, workspace, env, writable, transport_factory=ProcessTransport):
+        self.config, self.variant, self.workspace = config, variant, workspace.resolve()
+        self.writable = [str(p.resolve()) for p in writable]
+        self.data = writable[-1] if variant.name == 'om' else None
         options = settings(config)
-        options['sandbox_workspace_write.writable_roots'] = [str(p) for p in writable]
+        options['sandbox_workspace_write.writable_roots'] = self.writable
         argv = [config.args.codex, 'app-server']
         for key, value in options.items():
             argv.extend(['-c', key + '=' + json.dumps(value)])
-        self.transport = ProcessTransport(argv, env, workspace)
+        self.transport = transport_factory(argv, env, workspace)
         self.active_turn = None
         self.log = (config.output / (variant.name + '-events.jsonl')).open('w')
         self.rpc = RpcClient(self.transport.receive, self.transport.send, variant.budget, self.notify)
@@ -758,6 +1053,29 @@ class LiveVariant:
         if not account or account.get('type') != 'chatgpt':
             raise HarnessError('normal Codex ChatGPT sign-in required in each dedicated evaluation home')
         effective = verify_effective(self.rpc.request('config/read', {'cwd': str(self.workspace), 'includeLayers': True}), self.config)
+        sandbox = effective.get('sandbox_workspace_write', {})
+        if (sandbox.get('network_access') is not False or
+                sorted(sandbox.get('writable_roots', [])) != sorted(self.writable)):
+            raise HarnessError('effective workspace/store permissions differ from evaluation scope')
+        skills = self.rpc.request('skills/list', {'cwds': [str(self.workspace)], 'forceReload': True})
+        base_skills, om_skills = [], []
+        for entry in skills.get('data', []):
+            if entry.get('errors'):
+                raise HarnessError('evaluation skill loading failed')
+            for skill in entry.get('skills', []):
+                if not skill.get('enabled'):
+                    continue
+                if skill.get('pluginId'):
+                    if self.variant.name != 'om' or (skill.get('name') != 'observational-memory:observational-memory' or
+                            skill.get('pluginId') != 'observational-memory@om-evaluation'):
+                        raise HarnessError('unexpected plugin capability in evaluation')
+                    om_skills.append(skill['name'])
+                elif skill.get('scope') != 'system':
+                    raise HarnessError('external user/repository skills defeat evaluation isolation')
+                else:
+                    base_skills.append([skill['name'], digest(Path(skill['path']).read_bytes())])
+        if self.variant.name == 'om' and om_skills != ['observational-memory:observational-memory']:
+            raise HarnessError('OM skill is not installed and enabled')
         models, cursor, seen = [], None, set()
         while True:
             page = self.rpc.request('model/list', {'cursor': cursor, 'limit': 100, 'includeHidden': False})
@@ -772,7 +1090,7 @@ class LiveVariant:
         if not selected or self.config.args.reasoning not in [e['reasoningEffort'] for e in selected.get('supportedReasoningEfforts', [])]:
             raise HarnessError('selected model/reasoning is not advertised by this signed-in host')
         self.variant.effective = {'config': redact(effective), 'model': self.config.args.model,
-                                  'reasoning': self.config.args.reasoning, 'auth': 'dedicated Codex ChatGPT sign-in'}
+                                  'reasoning': self.config.args.reasoning, 'auth': 'dedicated Codex ChatGPT sign-in', 'base_skills': sorted(base_skills)}
         return effective
 
     def start(self):
@@ -791,6 +1109,7 @@ class LiveVariant:
 
     def turn(self, prompt, cycle=None, interrupt=False):
         before = len(self.variant.usage.observations)
+        effects_before = action_evidence(self.variant.fixture, self.workspace, cycle, before=True) if cycle else None
         response = self.rpc.request('turn/start', {'threadId': self.variant.thread_id,
                    'input': [{'type': 'text', 'text': prompt}], 'effort': self.config.args.reasoning})
         turn_id = response.get('turn', {}).get('id')
@@ -805,7 +1124,8 @@ class LiveVariant:
             while turn_id not in self.variant.turns:
                 observed = self.variant.usage.observations
                 baseline = observed[before - 1]['total']['inputTokens'] if before else 0
-                if len(observed) > before and observed[-1]['total']['inputTokens'] > baseline:
+                if (len(observed) > before and observed[-1]['total']['inputTokens'] > baseline
+                        and turn_id in self.variant.started_commands.values()):
                     break
                 self.rpc.pump(0.1)
             if turn_id not in self.variant.turns:
@@ -816,6 +1136,8 @@ class LiveVariant:
         if completed.get('status') not in (('interrupted', 'completed') if interrupt else ('completed',)):
             raise HarnessError('evaluation turn did not complete successfully')
         self.active_turn = None
+        if interrupt:
+            self.variant.interruptions.append({'turn_id': turn_id, 'status': completed.get('status')})
         # Notifications may race with turn completion. Drain boundedly for usage;
         # never start the next paid turn while usage is unknown.
         grace = time.monotonic() + 2
@@ -832,7 +1154,8 @@ class LiveVariant:
                 answer = json.loads(values[-1]) if values else {}
             except ValueError:
                 answer = {}  # Invalid JSON is a failed actual probe, not a retry with hints.
-            self.variant.finish_probe(cycle, turn_id, answer)
+            self.variant.finish_probe(cycle, turn_id, answer,
+                                      action_evidence(self.variant.fixture, self.workspace, cycle, prior=effects_before))
         return turn_id
 
     def recover(self):
@@ -845,23 +1168,29 @@ class LiveVariant:
         for event in self.variant.fixture.workload['events']:
             prompt = event['text']
             if self.variant.name == 'om':
+                prompt += '\n' + event.get('om_instruction', '')
                 prompt += '\nUse the installed $observational-memory skill for this task. ' \
                           'Bulky tool logs may be explicitly deferred after identifying their source/span; ' \
                           'keep their searchable evidence and honest coverage.'
             self.turn(prompt, interrupt=event.get('interrupt', False))
             self.recover()
+        verify_deferrals(self)
         index = 0
         while len(self.variant.compactions) < self.config.cycles:
             self.variant.budget.check()
             index += 1
             batch = self.variant.fixture.batch(index)
+            self.variant.workload_batches.append({'index': index, 'sha256': digest(batch.encode()), 'bytes': len(batch.encode())})
             relative = f'batches/incident-{index:05d}.jsonl'
             (self.workspace / relative).write_text(batch)
-            self.turn(f'Analyze new incident batch {index}. Read all of {relative} with sufficient tool output allowance. '
-                      f'Compute per-region request counts, failures and p95 latency_ms; compare to your previous incident report. '
-                      f'Write reports/incident-{index:05d}.json and record which region needs investigation. '
+            prompt = (f'Analyze new incident batch {index}. The complete new request observations follow, and are also in {relative}. '
+                      'Compute per-region request counts, failures and p95 latency_ms; compare to your previous incident report. '
+                      f'Write reports/incident-{index:05d}.json and explain which region and route need investigation using concrete request IDs. '
                       'Keep the accepted project constraints and completed steps. Do not rerun migrations. '
-                      'Use local tools; these are fresh observations, not a replay of earlier incidents.')
+                      'Use local tools for arithmetic, then interpret the new evidence.\nObserved requests:\n' + batch)
+            self.variant.workload_batches[-1].update({'prompt_sha256': digest(prompt.encode()),
+                                                      'model_visible_bytes': len(prompt.encode())})
+            self.turn(prompt)
             if self.config.args.force_compaction and len(self.variant.compactions) == len(self.variant.probes):
                 before = len(self.variant.compactions)
                 samples = len(self.variant.usage.observations)
@@ -876,18 +1205,24 @@ class LiveVariant:
             raise HarnessError('more compactions than requested; recovery evidence is incomplete')
 
     def close(self):
-        self.transport.close(self.variant.thread_id, self.active_turn or self.variant.active_turn, self.notify)
-        self.log.close()
+        try:
+            self.transport.close(self.variant.thread_id, self.active_turn or self.variant.active_turn, self.notify)
+        finally:
+            self.log.close()
 
 
 def replay(config, fixture, variants, budget):
     payload = json.loads(config.args.replay_events.read_text())
+    if not isinstance(payload, dict) or not isinstance(payload.get('events'), list):
+        raise HarnessError('invalid replay envelope')
     if payload.get('schema') != SCHEMA:
         raise HarnessError('replay schema mismatch')
     fixture.check_hash(payload.get('split_hash'))
     if payload.get('compact_limit') != config.compact_limit or payload.get('scope') != config.scope:
         raise HarnessError('replay threshold/scope mismatch')
     for entry in payload.get('events', []):
+        if not isinstance(entry, dict):
+            raise HarnessError('invalid replay record')
         budget.check()
         name = entry.get('variant')
         if name not in variants:
@@ -901,7 +1236,7 @@ def replay(config, fixture, variants, budget):
         elif kind == 'probe_start':
             variant.begin_probe(entry['cycle'], entry['turn_id'])
         elif kind == 'probe_result':
-            variant.finish_probe(entry['cycle'], entry['turn_id'], entry['response'])
+            variant.finish_probe(entry['cycle'], entry['turn_id'], entry['response'], entry.get('effects'))
         elif kind == 'event':
             variant.event(entry['event'])
         else:
@@ -910,50 +1245,64 @@ def replay(config, fixture, variants, budget):
 
 def live(config, fixture, variants, budget, metadata):
     args = config.args
+    protected = {Path.home() / '.codex/config.toml', Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')) / 'config.toml'}
+    global_before = {str(p): digest(p.read_bytes()) if p.is_file() else None for p in protected}
     homes = {name: getattr(args, name + '_home').resolve() for name in VARIANTS}
+    states = {name: validate_home(home) for name, home in homes.items()}
+    release_exposures = sorted({item for state in states.values() for item in state.get('release_exposures', [])})
+    if config.mode == 'release' and fixture.rubric_hash in release_exposures:
+        raise HarnessError('these release cases were already exposed in these homes; not fresh held-out evidence')
+    baselines = {name: prepare_home(home) for name, home in homes.items()}
     envs = {name: process_env(home) for name, home in homes.items()}
-    metadata['host'] = schema_preflight(args.codex, config.output / 'host-schema', budget, envs['native'])
-    metadata['candidate'] = stage_plugin(config, budget)
-    data = Path(metadata['candidate']['data'])
-    meter = install_meter(data)
-    metadata['meter_sha256'] = digest((data / 'bin/om').read_bytes())
-    clients = []
     try:
-        for name in VARIANTS:
-            workspace = (config.output / name / 'workspace').resolve()
-            writable = [workspace] + ([data] if name == 'om' else [])
-            client = LiveVariant(config, variants[name], workspace, envs[name], writable)
-            clients.append(client)
-            client.preflight()
-        # Match all effective configuration except the intentionally installed plugin,
-        # dedicated paths, and its necessary writable store.
-        def comparable(value):
-            value = copy.deepcopy(value)
-            for key in ('plugins', 'plugin_marketplaces', 'sandbox_workspace_write', 'projects'):
-                value.pop(key, None)
-            return value
-        if comparable(variants['native'].effective['config']) != comparable(variants['om'].effective['config']):
-            raise HarnessError('native and OM effective configurations are not equivalent')
-        for client in clients:
-            client.drive()
+        metadata['host'] = schema_preflight(args.codex, config.output / 'host-schema', budget, envs['native'])
+        metadata['candidate'] = stage_plugin(config, budget)
+        data = Path(metadata['candidate']['data'])
+        meter = install_meter(data)
+        metadata['meter_sha256'] = digest((data / 'bin/om').read_bytes())
+        clients = []
+        try:
+            for name in VARIANTS:
+                workspace = (config.output / name / 'workspace').resolve()
+                writable = [workspace] + ([data] if name == 'om' else [])
+                client = LiveVariant(config, variants[name], workspace, envs[name], writable)
+                clients.append(client)
+                client.preflight()
+            # Match all effective configuration except the intentionally installed plugin,
+            # dedicated paths, and its necessary writable store.
+            if effective_comparison(variants['native'].effective['config']) != effective_comparison(variants['om'].effective['config']):
+                raise HarnessError('native and OM effective configurations are not equivalent')
+            if variants['native'].effective['base_skills'] != variants['om'].effective['base_skills']:
+                raise HarnessError('native and OM base skill/tool opportunities differ')
+            if config.mode == 'release':
+                release_exposures.append(fixture.rubric_hash)
+            for client in clients:
+                client.drive()
+        finally:
+            for client in clients:
+                client.close()
+            calls = [json.loads(line) for line in meter.read_text().splitlines()]
+            write_json(config.output / 'om-calls.json', calls)
+            metadata['om_measurements'] = {'calls': len(calls), 'input_bytes': sum(c['input_bytes'] for c in calls),
+                                          'output_bytes': sum(c['output_bytes'] for c in calls),
+                                          'hook_calls': sum(c['hook'] for c in calls),
+                                          'provenance': 'temporary candidate binary wrapper; includes hook maintenance'}
+            if not any(c['hook'] for c in calls):
+                metadata['om_plugin_verified'] = False
+            else:
+                metadata['om_plugin_verified'] = all(c['exit_code'] == 0 and not c.get('hook_unavailable') for c in calls if c['hook'])
+            # Detect candidate tampering or accidental drift during a long run.
+            if digest(args.om_binary.read_bytes()) != metadata['om_binary_sha256']:
+                raise HarnessError('candidate binary changed during run')
+            if tree_hash(args.plugin_root) != metadata['plugin_sha256']:
+                raise HarnessError('candidate plugin changed during run')
     finally:
-        for client in clients:
-            client.close()
-        calls = [json.loads(line) for line in meter.read_text().splitlines()]
-        write_json(config.output / 'om-calls.json', calls)
-        metadata['om_measurements'] = {'calls': len(calls), 'input_bytes': sum(c['input_bytes'] for c in calls),
-                                      'output_bytes': sum(c['output_bytes'] for c in calls),
-                                      'hook_calls': sum(c['hook'] for c in calls),
-                                      'provenance': 'temporary candidate binary wrapper; includes hook maintenance'}
-        if not any(c['hook'] for c in calls):
-            metadata['om_plugin_verified'] = False
-        else:
-            metadata['om_plugin_verified'] = all(c['exit_code'] == 0 for c in calls if c['hook'])
-        # Detect candidate tampering or accidental drift during a long run.
-        if digest(args.om_binary.read_bytes()) != metadata['om_binary_sha256']:
-            raise HarnessError('candidate binary changed during run')
-        if tree_hash(args.plugin_root) != metadata['plugin_sha256']:
-            raise HarnessError('candidate plugin changed during run')
+        for name, home in homes.items():
+            finish_home(home, baselines[name], config.output, release_exposures)
+        global_after = {str(p): digest(p.read_bytes()) if p.is_file() else None for p in protected}
+        metadata['global_config_unchanged'] = global_before == global_after
+        if global_before != global_after:
+            raise HarnessError('global Codex configuration changed during evaluation')
 
 
 def output_results(config, fixture, variants, budget, metadata, error):
@@ -971,7 +1320,11 @@ def output_results(config, fixture, variants, budget, metadata, error):
     if config.mode == 'release' and not metadata.get('om_plugin_verified'):
         reasons.append('OM hook execution not verified')
     if config.mode == 'release':
+        if not (variants['om'].deferral_evidence or {}).get('verified'):
+            reasons.append('OM explicit deferred-log recovery setup not verified')
         for name, variant in variants.items():
+            if not any(i['status'] == 'interrupted' for i in variant.interruptions):
+                reasons.append(name + ': interruption scenario was not observed')
             if any(c['before_usage'] is None or c['after_usage'] is None for c in variant.compactions):
                 reasons.append(name + ': compaction usage observations incomplete')
     native_tokens = variants['native'].usage.totals()['inputTokens']
@@ -986,10 +1339,15 @@ def output_results(config, fixture, variants, budget, metadata, error):
                          'input_overshoot': budget.overshoot, 'wall_seconds': budget.clock() - budget.started,
                          'scope': 'whole run, both variants and all observed maintenance'},
               'input_token_overhead': overhead,
+              'workload_exposure': {name: {'batches': len(v.workload_batches),
+                                           'bytes': sum(b['bytes'] for b in v.workload_batches),
+                                           'model_visible_bytes': sum(b['model_visible_bytes'] for b in v.workload_batches)}
+                                    for name, v in variants.items()},
               'measurement_notes': ['Cumulative total input counts cached input already; reasoning output is not added to output.',
                                     'last is a host active-context observation, not additional billable usage.',
                                     'Absent measurements are null. Overshoot between observations is possible.',
-                                    'No subscription allowance, dollar conversion, or universal savings claim.']}
+                                    'No subscription allowance, dollar conversion, or universal savings claim.',
+                                    'Usage compares reaching the same compaction target; automatic thresholds may consume different lengths of the same generated workload sequence. See workload_exposure.']}
     write_json(config.output / 'results.json', result)
     lines = ['# Native compaction / OM evaluation', '', f'Status: **{status}**. Release PASS: **{result["release_pass"]}**.',
              '', f'Mode: {config.mode}; split: {fixture.split}; seed: {fixture.seed}; threshold: {config.compact_limit}/{config.scope}.',
@@ -1015,20 +1373,28 @@ def main(argv=None):
         fixture = Fixture.load(config.args.fixture.resolve(), config.split)
         if config.args.frozen_split_hash:
             fixture.check_hash(config.args.frozen_split_hash)
-    except (HarnessError, OSError, ValueError) as exc:
+    except (HarnessError, OSError, ValueError, KeyError, TypeError) as exc:
         print('evaluation refused: ' + str(redact(str(exc))), file=sys.stderr)
         return 2
-    config.output.mkdir(parents=True, exist_ok=False)
+    try:
+        config.output.mkdir(parents=True, exist_ok=False)
+    except OSError as exc:
+        print('evaluation refused: cannot create fresh output directory', file=sys.stderr)
+        return 2
     budget = RunBudget(config.args.max_seconds, config.args.max_input_tokens)
     variants = {name: VariantRun(name, fixture, budget) for name in VARIANTS}
-    metadata = {'fixture_sha256': fixture.fixture_hash, 'split_sha256': fixture.split_hash,
+    metadata = {'fixture_sha256': fixture.fixture_hash, 'split_sha256': fixture.split_hash, 'rubric_sha256': fixture.rubric_hash,
                 'runner_sha256': digest(Path(__file__).read_bytes()), 'seed': fixture.seed,
-                'om_binary_sha256': digest(config.args.om_binary.read_bytes()) if config.args.om_binary else None,
-                'plugin_sha256': tree_hash(config.args.plugin_root) if config.args.plugin_root else None,
+                'om_binary_sha256': None, 'plugin_sha256': None,
                 'protocol': 2, 'host': None,
                 'official_app_server_reference': 'https://learn.chatgpt.com/docs/app-server'}
     error = None
     try:
+        metadata['om_binary_sha256'] = digest(config.args.om_binary.read_bytes()) if config.args.om_binary else None
+        metadata['plugin_sha256'] = tree_hash(config.args.plugin_root) if config.args.plugin_root else None
+        if config.args.om_binary:
+            vcs = re.search(rb'vcs.revision=([0-9a-f]{40})', config.args.om_binary.read_bytes())
+            metadata['candidate_git_revision'] = vcs.group(1).decode() if vcs else None
         for name in VARIANTS:
             fixture.prepare(config.output / name / 'workspace')
         metadata['initial_workspace_sha256'] = tree_hash(config.output / 'native/workspace')
@@ -1050,7 +1416,7 @@ def main(argv=None):
                                               'frozen split hash', '--allow-paid-inference'],
                        'first_probe': fixture.probe_prompt(1),
                        'first_batch_sha256': digest(fixture.batch(1).encode())})
-    except (HarnessError, OSError, ValueError, KeyError) as exc:
+    except (HarnessError, OSError, ValueError, KeyError, TypeError) as exc:
         error = str(redact(str(exc)))
     except KeyboardInterrupt:
         error = 'operator interrupted evaluation'

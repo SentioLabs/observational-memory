@@ -1,49 +1,188 @@
-# Compaction evaluation harness (development checkpoint)
+# Native compaction / Observational Memory evaluation
 
-This opt-in Python 3.10+ harness compares newly created synthetic native Codex and
-Observational Memory tasks. It does not control an existing Desktop task. The
-public `om` CLI remains Go-only.
+The opt-in Python 3.10+ harness evaluates newly created synthetic Codex tasks. It
+uses only the standard library, the installed Codex App Server and the supplied
+v2 `om` candidate. The public `om` CLI remains Go-only. It never controls an
+existing Desktop task or copies authentication into result artifacts.
 
-**WIP checkpoint:** deterministic unit tests currently pass, but the live driver
-has not completed integration review or the project gates. Do not use this
-checkpoint as release evidence. Resume from the preserved Arc T8 pause report.
+`dry-run` and `replay` start **no subprocesses or models** and need no credentials.
+`pilot` and `release` are explicitly paid modes; running tests or a preview does
+not authorize either. A functioning runner or successful pilot is not release
+quality evidence.
 
-Run unpaid checks:
+## Unpaid preview and tests
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_evaluate_compaction.py'
-python3 scripts/evaluate_compaction.py --mode dry-run --output /absolute/fresh/eval-preview
+# Equivalent Taskfile target: task eval:test
+python3 scripts/evaluate_compaction.py --mode dry-run --split pilot --cycles 1 \
+  --output /absolute/fresh/pilot-preview
+python3 scripts/evaluate_compaction.py --mode dry-run --split release \
+  --output /absolute/fresh/release-preview
 ```
 
-Dry-run and replay do not launch subprocesses or require authentication. Both
-write `results.json`, `report.md`, and a frozen fixture manifest. Dry-run prepares
-equivalent workspaces and a preview; it does not generate recovery scores.
+Each output directory must be new. Previews write paired synthetic workspaces,
+`preview.json`, `frozen-manifest.json`, `results.json` and `report.md`. Candidate
+hashes are null unless `--om-binary` and `--plugin-root` are supplied. Supply those
+paths during the operator preview to record their real identities without
+launching either binary. Preview results are `incomplete`, never release PASS.
 
-Fixture cases and gold rubric are separate from the model-visible workload.
-Pilot selects only pilot cases; release selects held-out release cases. Preserve
-the split and runner hashes before tuning. Do not retune using held-out results
-and then report those same cases as fresh release evidence.
+The fixture separates model-visible files/events from gold cases. It includes
+repeated corrections, rejected proposals, a completed migration, a changed
+objective, an interrupted turn, Unicode and a 48KB log with a middle error.
+After setup, fresh seeded incident batches provide real per-region request,
+failure and latency analysis tasks. Complete new request observations are included
+in each model-visible prompt as well as its workspace file, so arithmetic tools
+cannot reduce the exposure to only tiny aggregate outputs. Batches differ in content and IDs; repeating
+the fixture or merely counting turns never counts as a compaction.
 
-Live pilot/release modes require explicit model/reasoning, separate unused Codex
-homes signed in through normal Codex authentication, candidate binary/plugin,
-fresh absolute output, positive maximum wall seconds and reported input tokens,
-the frozen split hash, and `--allow-paid-inference`. No values are selected on the
-user's behalf. Homes must be outside results and differ from active/global homes.
-The runner never copies credentials. Candidate plugin staging substitutes its
-runtime version only in a temporary copy, installs the supplied binary, and
-records both original and staged hashes.
+The two variants receive the same ordered workload generator and initial files;
+native may use ordinary notes/tools, and OM additionally receives its plugin.
+Each advances that sequence until its target number of native compactions. OM
+maintenance can change how many batches fit between compactions. Results include
+batch hashes/counts/bytes and usage to reach the cycle target; they do not pretend
+that unequal workload lengths measure identical work throughput.
 
-Release fixes both variants, 50 distinct actual completed compactions per variant,
-200000/total native compaction and a separate recovery probe after every cycle.
-Forced compaction is diagnostic pilot-only. Scores use exact facts, source lines
-and action evidence; a functioning runner does not imply quality passed.
+## Frozen cases and live commands
 
-Input and wall limits cover the whole run, including both variants and observed
-maintenance. Cumulative usage is differenced; cached input and reasoning output
-are not added twice. Missing telemetry stops live work. Usage may overshoot
-between notifications, so this is not a hard per-request billing cap. Unavailable
-measurements are null. Ties do not establish superiority.
+A preview's `frozen-manifest.json` contains:
 
-Protocol reference: [official Codex App Server documentation](https://learn.chatgpt.com/docs/app-server).
-The live runner freshly generates installed schemas and reads effective settings;
-cached schema evidence is not release evidence.
+- `split_sha256`: selected case IDs, split, contents, workload/generator identity
+  **and the runner source bytes**. A runner change invalidates the campaign hash.
+- `rubric_sha256`: selected cases/workload/generator independent of runner bytes.
+- `fixture_sha256`, `runner_sha256` and supplied candidate/plugin content hashes.
+
+Pilot scores only pilot cases; release scores held-out release cases. Global
+fixture validation checks split/marker separation, but unselected cases are not
+passed to scoring or copied to model workspaces. Gold responses never generate
+recovery output. Do not tune on release scores and then claim the same cases are
+fresh held-out evidence. The two homes also retain release-exposure hashes and
+refuse the same rubric after a live release attempt. This local record cannot
+establish what was exposed outside this runner.
+
+Before live execution, the operator must explicitly choose the model, reasoning,
+wall seconds, input-token ceiling and paths. Sign in normally in two dedicated
+Codex homes; do not copy another home's auth files. New homes must contain only
+normal authentication/installation files. The runner validates actual account
+sign-in and the model/reasoning advertised by that host.
+
+After those choices, use the following commands. The variables name the actual
+operator-approved values, not defaults. Both maximums cover **the entire run and
+both variants**, including their model maintenance/compaction work.
+
+```sh
+# Set PILOT_PREVIEW and RELEASE_PREVIEW to the fresh previews above.
+PILOT_SPLIT_HASH=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["split_sha256"])' "$PILOT_PREVIEW/frozen-manifest.json")
+python3 scripts/evaluate_compaction.py --mode pilot --cycles 1 \
+  --output "$PILOT_OUTPUT" --model "$MODEL" --reasoning "$REASONING" \
+  --native-home "$NATIVE_HOME" --om-home "$OM_HOME" \
+  --om-binary "$OM_BINARY" --plugin-root "$PLUGIN_ROOT" \
+  --max-seconds "$PILOT_MAX_SECONDS" --max-input-tokens "$PILOT_MAX_INPUT_TOKENS" \
+  --frozen-split-hash "$PILOT_SPLIT_HASH" --allow-paid-inference
+
+RELEASE_SPLIT_HASH=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["split_sha256"])' "$RELEASE_PREVIEW/frozen-manifest.json")
+python3 scripts/evaluate_compaction.py --mode release \
+  --output "$RELEASE_OUTPUT" --model "$MODEL" --reasoning "$REASONING" \
+  --native-home "$NATIVE_HOME" --om-home "$OM_HOME" \
+  --om-binary "$OM_BINARY" --plugin-root "$PLUGIN_ROOT" \
+  --max-seconds "$RELEASE_MAX_SECONDS" --max-input-tokens "$RELEASE_MAX_INPUT_TOKENS" \
+  --frozen-split-hash "$RELEASE_SPLIT_HASH" --allow-paid-inference
+```
+
+Recreate the release preview after any pilot-driven runner/fixture change. Live
+pilot may additionally use `--force-compaction` for diagnosis; it never qualifies
+as release evidence. Release fixes both variants, 50 actual cycles, threshold
+200000 and scope `total`; conflicting flags fail before process startup.
+
+The same two dedicated homes can be reused for pilot then release. At shutdown,
+`.om-eval-ownership.json` records hashes of state created by the runner/Codex.
+Before reuse, the runner verifies that record and removes only its recorded
+synthetic state, including prior sessions, plugin configuration and stores. It
+preserves the original authentication files and their normal refreshes. Modified
+or unexpected state causes a refusal; it is never silently deleted. New threads
+and stores are created for the next run. A crash without a complete ownership
+record requires operator inspection; the runner does not guess ownership.
+
+Candidate staging copies the plugin into the output directory, substitutes only
+the temporary runtime version pin, installs the explicitly supplied binary with
+`--from`, and verifies its content hash. It does not download a released runtime.
+Results retain original/staged hashes and the version substitution. A temporary
+binary wrapper measures CLI calls/bytes and successful explicit source deferrals,
+including hook maintenance. Effective native memories use/generation are disabled
+in both processes. Actual schemas, model/reasoning, skills and effective settings
+are checked afresh; unsupported contracts, rerouting, mismatched tools, unknown
+approval requests or missing usage stop the run. Global configuration is never
+written and its before/after hashes are compared.
+
+## Scoring and measurements
+
+Only distinct `item/completed` items with type `contextCompaction` and stable
+thread/item IDs count. Each cycle needs its own subsequent probe turn and actual
+answer. A second compaction before that recovery finishes leaves the experiment
+ineligible; one answer is never copied across cycles. Checkpoints at 10/25/50
+reuse the frozen rubric. The interrupted workload must produce an interrupted
+turn for release eligibility.
+
+Scoring uses exact short facts and verbatim source path/line/text. Action probes
+must create a new cycle-specific artifact and preserve the original completed
+migration record. Executed migration commands are also recorded across all turns,
+including failures or later undo; merely reading/quoting the script is distinct
+from executing it. This is behavioral instrumentation, not a security boundary
+against a malicious agent. OM's deferred-log setup requires a successful explicit
+apply and complete retained source verified through bounded public recall pages.
+Coverage is not a claim of understanding.
+
+Release quality requires 50 scored actual cycles per variant, every OM critical
+fact/action correct, no stale correction or repeated completed action, exact-source
+checks, and OM noncritical accuracy at least native's. Other host/isolation/evidence
+requirements must also pass. Ties are reported as equal quality, not superiority.
+
+Usage comes from cumulative `thread/tokenUsage/updated.tokenUsage.total` deltas;
+`last` is recorded separately as host active-context state. Optional absent fields
+remain null. Cached input is already part of input; reasoning output is reported
+separately without adding it to output twice. Counter resets require an explicit
+new segment in replay; an unexplained live reset stops execution. Stale start-of-turn
+snapshots cannot stand in for completed work's usage.
+
+The monotonic wall deadline and observed input ceiling are shared across both
+variants. Notifications are processed even while waiting for RPC replies, and
+shutdown retains final usage/overshoot. Shutdown interrupts only the owned task
+and terminates only its child process if needed. Cleanup may finish after the wall
+deadline. Telemetry can overshoot between observations: this is **not** a hard
+per-request cap, a subscription allowance measurement or a dollar conversion.
+
+## Replay format
+
+Replay is diagnostic and never sets release PASS, even with 50 perfect synthetic
+cycles. Its JSON envelope contains `schema: 1`, the matching `split_hash`,
+`compact_limit`, `scope` and ordered `events`. Records are scoped to `variant`
+(`native` or `om`) and have one of these forms:
+
+```json
+{"variant":"native","kind":"thread","thread_id":"synthetic-thread"}
+{"variant":"native","kind":"event","event":{"method":"item/completed","params":{"threadId":"synthetic-thread","turnId":"t1","item":{"type":"contextCompaction","id":"c1"}}}}
+{"variant":"native","kind":"probe_start","cycle":1,"turn_id":"probe-1"}
+{"variant":"native","kind":"probe_result","cycle":1,"turn_id":"probe-1","response":{"answers":{}},"effects":{}}
+```
+
+`event` records carry ordinary host usage/item/turn notifications. A counter reset
+uses `kind: "segment"`, a unique `id`, explicit nonnegative `baseline` counters and
+`reason`; it does not reset the shared allowance. `effects` represents recorded
+local action evidence for replay, never gold answers. Run it with:
+
+```sh
+python3 scripts/evaluate_compaction.py --mode replay \
+  --replay-events /absolute/synthetic-events.json --output /absolute/fresh/replay
+```
+
+Exit 2 means invalid arguments/prerequisites before output creation; exit 1 means
+an experiment failure or a nonpassing live release; exit 0 means diagnostic
+completion or a passing live release. Always inspect `status`, `release_pass` and
+`eligibility_reasons`. The T8 deterministic checks establish runner behavior only;
+T9 owns the explicitly authorized live pilot, full experiment and release.
+
+References: [official Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)
+and [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+The installed host, rather than an old example, supplies enum spellings such as
+`workspace-write`. Native memory flags are verified in the effective config even
+when they are absent from the generated typed `Config` properties.
