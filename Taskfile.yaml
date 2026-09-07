@@ -20,3 +20,7 @@ tasks:
     desc: Validate GoReleaser configuration
     cmds:
       - goreleaser check
+  eval:test:
+    desc: Verify the unpaid compaction evaluation harness
+    cmds:
+      - python3 -m unittest discover -s tests -p 'test_evaluate_compaction.py'
