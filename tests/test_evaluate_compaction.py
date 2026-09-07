@@ -1480,6 +1480,24 @@ class CorrectiveRegressionTests(unittest.TestCase):
                 self.assertNotEqual(cycle['before_usage']['observation_index'], cycle['after_usage']['observation_index'])
                 self.assertTrue(v.compaction_evidence(200000)[0]['context_reduction_verified'])
 
+    def test_conflicting_return_to_pre_context_is_ambiguous_after_post_sample(self):
+        for repeated in (10000, 8000):
+            with self.subTest(repeated=repeated):
+                v = self.variant(budget=self.budget(limit=1000))
+                before = self.context_usage(v, 100, 10000)
+                v.event(before)
+                event = compact(v.thread_id, 'c')
+                v.event({**event, 'method': 'item/started'})
+                v.event(before)  # Repeated pre-estimate alone is not a post sample.
+                self.assertIsNone(v.pending_compaction['after_usage'])
+                v.event(self.context_usage(v, 100, 8000))
+                v.event(self.context_usage(v, 100, repeated))
+                v.event(event)
+                self.assertEqual(v.compactions[0]['after_usage']['active_context']['totalTokens'], 8000)
+                self.assertEqual(v.compaction_evidence(200000)[0]['context_reduction_verified'], repeated == 8000)
+                self.assertEqual(v.compactions[0]['context_ambiguous'], repeated != 8000)
+                self.assertEqual(v.usage.totals()['inputTokens'], 100)
+
     def test_context_not_invented_from_request_or_lifetime_totals(self):
         v = self.variant(budget=self.budget(limit=1_000_000))
         v.event(self.context_usage(v, 900000, 3000))

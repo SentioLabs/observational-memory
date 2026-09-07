@@ -466,7 +466,8 @@ class VariantRun:
             if (boundary and p.get('turnId') == boundary['turn_id']
                     and type(context.get('totalTokens')) is int and context['totalTokens'] > 0
                     and context.get('inputTokens') == 0 and context.get('outputTokens') == 0
-                    and context != (boundary['before_usage'] or {}).get('active_context')):
+                    and (boundary['after_usage'] is not None
+                         or context != (boundary['before_usage'] or {}).get('active_context'))):
                 prior = boundary['after_usage']
                 if prior and prior['active_context'] != context:
                     boundary['context_ambiguous'] = True
