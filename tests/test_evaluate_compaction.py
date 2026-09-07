@@ -842,6 +842,37 @@ class ActivationTests(unittest.TestCase):
         self.assertTrue((output / 'activation.json').is_file())
         self.assertFalse((output / 'results.json').exists())
 
+    def test_nullable_command_output_never_substitutes_for_prime_evidence(self):
+        binding = {'installed': '/isolated/plugin'}
+        hook = {'method': 'hook/completed', 'params': {'threadId': 'owned', 'run': {
+            'eventName': 'sessionStart', 'source': 'plugin', 'sourcePath': '/isolated/plugin/hooks/hooks.json',
+            'handlerType': 'command', 'executionMode': 'sync', 'status': 'completed',
+            'entries': [{'kind': 'context', 'text': 'Ledger command: om --session owned. Review one page.'}]}}}
+        prime = {'method': 'item/completed', 'params': {'threadId': 'owned', 'item': {
+            'type': 'commandExecution', 'exitCode': 0, 'aggregatedOutput': 'Session: "owned"',
+            'commandActions': [{'command': 'om --session owned prime'}]}}}
+        calls = [{'session': 'owned', 'hook': True, 'hook_event': 'SessionStart', 'exit_code': 0},
+                 {'session': 'owned', 'command': 'prime', 'prime_valid': True}]
+        def verify(events):
+            return evalmod.verify_intervention(events, calls, binding, 'owned', {'sessionStart'}, prime=True)
+        for output in ({}, {'aggregatedOutput': None}):
+            unrelated = {'method': 'item/completed', 'params': {'threadId': 'owned', 'item': {
+                'type': 'commandExecution', 'exitCode': 0, 'commandActions': [], **output}}}
+            for events in ([hook, unrelated, prime], [hook, prime, unrelated]):
+                with self.subTest(output=output, prime_last=events[-1] is prime):
+                    self.assertTrue(verify(events)['prime_verified'])
+        for output in ({}, {'aggregatedOutput': None}, {'aggregatedOutput': ''},
+                       {'aggregatedOutput': 'Session: "other"'}, {'aggregatedOutput': ['Session: "owned"']}):
+            invalid = copy.deepcopy(prime)
+            del invalid['params']['item']['aggregatedOutput']
+            invalid['params']['item'].update(output)
+            with self.subTest(prime_output=output), self.assertRaisesRegex(evalmod.HarnessError, 'hook-delivered prime'):
+                verify([hook, invalid])
+        wrong = copy.deepcopy(prime); wrong['params']['item']['commandActions'] = [{'command': 'other prime'}]
+        for events in ([hook], [hook, wrong]):
+            with self.assertRaisesRegex(evalmod.HarnessError, 'hook-delivered prime'):
+                verify(events)
+
 
 class EffectiveComparisonTests(unittest.TestCase):
     setUp = HarnessTests.setUp
@@ -1028,6 +1059,10 @@ class MatchedRunTests(unittest.TestCase):
                         for record in records:
                             if record.get('hook_event') == 'PostToolUse':
                                 record['turn_id'] = 't1'
+                    if getattr(self, 'null_output_command', False) and prime:
+                        events.append({'method': 'item/completed', 'params': {'threadId': self.thread, 'turnId': tid,
+                            'item': {'id': 'silent-' + tid, 'type': 'commandExecution', 'exitCode': 0,
+                                     'aggregatedOutput': None, 'commandActions': []}}})
                     self.queue[0:0] = events
                     with (data / 'calls.jsonl').open('a') as log:
                         for record in records:
@@ -1153,6 +1188,12 @@ class MatchedRunTests(unittest.TestCase):
         def mutate(name, host):
             if name == 'om':
                 host.no_tool_post = True
+        self.run_matched(mutate)
+
+    def test_nullable_unrelated_command_allows_recovery_with_usage_retained(self):
+        def mutate(name, host):
+            if name == 'om':
+                host.null_output_command = True
         self.run_matched(mutate)
 
     def test_finalization_failure_cannot_turn_completed_work_into_success(self):

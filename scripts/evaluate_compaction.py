@@ -1458,6 +1458,7 @@ def verify_intervention(events, calls, binding, thread_id, required, prime=False
                     for entry in run.get('entries', []) if entry.get('kind') == 'context']
         delivered = [m.group(1) for context in contexts for m in re.finditer(r'Ledger command: (.*?)\. Review', context)]
         valid = [item for item in commands if item.get('exitCode') == 0
+                 and isinstance(item.get('aggregatedOutput'), str)
                  and ('Session: ' + json.dumps(thread_id)) in item.get('aggregatedOutput', '')
                  and any(action.get('command') == command + ' prime' for action in item.get('commandActions', [])
                          for command in delivered)]
