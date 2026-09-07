@@ -462,8 +462,23 @@ func TestStopRecursionDoesNotStealNewRoot(t *testing.T) {
 	store := t.TempDir()
 	l := open(t, store)
 	promptRoot(t, store, "old", strings.Repeat("work", 11000))
-	if stopRoot(t, store, "old", "old final")["decision"] != "block" {
+	first := stopRoot(t, store, "old", "old final")
+	reason, ok := first["reason"].(string)
+	if !ok {
 		t.Fatal("missing initial owned continuation")
+	}
+	promptRoot(t, store, "owned-synthetic", reason)
+	owned := rootEvent("Stop", "owned-synthetic")
+	owned["stop_hook_active"] = true
+	owned["last_assistant_message"] = "Owned continuation final"
+	for range 2 {
+		if len(invoke(t, store, owned)) != 0 {
+			t.Fatal("owned synthetic continued")
+		}
+		count, err := l.State("root_completed_ordinal")
+		if err != nil || count != "1" {
+			t.Fatal("owned synthetic counted as root", count, err)
+		}
 	}
 	if _, err := l.ApplyV2(capturedCheckpoint(t, l)); err != nil {
 		t.Fatal(err)
@@ -475,12 +490,55 @@ func TestStopRecursionDoesNotStealNewRoot(t *testing.T) {
 	e := rootEvent("Stop", "new")
 	e["stop_hook_active"] = true
 	e["last_assistant_message"] = "Final from another hook continuation"
-	if len(invoke(t, store, e)) != 0 {
-		t.Fatal("active stop continued")
+	for range 2 {
+		if len(invoke(t, store, e)) != 0 {
+			t.Fatal("active stop continued")
+		}
+		count, err := l.State("root_completed_ordinal")
+		if err != nil || count != "2" {
+			t.Fatal("known guarded real root must complete once", count, err)
+		}
+		status, err := l.Status()
+		if err != nil || status.SourceCount != 5 || status.OldestPendingAgeTurns != 0 {
+			t.Fatal("guarded final capture/origin", status, err)
+		}
+	}
+	ordinal, err := l.CompleteRootTurn("new")
+	if err != nil || ordinal != 2 {
+		t.Fatal("wrong real root completed", ordinal, err)
 	}
 	stopRoot(t, store, "boundary", "")
-	s, err := l.Status()
-	if err != nil || s.OldestPendingAgeTurns != 0 {
-		t.Fatal("stale owned prompt stole new final's origin", s, err)
+	status, err := l.Status()
+	if err != nil || status.OldestPendingAgeTurns != 1 {
+		t.Fatal("stale owned prompt stole new final's origin", status, err)
+	}
+}
+
+func TestStopBacklogAgeGuardedRealCompletions(t *testing.T) {
+	store := t.TempDir()
+	l := open(t, store)
+	for i := 0; i < 4; i++ {
+		root := fmt.Sprintf("guarded-%d", i)
+		promptRoot(t, store, root, "Routine real work")
+		e := rootEvent("Stop", root)
+		e["stop_hook_active"] = true
+		e["last_assistant_message"] = "Real final"
+		for range 2 {
+			if len(invoke(t, store, e)) != 0 {
+				t.Fatal("already active Stop requested continuation")
+			}
+			count, err := l.State("root_completed_ordinal")
+			if err != nil || count != fmt.Sprint(i+1) {
+				t.Fatal("guarded real completion missing or duplicated", count, err)
+			}
+			status, err := l.Status()
+			if err != nil || status.OldestPendingAgeTurns != int64(i) {
+				t.Fatal("guarded turns under-aged debt", status, err)
+			}
+		}
+	}
+	promptRoot(t, store, "unguarded", "Continue real work")
+	if stopRoot(t, store, "unguarded", "Done")["decision"] != "block" {
+		t.Fatal("aged real debt did not request bounded maintenance")
 	}
 }

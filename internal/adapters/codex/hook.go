@@ -200,7 +200,7 @@ func handle(ctx context.Context, event map[string]any, store, executable string)
 				}
 			}
 		}
-		if tc.Root == "" || tc.Synthetic || event["stop_hook_active"] == true {
+		if tc.Root == "" || tc.Synthetic {
 			return empty, nil
 		}
 		if _, err = l.CompleteRootTurn(tc.Root); err != nil {
@@ -213,7 +213,7 @@ func handle(ctx context.Context, event map[string]any, store, executable string)
 		if err = l.SetState("stop_seen:"+tc.Root, "1"); err != nil {
 			return nil, err
 		}
-		if previous != "" || (current.Bytes < 40000 && current.OldestAgeTurns < 3) {
+		if event["stop_hook_active"] == true || previous != "" || (current.Bytes < 40000 && current.OldestAgeTurns < 3) {
 			return empty, nil
 		}
 		reason := guidance + "Perform this one bounded memory pass now, then finish."
