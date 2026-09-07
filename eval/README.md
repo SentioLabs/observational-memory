@@ -126,8 +126,12 @@ turn for release eligibility.
 Scoring uses exact short facts and verbatim source path/line/text. Action probes
 must create a new cycle-specific artifact and preserve the original completed
 migration record. Executed migration commands are also recorded across all turns,
-including failures or later undo; merely reading/quoting the script is distinct
-from executing it. This is behavioral instrumentation, not a security boundary
+including failures or later undo. Ordinary Python script/module selection,
+interpreter flags, normalized paths and simple shell wrappers are recognized;
+`python3 -m py_compile actions/migrate.py` only compiles and does not count as
+running the migration. Reading/quoting a script also does not count. Dynamic code,
+aliases, imports from arbitrary programs and complex shell control flow are not
+generally interpreted. This is behavioral instrumentation, not a security boundary
 against a malicious agent. OM's deferred-log setup requires a successful explicit
 apply and complete retained source verified through bounded public recall pages.
 Coverage is not a claim of understanding.
@@ -138,17 +142,37 @@ checks, and OM noncritical accuracy at least native's. Other host/isolation/evid
 requirements must also pass. Ties are reported as equal quality, not superiority.
 
 Usage comes from cumulative `thread/tokenUsage/updated.tokenUsage.total` deltas;
-`last` is recorded separately as host active-context state. Optional absent fields
-remain null. Cached input is already part of input; reasoning output is reported
+`last` is retained separately in `usage_observations.active_context`, with its
+provenance. It can contain request usage or a context-only estimate; those are not
+interchangeable. Each compaction retains observation IDs and accepts post-context
+evidence only from a same-turn context-only estimate between its start and the
+next ordinary work item/turn boundary. The estimate may arrive before or after
+the completion event. The supported Codex 0.153.4 unpaid host trace supplies this
+estimate with positive `last.totalTokens` and zero `last.inputTokens` and
+`last.outputTokens`; a compaction request's usage snapshot is not that estimate.
+Missing, duplicate, or ambiguously associated context evidence remains null and
+ineligible. Threshold evidence requires pre-compaction `last.totalTokens` at least
+200000 and a subsequent smaller context estimate; lifetime totals never prove
+active-context pressure. Effective 200000/total configuration is also checked.
+Optional absent fields remain null. Cached input is already part of input; reasoning output is reported
 separately without adding it to output twice. Counter resets require an explicit
 new segment in replay; an unexplained live reset stops execution. Stale start-of-turn
-snapshots cannot stand in for completed work's usage.
+snapshots cannot stand in for completed work's usage. Before another turn starts,
+the completed turn must have fresh same-turn cumulative input telemetry beyond
+the snapshot at its final agent item. A duplicate intermediate snapshot or another
+turn's update cannot satisfy this obligation. The supported native host emits
+final response usage after that item; other ambiguous orderings stop the run.
 
 The monotonic wall deadline and observed input ceiling are shared across both
 variants. Notifications are processed even while waiting for RPC replies, and
 shutdown retains final usage/overshoot. Shutdown interrupts only the owned task
-and terminates only its child process if needed. Cleanup may finish after the wall
-deadline. Telemetry can overshoot between observations: this is **not** a hard
+and terminates only its child process if needed. Nonblocking writes share the
+run deadline and drain output while waiting. Continuous stderr cannot extend a
+receive deadline. Cleanup uses independent short bounds (0.25 seconds for an
+interrupt write, 0.5 seconds for telemetry draining, 0.25 seconds for graceful
+exit, then one second each for terminate and kill waits). A partially written
+request makes the transport unusable; cleanup still reaches terminate/kill.
+Cleanup may finish after the wall deadline. Telemetry can overshoot between observations: this is **not** a hard
 per-request cap, a subscription allowance measurement or a dollar conversion.
 
 ## Replay format

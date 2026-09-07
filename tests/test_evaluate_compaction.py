@@ -15,8 +15,8 @@ sys.modules[spec.name] = evalmod
 spec.loader.exec_module(evalmod)
 
 
-def usage(thread, amount, **fields):
-    return {'method': 'thread/tokenUsage/updated', 'params': {'threadId': thread, 'turnId': 'turn',
+def usage(thread, amount, turn='turn', **fields):
+    return {'method': 'thread/tokenUsage/updated', 'params': {'threadId': thread, 'turnId': turn,
             'tokenUsage': {'total': {'inputTokens': amount, **fields}, 'last': {'totalTokens': amount}}}}
 
 
@@ -241,7 +241,9 @@ class ResumeRegressionTests(unittest.TestCase):
         v = self.variant(budget=self.budget(limit=1_000_000)); v.event(usage(v.thread_id, 210000))
         event = compact(v.thread_id, 'c')
         v.event({**event, 'method': 'item/started'})
-        v.event(usage(v.thread_id, 210100))
+        after = usage(v.thread_id, 210100)
+        after['params']['tokenUsage']['last'] = {'totalTokens': 5570, 'inputTokens': 0, 'outputTokens': 0}
+        v.event(after)
         v.event(event)
         self.assertEqual(v.compactions[0]['before_usage']['total']['inputTokens'], 210000)
         self.assertEqual(v.compactions[0]['after_usage']['total']['inputTokens'], 210100)
@@ -331,15 +333,15 @@ class FakeHost:
                 event = compact(self.thread, f'compact-{tid}'); event['params']['turnId'] = tid
                 self.queue.append({**event, 'method': 'item/started'})
                 self.input += 20
-                self.queue.append(usage(self.thread, self.input))
+                self.queue.append(usage(self.thread, self.input, turn=tid))
                 self.queue.append(event)
             # Stale usage before the response is not new work. Include the actual
             # final usage after the agent item just like the observed native host.
-            self.queue.append(usage(self.thread, self.input))
+            self.queue.append(usage(self.thread, self.input, turn=tid))
             self.queue.append({'method': 'item/completed', 'params': {'threadId': self.thread, 'turnId': tid,
                 'item': {'type': 'agentMessage', 'id': f'm{tid}', 'text': '{"answers": {}}'}}})
             self.input += 100
-            self.queue.append(usage(self.thread, self.input))
+            self.queue.append(usage(self.thread, self.input, turn=tid))
             self.queue.append({'method': 'turn/completed', 'params': {'threadId': self.thread,
                                 'turn': {'id': tid, 'status': 'completed'}}})
         if 'id' in request:
@@ -491,7 +493,7 @@ class OMAndShutdownTests(unittest.TestCase):
                  'item': {'id': 'm', 'type': 'agentMessage', 'text': 'done'}}})
         with self.assertRaisesRegex(evalmod.HarnessError, 'usage'):
             v.require_usage_since(0)
-        v.event(usage('owned', 20))
+        v.event(usage('owned', 20, turn='t'))
         v.require_usage_since(0)
 
     def test_missing_or_malformed_replay_preserves_failure_artifact(self):
@@ -574,7 +576,7 @@ class InterruptDriverTests(unittest.TestCase):
                     self.sent.append(request)
                     self.queue.extend([
                         {'method': 'turn/started', 'params': {'threadId': self.thread, 'turn': {'id': 'slow'}}},
-                        usage(self.thread, 100),
+                        usage(self.thread, 100, turn='slow'),
                         {'method': 'item/started', 'params': {'threadId': self.thread, 'turnId': 'slow',
                          'item': {'id': 'cmd', 'type': 'commandExecution', 'command': 'python3 diagnostic.py'}}},
                         {'id': request['id'], 'result': {'turn': {'id': 'slow'}}}])
@@ -597,6 +599,242 @@ class InterruptDriverTests(unittest.TestCase):
             self.assertEqual(sent[0]['params'], {'threadId': 'test-thread', 'turnId': 'slow'})
         finally:
             c.close()
+
+
+class CorrectiveRegressionTests(unittest.TestCase):
+    setUp = HarnessTests.setUp
+    variant = HarnessTests.variant
+    budget = HarnessTests.budget
+
+    def context_usage(self, v, amount, context, turn='turn'):
+        event = usage(v.thread_id, amount)
+        event['params']['turnId'] = turn
+        event['params']['tokenUsage']['last'] = {'totalTokens': context, 'inputTokens': 0, 'outputTokens': 0}
+        return event
+
+    def test_compaction_context_supports_both_notification_orders(self):
+        for after_completion in (False, True):
+            with self.subTest(after_completion=after_completion):
+                v = self.variant(budget=self.budget(limit=1_000_000))
+                v.event(usage(v.thread_id, 210000))
+                event = compact(v.thread_id, 'c')
+                v.event({**event, 'method': 'item/started'})
+                v.event(usage(v.thread_id, 210000))  # repeated pre-compaction sample
+                if after_completion:
+                    v.event(event)
+                    self.assertIsNone(v.compactions[0]['after_usage'])
+                v.event(self.context_usage(v, 210100, 5570))
+                if not after_completion:
+                    v.event(event)
+                cycle = v.compactions[0]
+                self.assertEqual(cycle['before_usage']['total']['inputTokens'], 210000)
+                self.assertEqual(cycle['after_usage']['active_context']['totalTokens'], 5570)
+                self.assertNotEqual(cycle['before_usage']['observation_index'], cycle['after_usage']['observation_index'])
+                self.assertTrue(v.compaction_evidence(200000)[0]['verified'])
+
+    def test_context_not_invented_from_request_or_lifetime_totals(self):
+        v = self.variant(budget=self.budget(limit=1_000_000))
+        v.event(self.context_usage(v, 900000, 3000))
+        event = compact(v.thread_id, 'c'); v.event({**event, 'method': 'item/started'})
+        request = usage(v.thread_id, 900100)
+        request['params']['tokenUsage']['last'] = {'totalTokens': 110, 'inputTokens': 100, 'outputTokens': 10}
+        v.event(request); v.event(event)
+        self.assertIsNone(v.compactions[0]['after_usage'])
+        self.assertFalse(v.compaction_evidence(200000)[0]['verified'])
+        # Even real context reduction cannot prove the 200K threshold from 900K lifetime usage.
+        v.event(self.context_usage(v, 900100, 2000))
+        self.assertFalse(v.compaction_evidence(200000)[0]['verified'])
+
+    def test_post_compaction_sample_cannot_cross_work_or_turn_boundaries(self):
+        for boundary in ('agentMessage', 'new-compaction', 'wrong-turn'):
+            v = self.variant(budget=self.budget(limit=1_000_000))
+            v.event(usage(v.thread_id, 210000))
+            event = compact(v.thread_id, 'c'); v.event({**event, 'method': 'item/started'}); v.event(event)
+            if boundary == 'agentMessage':
+                v.event(compact(v.thread_id, 'm', 'agentMessage'))
+            elif boundary == 'new-compaction':
+                v.event({**compact(v.thread_id, 'next'), 'method': 'item/started'})
+            v.event(self.context_usage(v, 210100, 5000, 'foreign' if boundary == 'wrong-turn' else 'turn'))
+            self.assertIsNone(v.compactions[0]['after_usage'], boundary)
+
+    def test_final_duplicate_and_wrong_turn_usage_do_not_pay_for_final_work(self):
+        v = self.variant()
+        v.event(usage(v.thread_id, 100))
+        v.event(compact(v.thread_id, 'm', 'agentMessage'))
+        v.event(usage(v.thread_id, 100))
+        with self.assertRaisesRegex(evalmod.HarnessError, 'usage'):
+            v.require_usage_since(0, 'turn')
+        wrong = usage(v.thread_id, 200); wrong['params']['turnId'] = 'other'; v.event(wrong)
+        with self.assertRaisesRegex(evalmod.HarnessError, 'usage'):
+            v.require_usage_since(0, 'turn')
+        v.event(usage(v.thread_id, 300)); v.require_usage_since(0, 'turn')
+
+    def test_actual_python_compilation_and_equivalent_execution_with_undo(self):
+        import subprocess
+        for arguments, repeats in ((['-m', 'py_compile', 'actions/migrate.py'], False),
+                                   (['actions//migrate.py'], True),
+                                   (['actions/../actions/migrate.py'], True),
+                                   (['-B', '--', './actions/migrate.py'], True)):
+            with self.subTest(arguments=arguments):
+                workspace = self.path / str(len(list(self.path.iterdir())))
+                self.fixture.prepare(workspace)
+                record = workspace / 'state/migrations.txt'
+                case = next(c for c in self.fixture.cases if c['id'] == 'completed-step')
+                record = workspace / case['effect']['unchanged']
+                original = record.read_bytes()
+                prior = evalmod.action_evidence(self.fixture, workspace, 1, before=True)
+                subprocess.run([sys.executable, *arguments], cwd=workspace, check=True, capture_output=True)
+                self.assertEqual(record.read_bytes() != original, repeats)
+                record.write_bytes(original)
+                target = workspace / case['effect']['path'].format(cycle=1)
+                target.parent.mkdir(parents=True, exist_ok=True); target.write_text(json.dumps(case['effect']['content']))
+                v = self.variant(); v.event(compact(v.thread_id, 'c')); v.begin_probe(1, 'p')
+                import shlex
+                v.event({'method': 'item/completed', 'params': {'threadId': v.thread_id, 'turnId': 'p',
+                    'item': {'id': 'cmd', 'type': 'commandExecution', 'cwd': str(workspace),
+                             'command': shlex.join([sys.executable, *arguments])}}})
+                answers = {c['id']: {'answer': c.get('expected', ''), 'action': c.get('expected_action', 'none'),
+                                     **({'source': c['source']} if 'source' in c else {})} for c in self.fixture.cases}
+                v.finish_probe(1, 'p', {'answers': answers}, evalmod.action_evidence(self.fixture, workspace, 1, prior=prior))
+                self.assertEqual(v.scorecard()['repeated_completed_actions'], int(repeats))
+                self.assertEqual(v.scorecard()['critical_failures'], int(repeats))
+
+    def test_real_transport_blocked_stdin_obeys_shared_deadline(self):
+        import os, threading, time
+        t = evalmod.ProcessTransport([sys.executable, '-c', 'import time; time.sleep(30)'], os.environ.copy(), self.path)
+        # Watchdog bounds the regression itself on a broken implementation.
+        watchdog = threading.Timer(2, t.process.kill); watchdog.start()
+        started = time.monotonic()
+        try:
+            t.budget = evalmod.RunBudget(0.15, 1000)
+            rpc = evalmod.RpcClient(t.receive, t.send, t.budget, lambda e: None)
+            with self.assertRaisesRegex(evalmod.HarnessError, 'deadline'):
+                rpc.request('turn/start', {'text': 'x' * 2_000_000})
+            self.assertLess(time.monotonic() - started, 1)
+        finally:
+            watchdog.cancel(); t.process.kill(); t.close()
+
+    def test_real_transport_noisy_stderr_cannot_extend_receive(self):
+        import os, threading, time
+        t = evalmod.ProcessTransport([sys.executable, '-c', 'import os\nwhile True: os.write(2, b"x"*4096)'], os.environ.copy(), self.path)
+        watchdog = threading.Timer(2, t.process.kill); watchdog.start()
+        started = time.monotonic()
+        try:
+            self.assertIsNone(t.receive(0.15))
+            self.assertLess(time.monotonic() - started, 1)
+        finally:
+            watchdog.cancel(); t.process.kill(); t.close()
+
+    def test_real_transport_shutdown_reaches_kill_with_full_stdin(self):
+        import os, threading, time
+        t = evalmod.ProcessTransport([sys.executable, '-c',
+             'import os,signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nwhile True: os.write(2,b"x"*4096)'], os.environ.copy(), self.path)
+        os.set_blocking(t.process.stdin.fileno(), False)
+        try:
+            while True: os.write(t.process.stdin.fileno(), b'x' * 4096)
+        except BlockingIOError:
+            pass
+        watchdog = threading.Timer(6, t.process.kill); watchdog.start()
+        started = time.monotonic()
+        try:
+            t.close('owned', 'active')
+            self.assertLess(time.monotonic() - started, 4.5)
+            self.assertIsNotNone(t.process.poll())
+        finally:
+            watchdog.cancel()
+            if t.process.poll() is None: t.process.kill(); t.process.wait()
+
+
+    def test_installed_host_compaction_request_then_context_then_final_order(self):
+        v = self.variant(budget=self.budget(limit=1_000_000))
+        v.event(usage(v.thread_id, 210000, turn='previous', outputTokens=10))
+        event = compact(v.thread_id, 'c'); v.event({**event, 'method': 'item/started'})
+        v.event(usage(v.thread_id, 210000, outputTokens=10))
+        request = usage(v.thread_id, 210100, outputTokens=20)
+        request['params']['tokenUsage']['last'] = {'totalTokens': 110, 'inputTokens': 100, 'outputTokens': 10}
+        v.event(request)
+        estimate = self.context_usage(v, 210100, 5570)
+        estimate['params']['tokenUsage']['total']['outputTokens'] = 20
+        v.event(estimate); v.event(event)
+        v.event(compact(v.thread_id, 'final', 'agentMessage'))
+        v.event(estimate)  # duplicate compaction usage does not cover final work
+        with self.assertRaisesRegex(evalmod.HarnessError, 'usage'):
+            v.require_usage_since(1, 'turn')
+        final = usage(v.thread_id, 210200, outputTokens=30)
+        final['params']['tokenUsage']['last'] = {'totalTokens': 110, 'inputTokens': 100, 'outputTokens': 10}
+        v.event(final); v.require_usage_since(1, 'turn')
+        self.assertEqual(v.compactions[0]['after_usage']['active_context']['totalTokens'], 5570)
+        self.assertEqual(v.usage.totals()['inputTokens'], 210200)
+        self.assertEqual(v.usage.totals()['outputTokens'], 30)
+        self.assertTrue(v.compaction_evidence(200000)[0]['verified'])
+
+    def test_duplicate_final_usage_stops_driver_before_next_turn(self):
+        class DuplicateHost(FakeHost):
+            def send(self, request):
+                super().send(request)
+                if request.get('method') == 'turn/start':
+                    # Intermediate response spent 50 input tokens; final snapshot
+                    # repeats those 50 rather than reporting the outstanding work.
+                    for event in self.queue:
+                        if event.get('method') == 'thread/tokenUsage/updated':
+                            event['params']['tokenUsage']['total']['inputTokens'] = 50
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = evalmod.VariantRun('native', self.fixture, evalmod.RunBudget(30, 1000))
+        client = evalmod.LiveVariant(DriverTests.config(self), v, workspace, {}, [workspace], DuplicateHost)
+        try:
+            client.preflight()
+            with self.assertRaisesRegex(evalmod.HarnessError, 'usage'):
+                client.drive()
+            self.assertEqual(sum(r.get('method') == 'turn/start' for r in client.transport.sent), 1)
+        finally:
+            client.close()
+
+    def test_duplicate_context_snapshot_is_unavailable(self):
+        v = self.variant(budget=self.budget(limit=1_000_000))
+        sample = self.context_usage(v, 210000, 210010)
+        v.event(sample)
+        event = compact(v.thread_id, 'c'); v.event({**event, 'method': 'item/started'})
+        v.event(sample); v.event(event)
+        self.assertIsNone(v.compactions[0]['after_usage'])
+        self.assertFalse(v.compaction_evidence(200000)[0]['verified'])
+
+    def test_ordinary_python_script_selection_and_paths(self):
+        for command in ('python3 -m py_compile actions/migrate.py', 'python3 -c "print(1)" actions/migrate.py',
+                        'python3 other.py actions/migrate.py', 'python3 -W actions/migrate.py other.py',
+                        'python3 notactions/migrate.py'):
+            self.assertFalse(evalmod.executes_script(command, 'actions/migrate.py'), command)
+        for command in ('python3 -m actions.migrate', 'python3 -B actions//migrate.py',
+                        'cd actions && python3 migrate.py',
+                        "zsh -lc 'python3 actions/../actions/migrate.py'",
+                        "python3 -c 'import runpy; runpy.run_path(\"actions//migrate.py\")'"):
+            self.assertTrue(evalmod.executes_script(command, 'actions/migrate.py'), command)
+
+
+    def test_missing_context_cannot_certify_otherwise_complete_release(self):
+        native, om = self.variant(), self.variant('om')
+        for variant in (native, om):
+            for i in range(1, 51):
+                variant.event(compact(variant.thread_id, str(i)))
+                variant.begin_probe(i, 'p' + str(i))
+                variant.finish_probe(i, 'p' + str(i), HarnessTests.correct_answers(self),
+                                     {'completed-step': {'performed': True, 'unchanged': True}})
+            variant.interruptions = [{'status': 'interrupted'}]
+        om.deferral_evidence = {'verified': True}
+        config = DriverTests.config(self); config.mode = 'release'; config.cycles = 50
+        result = evalmod.output_results(config, self.fixture, {'native': native, 'om': om},
+                                       self.budget(), {'om_plugin_verified': True}, None)
+        self.assertTrue(result['quality']['quality_pass'])
+        self.assertFalse(result['release_pass'])
+        self.assertEqual(len(result['eligibility_reasons']), 2)
+        self.assertTrue(all('context/threshold' in reason for reason in result['eligibility_reasons']))
+
+    def test_script_execution_in_explicit_subdirectory(self):
+        workspace = self.path / 'workspace'; self.fixture.prepare(workspace)
+        v = self.variant(); v.workspace = workspace
+        v.event({'method': 'item/started', 'params': {'threadId': v.thread_id, 'turnId': 'work',
+            'item': {'id': 'cmd', 'type': 'commandExecution', 'cwd': str(workspace / 'actions'),
+                     'command': 'python3 migrate.py'}}})
+        self.assertEqual(v.scorecard()['repeated_completed_actions'], 1)
 
 
 if __name__ == '__main__':

@@ -86,7 +86,7 @@ def safe_relative(name):
 
 
 
-def executes_script(command, target):
+def executes_script(command, target, cwd=None):
     """Recognize executed workload scripts, not cat/echo/source-text mentions."""
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|()')
@@ -102,32 +102,62 @@ def executes_script(command, target):
             current = []
         else:
             current.append(token)
+    directory = cwd or '.'
+    expected = os.path.normpath(os.path.join(directory, target))
+
+    def matches(path):
+        return os.path.normpath(os.path.join(directory, path)) == expected
+
     for words in segments:
         while words and ('=' in words[0] or words[0] in ('env', 'command', 'exec')):
             words.pop(0)
         if not words:
             continue
         executable = Path(words[0]).name
-        if words[0].removeprefix('./').endswith(target):
+        if executable == 'cd' and len(words) == 2:
+            directory = os.path.normpath(os.path.join(directory, words[1]))
+            continue
+        if matches(words[0]):
             return True
-        if executable in ('sh', 'bash', 'zsh') and '-c' in words:
-            pos = words.index('-c') + 1
-            if pos < len(words) and executes_script(words[pos], target):
+        if executable in ('sh', 'bash', 'zsh'):
+            pos = next((i + 1 for i, word in enumerate(words[1:], 1)
+                        if word.startswith('-') and 'c' in word[1:]), len(words))
+            if pos < len(words) and executes_script(words[pos], os.path.abspath(expected), os.path.abspath(directory)):
                 return True
-        if executable.startswith('python'):
-            if any(word.removeprefix('./').endswith(target) for word in words[1:] if not word.startswith('-')):
-                return True
-            if '-c' in words:
-                pos = words.index('-c') + 1
-                try:
-                    tree = ast.parse(words[pos])
-                    for node in ast.walk(tree):
-                        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                                and node.func.attr == 'run_path' and node.args
-                                and isinstance(node.args[0], ast.Constant) and node.args[0].value == target):
-                            return True
-                except (IndexError, SyntaxError):
-                    pass
+        if re.fullmatch(r'python(?:[0-9]+(?:\.[0-9]+)*)?', executable):
+            # Python executes only its selected script/module/code, not arbitrary
+            # positional arguments (e.g. py_compile's source file arguments).
+            args = words[1:]
+            while args:
+                option = args.pop(0)
+                if option == '--':
+                    if args and matches(args[0]):
+                        return True
+                    break
+                if option == '-m' or option.startswith('-m'):
+                    module = args[0] if option == '-m' and args else option[2:]
+                    if matches(module.replace('.', '/') + '.py'):
+                        return True
+                    break
+                if option == '-c' or option.startswith('-c'):
+                    code = args[0] if option == '-c' and args else option[2:]
+                    try:
+                        tree = ast.parse(code)
+                        for node in ast.walk(tree):
+                            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                                    and node.func.attr == 'run_path' and node.args
+                                    and isinstance(node.args[0], ast.Constant)
+                                    and isinstance(node.args[0].value, str) and matches(node.args[0].value)):
+                                return True
+                    except SyntaxError:
+                        pass
+                    break
+                if option in ('-W', '-X'):
+                    args = args[1:]  # interpreter option value, not a script
+                elif not option.startswith('-'):
+                    if matches(option):
+                        return True
+                    break
     return False
 
 
@@ -344,8 +374,10 @@ class Usage:
 
     def observe(self, value, turn_id):
         amount = self.segments[-1].observe(value.get('total', {}))
-        self.observations.append({'turn_id': turn_id, 'total': value.get('total'),
+        self.observations.append({'observation_index': len(self.observations) + 1,
+                                  'turn_id': turn_id, 'total': value.get('total'),
                                   'active_context': value.get('last'),
+                                  'last_provenance': 'tokenUsage.last; request usage or context-only estimate',
                                   'model_context_window': value.get('modelContextWindow'),
                                   'provenance': 'thread/tokenUsage/updated.tokenUsage'})
         return amount
@@ -362,6 +394,7 @@ class VariantRun:
     def __init__(self, name, fixture, budget):
         self.name, self.fixture, self.budget = name, fixture, budget
         self.thread_id = None
+        self.workspace = None
         self.usage = Usage()
         self.compactions, self.seen, self.probes = [], set(), {}
         self.turns, self.messages, self.commands = {}, {}, []
@@ -373,7 +406,8 @@ class VariantRun:
         self.interruptions = []
         self.deferral_evidence = None
         self.forbidden_attempts = set()
-        self.last_agent_usage_index = None
+        self.agent_usage_boundaries = {}
+        self.pending_compaction = None
         self.started_commands = {}
 
     def start_thread(self, ident):
@@ -395,18 +429,40 @@ class VariantRun:
             if method == 'item/started':
                 self.started_commands[item.get('id')] = p.get('turnId')
             for case in self.fixture.cases:
-                if case.get('forbidden_script') and executes_script(item.get('command', ''), case['forbidden_script']):
-                    self.forbidden_attempts.add(item.get('id', '<missing-id>'))
+                script = case.get('forbidden_script')
+                if script:
+                    target = str(self.workspace / script) if self.workspace else script
+                    if executes_script(item.get('command', ''), target, item.get('cwd')):
+                        self.forbidden_attempts.add(item.get('id', '<missing-id>'))
         if method == 'model/rerouted':
             self.reroutes.append(redact(p))
             raise HarnessError('model rerouted away from authorized matched selection')
         if method == 'turn/started':
             self.active_turn = p.get('turn', {}).get('id')
-        if method == 'item/started' and p.get('item', {}).get('type') == 'contextCompaction':
-            self.compaction_starts[p['item'].get('id')] = (
-                copy.deepcopy(self.usage.observations[-1]) if self.usage.observations else None)
+        if method in ('item/started', 'item/completed'):
+            item = p.get('item', {})
+            if item.get('type') != 'contextCompaction':
+                self.pending_compaction = None  # Later work makes delayed attribution ambiguous.
+            elif method == 'item/started' and item.get('id') not in self.compaction_starts:
+                boundary = {'thread_id': self.thread_id, 'item_id': item.get('id'),
+                            'turn_id': p.get('turnId'), 'completed_at_ms': None,
+                            'before_usage': copy.deepcopy(self.usage.observations[-1]) if self.usage.observations else None,
+                            'after_usage': None}
+                self.compaction_starts[item.get('id')] = boundary
+                self.pending_compaction = boundary
         if method == 'thread/tokenUsage/updated':
             self.budget.charge(self.usage.observe(p.get('tokenUsage', {}), p.get('turnId')))
+            boundary = self.pending_compaction
+            sample = self.usage.observations[-1]
+            context = sample.get('active_context') or {}
+            # Codex 0.153.4 emits request usage followed by a context-only estimate
+            # (zero input/output, total=context size). The estimate may precede
+            # item/completed. Never substitute the compaction request's last usage.
+            if (boundary and p.get('turnId') == boundary['turn_id']
+                    and type(context.get('totalTokens')) is int and context['totalTokens'] > 0
+                    and context.get('inputTokens') == 0 and context.get('outputTokens') == 0
+                    and context != (boundary['before_usage'] or {}).get('active_context')):
+                boundary['after_usage'] = copy.deepcopy(sample)
         if method == 'item/completed':
             item = p.get('item', {})
             if item.get('type') == 'contextCompaction':
@@ -415,32 +471,53 @@ class VariantRun:
                 key = (self.thread_id, item['id'])
                 if key not in self.seen:
                     self.seen.add(key)
-                    self.compactions.append({'thread_id': self.thread_id, 'item_id': item['id'],
-                        'turn_id': p.get('turnId'), 'completed_at_ms': p.get('completedAtMs'),
-                        'before_usage': self.compaction_starts.get(item['id']),
-                        'after_usage': copy.deepcopy(self.usage.observations[-1]) if self.usage.observations else None})
+                    boundary = self.compaction_starts.get(item['id'])
+                    if boundary is None:
+                        boundary = {'thread_id': self.thread_id, 'item_id': item['id'],
+                                    'turn_id': p.get('turnId'), 'before_usage': None, 'after_usage': None}
+                    boundary['completed_at_ms'] = p.get('completedAtMs')
+                    self.compactions.append(boundary)
             elif item.get('type') == 'agentMessage':
                 self.messages.setdefault(p.get('turnId'), {})[item.get('id')] = item.get('text', '')
-                self.last_agent_usage_index = len(self.usage.observations)
+                self.agent_usage_boundaries[p.get('turnId')] = len(self.usage.observations)
             elif item.get('type') == 'commandExecution':
                 self.commands.append({'turn_id': p.get('turnId'), 'item': item})
         if method == 'turn/completed':
             turn = p.get('turn', {})
             self.turns[turn.get('id')] = turn
             self.active_turn = None
+            self.pending_compaction = None
         if method == 'error' and not p.get('willRetry', False):
             raise HarnessError('host reported a non-retryable turn error')
-        if method == 'thread/tokenUsage/updated':
-            for cycle in self.compactions:
-                if cycle['after_usage'] is None:
-                    cycle['after_usage'] = copy.deepcopy(self.usage.observations[-1])
 
-    def require_usage_since(self, samples):
+    def require_usage_since(self, samples, turn_id=None):
         observations = self.usage.observations
-        baseline = observations[samples - 1]['total']['inputTokens'] if samples else 0
-        if (len(observations) <= samples or observations[-1]['total']['inputTokens'] <= baseline
-                or (self.last_agent_usage_index is not None and len(observations) <= self.last_agent_usage_index)):
+        if turn_id is None:
+            turn_id = (next(reversed(self.agent_usage_boundaries)) if self.agent_usage_boundaries
+                       else (observations[-1]['turn_id'] if observations else None))
+        boundary = max(samples, self.agent_usage_boundaries.get(turn_id, samples))
+        baseline = observations[boundary - 1]['total']['inputTokens'] if boundary else 0
+        if not any(o['turn_id'] == turn_id and o['total']['inputTokens'] > baseline
+                   for o in observations[boundary:]):
             raise HarnessError('usage telemetry missing or stale for completed work; stopping before another request')
+
+    def compaction_evidence(self, limit):
+        evidence = []
+        for cycle in self.compactions:
+            before, after = cycle['before_usage'], cycle['after_usage']
+            pre = (before or {}).get('active_context') or {}
+            post = (after or {}).get('active_context') or {}
+            pre_total, post_total = pre.get('totalTokens'), post.get('totalTokens')
+            verified = (type(pre_total) is int and pre_total >= limit
+                        and type(post_total) is int and 0 < post_total < pre_total
+                        and after['observation_index'] > before['observation_index']
+                        and after['turn_id'] == cycle['turn_id'])
+            evidence.append({'item_id': cycle['item_id'], 'verified': bool(verified),
+                             'threshold': limit, 'before_context_tokens': pre_total,
+                             'after_context_tokens': post_total,
+                             'provenance': 'tokenUsage.last.totalTokens across a contextCompaction; '
+                                           'post-context-only shape observed on Codex 0.153.4'})
+        return evidence
 
     def begin_probe(self, cycle, turn_id):
         if (cycle != len(self.compactions) or cycle != len(self.probes) + 1
@@ -496,13 +573,14 @@ class VariantRun:
                 'exact_source_checks': sum(s['exact_source'] for s in scores),
                 'exact_source_failures': sum(s['exact_source'] and not s['correct'] for s in scores)}
 
-    def result(self):
+    def result(self, compact_limit=200000):
         return {'scorecard': self.scorecard(), 'compactions': self.compactions, 'probes': self.probes,
                 'usage': self.usage.totals(),
                 'usage_provenance': {k: ('thread/tokenUsage/updated.tokenUsage.total.' + k
                                           if self.usage.totals()[k] is not None else None) for k in FIELDS},
                 'usage_segments': [vars(s) for s in self.usage.segments],
                 'usage_observations': self.usage.observations, 'effective': self.effective, 'reroutes': self.reroutes,
+                'compaction_evidence': self.compaction_evidence(compact_limit),
                 'workload_batches': self.workload_batches, 'interruptions': self.interruptions,
                 'deferral_evidence': self.deferral_evidence, 'forbidden_attempts': sorted(self.forbidden_attempts),
                 'checkpoints': {str(n): [self.probes[k] for k in range(1, n + 1)]
@@ -578,36 +656,81 @@ class RpcClient:
 
 
 class ProcessTransport:
-    """Bounded binary line reader; drains stderr without pipe deadlock."""
+    """Deadline-aware unbuffered pipes; stderr is drained but never persisted."""
     def __init__(self, argv, env, cwd):
         self.process = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.PIPE,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         self.selector = selectors.DefaultSelector()
-        self.selector.register(self.process.stdout, selectors.EVENT_READ, 'stdout')
-        self.selector.register(self.process.stderr, selectors.EVENT_READ, 'stderr')
+        for stream, name in ((self.process.stdout, 'stdout'), (self.process.stderr, 'stderr')):
+            os.set_blocking(stream.fileno(), False)
+            self.selector.register(stream, selectors.EVENT_READ, name)
+        os.set_blocking(self.process.stdin.fileno(), False)
         self.buffer = b''
+        self.budget = None
+        self.write_failed = False
 
-    def send(self, event):
-        self.process.stdin.write(canonical(event) + b'\n')
-        self.process.stdin.flush()
+    def read_ready(self, key):
+        try:
+            data = os.read(key.fileobj.fileno(), 65536)
+        except BlockingIOError:
+            return
+        if not data:
+            self.selector.unregister(key.fileobj)
+            if key.data == 'stdout':
+                raise HarnessError('App Server closed its transport')
+        elif key.data == 'stdout':
+            self.buffer += data
+            if len(self.buffer) > 16_000_000:
+                raise HarnessError('App Server event exceeded transport bound')
+
+    def send(self, event, timeout=None):
+        # An explicit timeout is reserved for cleanup, which must remain possible
+        # after the run budget expires. A partial failed JSON line cannot be reused.
+        if self.write_failed:
+            raise HarnessError('App Server write failed; transport cannot be reused')
+        budget = self.budget if timeout is None else None
+        if budget:
+            budget.check()
+        deadline = time.monotonic() + (min(30, budget.remaining()) if budget else (timeout if timeout is not None else 30))
+        payload = memoryview(canonical(event) + b'\n')
+        self.selector.register(self.process.stdin, selectors.EVENT_WRITE, 'stdin')
+        try:
+            while payload:
+                if budget:
+                    budget.check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HarnessError('App Server write deadline reached')
+                for key, _ in self.selector.select(remaining):
+                    if time.monotonic() >= deadline:
+                        raise HarnessError('App Server write deadline reached')
+                    if key.data == 'stdin':
+                        try:
+                            sent = os.write(key.fileobj.fileno(), payload[:65536])
+                            payload = payload[sent:]
+                        except BlockingIOError:
+                            pass
+                    else:
+                        self.read_ready(key)
+        except (OSError, HarnessError):
+            self.write_failed = True
+            raise
+        finally:
+            self.selector.unregister(self.process.stdin)
 
     def receive(self, timeout):
         deadline = time.monotonic() + timeout
         while b'\n' not in self.buffer:
-            ready = self.selector.select(max(0, deadline - time.monotonic()))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            ready = self.selector.select(remaining)
             if not ready:
                 return None
             for key, _ in ready:
-                data = os.read(key.fileobj.fileno(), 65536)
-                if not data:
-                    self.selector.unregister(key.fileobj)
-                    if key.data == 'stdout':
-                        raise HarnessError('App Server closed its transport')
-                elif key.data == 'stdout':
-                    self.buffer += data
-                    if len(self.buffer) > 16_000_000:
-                        raise HarnessError('App Server event exceeded transport bound')
-                # stderr may contain host paths/auth diagnostics: drain, never persist.
+                if time.monotonic() >= deadline:
+                    return None
+                self.read_ready(key)
         line, self.buffer = self.buffer.split(b'\n', 1)
         try:
             return json.loads(line)
@@ -615,48 +738,42 @@ class ProcessTransport:
             raise HarnessError('invalid App Server JSON line') from exc
 
     def close(self, thread_id=None, turn_id=None, notify=None):
-        if self.process.poll() is None:
-            if thread_id and turn_id:
+        # All phases have independent short bounds, including interrupt writes.
+        # terminate/kill affect only this owned App Server child.
+        try:
+            if self.process.poll() is None:
+                if thread_id and turn_id:
+                    try:
+                        self.send({'method': 'turn/interrupt', 'id': 2_000_000_000,
+                                   'params': {'threadId': thread_id, 'turnId': turn_id}}, timeout=0.25)
+                    except (OSError, HarnessError):
+                        pass
+                if notify:
+                    deadline = time.monotonic() + 0.5
+                    try:
+                        while time.monotonic() < deadline:
+                            event = self.receive(min(0.05, deadline - time.monotonic()))
+                            if event and 'method' in event and 'id' not in event:
+                                try:
+                                    notify(event)
+                                except HarnessError:
+                                    pass  # Retain final usage/overshoot even after the limit.
+                    except (OSError, HarnessError):
+                        pass
+                self.process.stdin.close()
                 try:
-                    self.send({'method': 'turn/interrupt', 'id': 2_000_000_000,
-                               'params': {'threadId': thread_id, 'turnId': turn_id}})
-                    deadline = time.monotonic() + 3
-                    while time.monotonic() < deadline:
-                        event = self.receive(0.2)
-                        if event and notify and 'method' in event and 'id' not in event:
-                            try:
-                                notify(event)
-                            except HarnessError:
-                                pass  # Still retain final usage/overshoot during shutdown.
-                        if event and event.get('method') == 'turn/completed':
-                            break
-                except (OSError, HarnessError):
-                    pass
-            if notify:
-                deadline = time.monotonic() + 0.25
-                try:
-                    while time.monotonic() < deadline:
-                        event = self.receive(min(0.05, deadline - time.monotonic()))
-                        if event and 'method' in event and 'id' not in event:
-                            try:
-                                notify(event)
-                            except HarnessError:
-                                pass
-                except (OSError, HarnessError):
-                    pass
-            self.process.stdin.close()
-            try:
-                self.process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=3)
+                    self.process.wait(timeout=0.25)
                 except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=3)
-        self.selector.close()
-        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
-            stream.close()
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait(timeout=1)
+        finally:
+            self.selector.close()
+            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                stream.close()
 
 
 @dataclass
@@ -761,7 +878,7 @@ def schema_preflight(codex, directory, budget, env):
     for method in ('initialize', 'thread/start', 'turn/start', 'turn/interrupt', 'config/read', 'model/list', 'account/read', 'skills/list'):
         if '"' + method + '"' not in requests:
             raise HarnessError('installed host lacks required method: ' + method)
-    for method in ('item/completed', 'turn/completed', 'thread/tokenUsage/updated'):
+    for method in ('item/started', 'item/completed', 'turn/completed', 'thread/tokenUsage/updated'):
         if '"' + method + '"' not in notifications:
             raise HarnessError('installed host lacks required event: ' + method)
     item = schema('ItemCompletedNotification')
@@ -769,9 +886,12 @@ def schema_preflight(codex, directory, budget, env):
     compaction = next((v for v in definitions if v.get('properties', {}).get('type', {}).get('enum') == ['contextCompaction']), None)
     if not compaction or 'id' not in compaction.get('required', []) or 'threadId' not in item.get('required', []):
         raise HarnessError('stable completed compaction identity unsupported')
-    usage = schema('ThreadTokenUsageUpdatedNotification')['definitions']
-    if 'inputTokens' not in usage['TokenUsageBreakdown'].get('required', []) or 'total' not in usage['ThreadTokenUsage'].get('required', []):
-        raise HarnessError('cumulative input telemetry unsupported')
+    usage_schema = schema('ThreadTokenUsageUpdatedNotification')
+    usage = usage_schema['definitions']
+    if (not {'inputTokens', 'outputTokens', 'totalTokens'} <= set(usage['TokenUsageBreakdown'].get('required', []))
+            or not {'total', 'last'} <= set(usage['ThreadTokenUsage'].get('required', []))
+            or 'turnId' not in usage_schema.get('required', [])):
+        raise HarnessError('turn-bound cumulative input/context telemetry unsupported')
     config = schema('ConfigReadResponse')['definitions']['Config']['properties']
     for key in ('model_auto_compact_token_limit', 'model_auto_compact_token_limit_scope'):
         if key not in config:
@@ -1026,6 +1146,7 @@ def verify_deferrals(client):
 class LiveVariant:
     def __init__(self, config, variant, workspace, env, writable, transport_factory=ProcessTransport):
         self.config, self.variant, self.workspace = config, variant, workspace.resolve()
+        self.variant.workspace = self.workspace
         self.writable = [str(p.resolve()) for p in writable]
         self.data = writable[-1] if variant.name == 'om' else None
         options = settings(config)
@@ -1034,6 +1155,7 @@ class LiveVariant:
         for key, value in options.items():
             argv.extend(['-c', key + '=' + json.dumps(value)])
         self.transport = transport_factory(argv, env, workspace)
+        self.transport.budget = variant.budget
         self.active_turn = None
         self.log = (config.output / (variant.name + '-events.jsonl')).open('w')
         self.rpc = RpcClient(self.transport.receive, self.transport.send, variant.budget, self.notify)
@@ -1143,11 +1265,11 @@ class LiveVariant:
         grace = time.monotonic() + 2
         while time.monotonic() < grace:
             try:
-                self.variant.require_usage_since(before)
+                self.variant.require_usage_since(before, turn_id)
                 break
             except HarnessError:
                 self.rpc.pump(0.1)
-        self.variant.require_usage_since(before)
+        self.variant.require_usage_since(before, turn_id)
         if cycle is not None:
             values = list(self.variant.messages.get(turn_id, {}).values())
             try:
@@ -1325,15 +1447,15 @@ def output_results(config, fixture, variants, budget, metadata, error):
         for name, variant in variants.items():
             if not any(i['status'] == 'interrupted' for i in variant.interruptions):
                 reasons.append(name + ': interruption scenario was not observed')
-            if any(c['before_usage'] is None or c['after_usage'] is None for c in variant.compactions):
-                reasons.append(name + ': compaction usage observations incomplete')
+            if any(not c['verified'] for c in variant.compaction_evidence(config.compact_limit)):
+                reasons.append(name + ': compaction context/threshold evidence incomplete or ambiguous')
     native_tokens = variants['native'].usage.totals()['inputTokens']
     om_tokens = variants['om'].usage.totals()['inputTokens']
     overhead = om_tokens - native_tokens if native_tokens is not None and om_tokens is not None else None
     result = {'schema': SCHEMA, 'mode': config.mode, 'status': status,
               'release_pass': config.mode == 'release' and counts_complete and not reasons,
               'quality': comparison, 'eligibility_reasons': reasons, 'metadata': metadata,
-              'variants': {name: v.result() for name, v in variants.items()},
+              'variants': {name: v.result(config.compact_limit) for name, v in variants.items()},
               'budget': {'max_seconds': budget.max_seconds, 'max_input_tokens': budget.max_input_tokens,
                          'observed_input_tokens': budget.input_tokens if any(v.usage.observations for v in variants.values()) else None,
                          'input_overshoot': budget.overshoot, 'wall_seconds': budget.clock() - budget.started,
@@ -1344,7 +1466,7 @@ def output_results(config, fixture, variants, budget, metadata, error):
                                            'model_visible_bytes': sum(b['model_visible_bytes'] for b in v.workload_batches)}
                                     for name, v in variants.items()},
               'measurement_notes': ['Cumulative total input counts cached input already; reasoning output is not added to output.',
-                                    'last is a host active-context observation, not additional billable usage.',
+                                    'last contains request usage or a context-only estimate; compaction evidence distinguishes their shapes and boundaries.',
                                     'Absent measurements are null. Overshoot between observations is possible.',
                                     'No subscription allowance, dollar conversion, or universal savings claim.',
                                     'Usage compares reaching the same compaction target; automatic thresholds may consume different lengths of the same generated workload sequence. See workload_exposure.']}
