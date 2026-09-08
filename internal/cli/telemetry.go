@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+
 	"github.com/sentiolabs/observational-memory/internal/ledger"
 	"github.com/sentiolabs/observational-memory/internal/telemetry"
 	"github.com/spf13/cobra"
@@ -35,7 +36,7 @@ func telemetryCommand(opts *options) *cobra.Command {
 			return err
 		}
 		defer l.Close()
-		paused, err := l.Paused()
+		paused, _, err := l.ObservationMetadata()
 		if err != nil || paused {
 			return fmt.Errorf("feedback unavailable while memory is paused")
 		}

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/sentiolabs/observational-memory/internal/telemetry"
 	"io"
 	"os"
 	"time"
@@ -14,6 +13,7 @@ import (
 	"github.com/sentiolabs/go-selfupdate/cobracmd"
 	"github.com/sentiolabs/observational-memory/internal/adapters/codex"
 	"github.com/sentiolabs/observational-memory/internal/ledger"
+	"github.com/sentiolabs/observational-memory/internal/telemetry"
 	"github.com/sentiolabs/observational-memory/internal/update"
 	"github.com/spf13/cobra"
 )
@@ -65,11 +65,14 @@ func New() *cobra.Command {
 	core := func(use, short string, args cobra.PositionalArgs, run func(*cobra.Command, *ledger.Ledger, []string) (any, error)) *cobra.Command {
 		return &cobra.Command{Use: use, Short: short, Args: args, RunE: func(cmd *cobra.Command, args []string) (resultErr error) {
 			started := time.Now()
+			collect := telemetry.Enabled(opts.store)
 			observation := telemetry.Input{Session: opts.session, Category: cmd.Name(), Version: Version, Paused: true}
 			defer func() {
 				observation.Duration = time.Since(started)
 				observation.Failed = resultErr != nil
-				telemetry.Record(opts.store, observation)
+				if collect {
+					telemetry.Record(opts.store, observation)
+				}
 			}()
 			if opts.store == "" {
 				return fmt.Errorf("set --store or OBSERVATIONAL_MEMORY_STORE")
@@ -82,18 +85,21 @@ func New() *cobra.Command {
 				return err
 			}
 			defer l.Close()
-			paused, pauseErr := l.Paused()
-			observation.Paused = paused || pauseErr != nil
-			defer func() {
-				if p, e := l.Paused(); e != nil || p {
-					observation.Paused = true
-				}
-			}()
+			if collect {
+				paused, _, metadataErr := l.ObservationMetadata()
+				observation.Paused = paused || metadataErr != nil
+				defer func() {
+					paused, checkpoint, metadataErr := l.ObservationMetadata()
+					if paused || metadataErr != nil {
+						observation.Paused = true
+					}
+					if metadataErr == nil {
+						observation.CheckpointAgeSeconds = telemetry.CheckpointAge(checkpoint)
+					}
+				}()
+			}
 			value, err := run(cmd, l, args)
 			observeValue(&observation, value)
-			if at, e := l.State("last_checkpoint_at"); e == nil {
-				observation.CheckpointAgeSeconds = telemetry.CheckpointAge(at)
-			}
 			if err != nil {
 				return err
 			}

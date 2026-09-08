@@ -5,13 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/sentiolabs/observational-memory/internal/telemetry"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sentiolabs/observational-memory/internal/ledger"
+	"github.com/sentiolabs/observational-memory/internal/telemetry"
 )
 
 // Codex counts approximately four UTF-8 bytes per hook-context token. Keep the
@@ -25,6 +25,7 @@ func contextOutput(event, text string) map[string]any {
 }
 func Handle(ctx context.Context, event map[string]any, store, executable string, version ...string) (result map[string]any, resultErr error) {
 	started := time.Now()
+	collect := telemetry.Enabled(store)
 	observation := telemetry.Input{Session: field(event, "session_id"), Turn: field(event, "turn_id"), Category: field(event, "hook_event_name"), Source: field(event, "source"), Model: field(event, "model"), Trigger: field(event, "trigger"), Paused: true}
 	if len(version) > 0 {
 		observation.Version = version[0]
@@ -32,9 +33,11 @@ func Handle(ctx context.Context, event map[string]any, store, executable string,
 	defer func() {
 		observation.Duration = time.Since(started)
 		observation.Failed = resultErr != nil
-		telemetry.Record(store, observation)
+		if collect {
+			telemetry.Record(store, observation)
+		}
 	}()
-	output, err := handle(ctx, event, store, executable, &observation)
+	output, err := handle(ctx, event, store, executable, &observation, collect)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +50,7 @@ func Handle(ctx context.Context, event map[string]any, store, executable string,
 	}
 	return output, nil
 }
-func handle(ctx context.Context, event map[string]any, store, executable string, observation *telemetry.Input) (map[string]any, error) {
+func handle(ctx context.Context, event map[string]any, store, executable string, observation *telemetry.Input, collect bool) (map[string]any, error) {
 	empty := map[string]any{}
 	if event == nil {
 		return nil, fmt.Errorf("hook input must be an object")
@@ -59,10 +62,17 @@ func handle(ctx context.Context, event map[string]any, store, executable string,
 	if field(event, "agent_id") != "" {
 		return empty, nil
 	}
-	if (name == "PreCompact" || name == "PostCompact") && !telemetry.Enabled(store) {
+	session := field(event, "session_id")
+	if name == "PreCompact" || name == "PostCompact" {
+		if collect {
+			paused, checkpoint, metadataErr := ledger.ExistingObservationMetadata(ctx, store, session)
+			observation.Paused = paused || metadataErr != nil
+			if metadataErr == nil {
+				observation.CheckpointAgeSeconds = telemetry.CheckpointAge(checkpoint)
+			}
+		}
 		return empty, nil
 	}
-	session := field(event, "session_id")
 	l, err := ledger.Open(ctx, store, session)
 	if err != nil {
 		return nil, err
@@ -75,17 +85,17 @@ func handle(ctx context.Context, event map[string]any, store, executable string,
 	if paused {
 		return empty, nil
 	}
-	observation.Paused = false
-	defer func() {
-		if p, e := l.Paused(); e != nil || p {
-			observation.Paused = true
-		}
-		if at, e := l.State("last_checkpoint_at"); e == nil {
-			observation.CheckpointAgeSeconds = telemetry.CheckpointAge(at)
-		}
-	}()
-	if name == "PreCompact" || name == "PostCompact" {
-		return empty, nil
+	if collect {
+		observation.Paused = false // The original memory privacy check above succeeded.
+		defer func() {
+			paused, checkpoint, metadataErr := l.ObservationMetadata()
+			if paused || metadataErr != nil {
+				observation.Paused = true
+			}
+			if metadataErr == nil {
+				observation.CheckpointAgeSeconds = telemetry.CheckpointAge(checkpoint)
+			}
+		}()
 	}
 	canonical := filepath.Dir(filepath.Dir(l.Path))
 	command := fmt.Sprintf("%s --store %s --session %s", quote(executable), quote(canonical), quote(session))

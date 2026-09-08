@@ -42,8 +42,12 @@ A separate `$OM_STORE/telemetry/events.sqlite3` stores UTC timestamps, schema an
 runtime version, HMAC task/turn pseudonyms, closed command/hook categories, generic
 success/failure, CLI/hook execution duration, successful prime loading, lifecycle
 signals, checkpoint age and numerical coverage where an existing operation
-already calculated it. Extra ledger metadata reads are constant-size; telemetry
-does not add a whole-ledger scan to tool hooks. Coverage is sampled, not a promise
+already calculated it. Disabled or unavailable telemetry adds no memory metadata
+queries. Enabled metadata snapshots use one constant-size SELECT with a 25 ms
+context and zero SQLite lock wait on a leased connection; the exact normal busy timeout is restored
+under a separate bounded context before release (or the connection is discarded).
+Unknown privacy state suppresses the observation. Telemetry does not add a
+whole-ledger scan to tool hooks. Coverage is sampled, not a promise
 that the latest store state was measured. Last observed coverage totals and age
 are labeled accordingly.
 
@@ -52,7 +56,7 @@ HMAC domains. Raw IDs, absolute paths, prompts, memory text, code, tool
 inputs/outputs, arbitrary metadata and raw errors are not telemetry fields. Known
 models have a closed allowlist; unknown/custom names are null. Host version,
 provider/billed usage and model waiting time remain unknown. The local SQLite
-key/database uses0600 permissions inside a0700 directory; symlinks and nonregular
+key/database uses 0600 permissions inside a 0700 directory; symlinks and nonregular
 or nonprivate telemetry files are refused. Memory content remains governed by
 its existing separate storage/privacy rules.
 
@@ -65,10 +69,15 @@ telemetry stores only `operation_failed`.
 
 ## Lifecycle and interpretation
 
-Reference Codex0.153.4 supports `PreCompact` and `PostCompact` with task/turn/model
+Reference Codex 0.153.4 supports `PreCompact` and `PostCompact` with task/turn/model
 and auto/manual trigger fields, and `SessionStart` with source=compact but no
 turn/item identity. The adapter handles compact hooks with empty `{}` output and
-no capture/guidance. To receive them, the existing plugin needs two hook entries
+no capture/guidance. These telemetry-only hooks read only an existing private,
+matching session's privacy/checkpoint metadata through a read-only connection
+with a 25 ms context and zero SQLite lock wait. They never create a session,
+migrate/repair memory, or perform ordinary full-ledger validation. Missing,
+locked, unsafe or WAL-mode memory makes privacy unknown and skips collection
+while preserving the empty response. To receive them, the existing plugin needs two hook entries
 using the same `om hook --client codex` wrapper as its other lifecycle hooks.
 This runtime change does not install or trust hooks or edit global configuration.
 Matched source: `codex-rs/hooks/src/schema.rs`347–385 and
@@ -81,8 +90,11 @@ multiple real compactions in one turn collapse to one. Missing IDs never create
 an identified boundary. Exact unique compactions remain null. The first Pre/Post
 UTC interval is an observation interval, not billed latency or model time.
 Successful prime after a retained signal means the CLI loaded its response,
-not that the model remembered, used or correctly followed it. The raw signal-chain
-histogram is explicitly not a unique-compaction count.
+not that the model remembered, used or correctly followed it. The
+`compact_signal_deliveries` field and raw signal-chain histogram count
+PostCompact plus SessionStart(source=compact) completion/recovery deliveries,
+not PreCompact attempts. Category counts include all delivered hook categories.
+These delivery metrics are explicitly not unique-compaction counts.
 
 Command/hook durations measure execution inside the CLI, excluding process startup
 and telemetry persistence; they are not model waiting time, total integration
@@ -93,17 +105,17 @@ OM-only study.
 
 ## Retention and failure behavior
 
-Automatic recording has a100ms context deadline and25ms SQLite busy timeout.
+Automatic recording has a 100 ms context deadline and 25 ms SQLite busy timeout.
 Concurrent CLI processes serialize writes transactionally; inability to record
 never changes normal stdout/exit status. Telemetry corruption, permissions,
 contention or storage failure may lose observations. An unrecordable drop cannot
 reliably record its own counter: `unrecorded_drops` stays null and limitations are
 always shown. No automatic repair/deletion of corrupt telemetry occurs.
 
-Retention is rolling, up to100000 event rows, with a64MiB main-file ceiling and
-bounded SQLite rollback journal (allow up to another64MiB transiently). Older rows
+Retention is rolling, up to 100,000 event rows, with a 64 MiB main-file ceiling and
+bounded SQLite rollback journal (allow up to approximately another 64 MiB plus journal framing transiently). Older rows
 are evicted when row or page capacity is approached; eviction count, cap-reached
-flag and retained start/end dates are visible. This is not guaranteed14-day
+flag and retained start/end dates are visible. This is not guaranteed 14-day
 retention under arbitrary traffic. Inspect collection health after seven days;
 keep the bounded local database for analysis after fourteen days. Reports scan
 only bounded telemetry rows, with a three-second deadline, not memory databases.
