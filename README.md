@@ -164,3 +164,8 @@ Extracted from the Rust Codex implementation in
 [agent-marketplace commit d3d82b9](https://github.com/bfirestone/agent-marketplace/commit/d3d82b9),
 then ported to Go. MIT attribution is retained in LICENSE. The current v2 ledger
 does not read or migrate schema-1 stores.
+
+Opt-in, content-free local field measurements are available with
+`om --store "$OM_STORE" telemetry enable`. Collection is off by default;
+[telemetry usage and privacy](docs/telemetry.md) describes status/report, explicit
+user feedback, pause/disable, bounded retention and observational limits.

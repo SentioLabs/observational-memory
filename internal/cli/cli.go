@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/sentiolabs/observational-memory/internal/telemetry"
 	"io"
 	"os"
+	"time"
 	"unicode/utf8"
 
 	"github.com/sentiolabs/go-selfupdate/cobracmd"
@@ -45,6 +47,7 @@ func New() *cobra.Command {
 	compatibility.Flags().IntVar(&protocol, "protocol", 0, "Required CLI protocol")
 	compatibility.Flags().StringVar(&compatibleClient, "client", "", "Required client adapter")
 	root.AddCommand(compatibility)
+	root.AddCommand(telemetryCommand(opts))
 	var client string
 	hook := &cobra.Command{Use: "hook", Short: "Handle a client lifecycle event", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
 		if client != "codex" {
@@ -60,7 +63,14 @@ func New() *cobra.Command {
 	hook.Flags().StringVar(&client, "client", "", "Client event contract (codex)")
 	root.AddCommand(hook)
 	core := func(use, short string, args cobra.PositionalArgs, run func(*cobra.Command, *ledger.Ledger, []string) (any, error)) *cobra.Command {
-		return &cobra.Command{Use: use, Short: short, Args: args, RunE: func(cmd *cobra.Command, args []string) error {
+		return &cobra.Command{Use: use, Short: short, Args: args, RunE: func(cmd *cobra.Command, args []string) (resultErr error) {
+			started := time.Now()
+			observation := telemetry.Input{Session: opts.session, Category: cmd.Name(), Version: Version, Paused: true}
+			defer func() {
+				observation.Duration = time.Since(started)
+				observation.Failed = resultErr != nil
+				telemetry.Record(opts.store, observation)
+			}()
 			if opts.store == "" {
 				return fmt.Errorf("set --store or OBSERVATIONAL_MEMORY_STORE")
 			}
@@ -72,7 +82,18 @@ func New() *cobra.Command {
 				return err
 			}
 			defer l.Close()
+			paused, pauseErr := l.Paused()
+			observation.Paused = paused || pauseErr != nil
+			defer func() {
+				if p, e := l.Paused(); e != nil || p {
+					observation.Paused = true
+				}
+			}()
 			value, err := run(cmd, l, args)
+			observeValue(&observation, value)
+			if at, e := l.State("last_checkpoint_at"); e == nil {
+				observation.CheckpointAgeSeconds = telemetry.CheckpointAge(at)
+			}
 			if err != nil {
 				return err
 			}
@@ -200,7 +221,7 @@ func runHook(ctx context.Context, reader io.Reader, store string) (map[string]an
 	if err != nil {
 		return nil, err
 	}
-	return codex.Handle(ctx, event, store, exe)
+	return codex.Handle(ctx, event, store, exe, Version)
 }
 func output(cmd *cobra.Command, value any) error {
 	body, err := ledger.EncodeResponse(value)
